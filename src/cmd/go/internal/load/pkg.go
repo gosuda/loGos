@@ -244,6 +244,7 @@ type PackageInternal struct {
 
 	Asmflags   []string // -asmflags for this package
 	Gcflags    []string // -gcflags for this package
+	LogosEject bool     // compile with -logos.eject and skip the build cache
 	Ldflags    []string // -ldflags for this package
 	Gccgoflags []string // -gccgoflags for this package
 }
@@ -1434,13 +1435,15 @@ HaveGoMod:
 }
 
 // hasGoFiles reports whether dir contains any files with names ending in .go.
+// In logos mode loGo/s source files count too, so vendoring sees the same
+// package directories the build does.
 // For a vendor check we must exclude directories that contain no .go files.
 // Otherwise it is not possible to vendor just a/b/c and still import the
 // non-vendored a/b. See golang.org/issue/13832.
 func hasGoFiles(dir string) bool {
 	files, _ := os.ReadDir(dir)
 	for _, f := range files {
-		if !f.IsDir() && strings.HasSuffix(f.Name(), ".go") {
+		if !f.IsDir() && cfg.IsGoFile(f.Name()) {
 			return true
 		}
 	}
@@ -1964,6 +1967,12 @@ func (p *Package) load(ld *modload.Loader, ctx context.Context, opts PackageOpts
 			addImport("syscall", true)
 		}
 
+		// Every logos package implicitly imports the support package,
+		// so lowered code can call into it without naming it.
+		if needsLogosRT(p) {
+			addImport("logos/rt", true)
+		}
+
 		// SWIG adds imports of some standard packages.
 		if p.UsesSwig() {
 			addImport("unsafe", true)
@@ -2088,6 +2097,9 @@ func (p *Package) load(ld *modload.Loader, ctx context.Context, opts PackageOpts
 		}
 	}
 	p.Internal.Imports = imports
+	checkLogosAliases(p)
+	checkLogosConfig(ld, p)
+	checkLogosCgo(ld, p)
 	if p.Error == nil && p.Name == "main" && !p.Internal.ForceLibrary && !p.Incomplete && !opts.SuppressBuildInfo {
 		// TODO(bcmills): loading VCS metadata can be fairly slow.
 		// Consider starting this as a background goroutine and retrieving the result
@@ -2942,12 +2954,13 @@ func PackagesAndErrors(ld *modload.Loader, ctx context.Context, opts PackageOpts
 		// Listing is only supported with all patterns referring to either:
 		// - Files that are part of the same directory.
 		// - Explicit package paths or patterns.
-		if strings.HasSuffix(p, ".go") {
+		if cfg.IsGoFile(p) {
 			// We need to test whether the path is an actual Go file and not a
 			// package path or pattern ending in '.go' (see golang.org/issue/34653).
 			if fi, err := fsys.Stat(p); err == nil && !fi.IsDir() {
 				pkgs := []*Package{GoFilesPackage(ld, ctx, opts, patterns)}
 				setPGOProfilePath(pkgs)
+				checkLogosModules(PackageList(pkgs))
 				return pkgs
 			}
 		}
@@ -3030,6 +3043,8 @@ func PackagesAndErrors(ld *modload.Loader, ctx context.Context, opts PackageOpts
 	setToolFlags(ld, pkgs...)
 
 	setPGOProfilePath(pkgs)
+
+	checkLogosModules(PackageList(pkgs))
 
 	return pkgs
 }
@@ -3270,6 +3285,7 @@ func setToolFlags(ld *modload.Loader, pkgs ...*Package) {
 	for _, p := range PackageList(pkgs) {
 		p.Internal.Asmflags = BuildAsmflags.For(ld, p)
 		p.Internal.Gcflags = BuildGcflags.For(ld, p)
+		p.Internal.Gcflags = append(p.Internal.Gcflags, logosEjectGcflags(p)...)
 		p.Internal.Ldflags = BuildLdflags.For(ld, p)
 		p.Internal.Gccgoflags = BuildGccgoflags.For(ld, p)
 	}
@@ -3282,7 +3298,7 @@ func GoFilesPackage(ld *modload.Loader, ctx context.Context, opts PackageOpts, g
 	modload.Init(ld)
 
 	for _, f := range gofiles {
-		if !strings.HasSuffix(f, ".go") {
+		if !cfg.IsGoFile(f) {
 			pkg := new(Package)
 			pkg.Internal.Local = true
 			pkg.Internal.CmdlineFiles = true

@@ -86,7 +86,11 @@ func (p *parser) init(file *PosBase, r io.Reader, errh ErrorHandler, pragh Pragm
 				}
 			}
 		},
-		directives,
+		// Forward LogosMode into the scanner alongside directives:
+		// the scanner gates '?' on s.mode&uint(LogosMode), while the
+		// comment-reporting bits live high (see scanner.go) so plain
+		// parser scans never enable loGo/s lexing.
+		directives|uint(mode&LogosMode),
 	)
 
 	p.base = file
@@ -1000,6 +1004,7 @@ func (p *parser) callStmt() *CallStmt {
 	}
 
 	s.Call = x
+	p.logosCheckCallParen(s) // M1-S2 hook: `?` hiding go/defer parens.
 	return s
 }
 
@@ -1246,6 +1251,9 @@ loop:
 			n := p.complitexpr()
 			n.Type = x
 			x = n
+
+		case _Question:
+			x = p.logosQuestion(x, pos)
 
 		default:
 			break loop
@@ -2619,6 +2627,9 @@ func (p *parser) stmtOrNil() Stmt {
 		lhs := p.exprList()
 		if label, ok := lhs.(*Name); ok && p.tok == _Colon {
 			return p.labeledStmtOrNil(label)
+		}
+		if s := p.logosErrdefer(lhs); s != nil { // M1-S2 hook: errdefer statement.
+			return s
 		}
 		return p.simpleStmt(lhs, 0)
 	}

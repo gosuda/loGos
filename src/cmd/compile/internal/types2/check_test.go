@@ -127,8 +127,9 @@ func testFiles(t *testing.T, filenames []string, srcs [][]byte, colDelta uint, m
 		t.Fatal("no source files")
 	}
 
-	// parse files
-	files, errlist := parseFiles(t, filenames, srcs, 0)
+	// parse files; .lgo-only packages parse with LogosMode (logosPackageMode)
+	mode, isLogos := logosPackageMode(filenames)
+	files, errlist := parseFiles(t, filenames, srcs, mode)
 	pkgName := "<no package>"
 	if len(files) > 0 {
 		pkgName = files[0].PkgName.Value
@@ -160,6 +161,9 @@ func testFiles(t *testing.T, filenames []string, srcs [][]byte, colDelta uint, m
 	for _, opt := range opts {
 		opt(&conf)
 	}
+
+	// .lgo test packages check with the loGo/s rules.
+	conf.Logos = isLogos
 
 	// apply flag setting (overrides custom configuration)
 	var goexperiment string
@@ -395,6 +399,12 @@ func TestFixedbugs(t *testing.T) {
 	testDirFiles(t, "../../../../internal/types/testdata/fixedbugs", 100, false)
 }                            // TODO(gri) narrow column tolerance
 func TestLocal(t *testing.T) { testDirFiles(t, "testdata/local", 0, false) }
+
+// TestLogos checks src/internal/types/testdata/logos. It copies TestLocal:
+// the shared testDirFiles chain takes every file in the directory, so
+// .lgo names need no additional filter, and testFiles derives LogosMode
+// parsing with Config.Logos = true from the .lgo names (logosPackageMode).
+func TestLogos(t *testing.T) { testDirFiles(t, "../../../../internal/types/testdata/logos", 0, false) }
 
 func testDirFiles(t *testing.T, dir string, colDelta uint, manual bool) {
 	testenv.MustHaveGoBuild(t)

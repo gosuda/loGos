@@ -71,7 +71,7 @@ var (
 
 	// dirs are the directories to look for *.go files in.
 	// TODO(bradfitz): just use all directories?
-	dirs = []string{".", "ken", "chan", "interface", "internal/runtime/sys", "syntax", "dwarf", "fixedbugs", "codegen", "abi", "typeparam", "typeparam/mdempsky", "arenas", "simd"}
+	dirs = []string{".", "ken", "chan", "interface", "internal/runtime/sys", "syntax", "dwarf", "fixedbugs", "codegen", "abi", "typeparam", "typeparam/mdempsky", "arenas", "simd", "logos"}
 )
 
 // Test is the main entrypoint that runs tests in the GOROOT/test directory.
@@ -137,7 +137,7 @@ func Test(t *testing.T) {
 	}
 
 	for _, dir := range dirs {
-		for _, goFile := range goFiles(t, dir) {
+		for _, goFile := range testFilesForDir(t, dir) {
 			test := test{testCommon: common, dir: dir, goFile: goFile}
 			t.Run(path.Join(dir, goFile), func(t *testing.T) {
 				t.Parallel()
@@ -609,6 +609,10 @@ func (t test) run() error {
 			flags = append(flags, args[0])
 		}
 		args = args[1:]
+	}
+	// test/logos cases run through the logos harness (see logos_test.go).
+	if routeLogosHarness(t.dir, t.goFile, action, flags) {
+		return t.runLogos(logosCase{action, args, flags, runenv, srcBytes, wantAuto, wantError, tim})
 	}
 	if action == "errorcheck" {
 		found := false
@@ -1172,8 +1176,7 @@ var findExecCmd = sync.OnceValue(func() (execCmd []string) {
 func (t test) checkExpectedOutput(gotBytes []byte) error {
 	got := string(gotBytes)
 	filename := filepath.Join(t.dir, t.goFile)
-	filename = filename[:len(filename)-len(".go")]
-	filename += ".out"
+	filename = testOutputStem(filename) + ".out"
 	b, err := os.ReadFile(filepath.Join(t.gorootTestDir, filename))
 	if errors.Is(err, fs.ErrNotExist) {
 		// File is allowed to be missing, in which case output should be empty.

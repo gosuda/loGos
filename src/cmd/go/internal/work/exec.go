@@ -1166,7 +1166,7 @@ func (b *Builder) loadCachedCompiledGoFiles(a *Action) error {
 	for name := range strings.SplitSeq(string(list), "\n") {
 		if name == "" { // end of list
 			continue
-		} else if !strings.HasSuffix(name, ".go") {
+		} else if !cfg.IsGoFile(name) {
 			continue
 		}
 		if strings.HasPrefix(name, "./") {
@@ -1230,11 +1230,11 @@ func analysisModuleFromModulePublic(m *modinfo.ModulePublic) *analysis.Module {
 }
 
 func buildVetConfig(a *Action, srcfiles []string, vetDeps []*Action) {
-	// Classify files based on .go extension.
+	// Classify files based on Go-family extension.
 	// srcfiles does not include raw cgo files.
 	var gofiles, nongofiles []string
 	for _, name := range srcfiles {
-		if strings.HasSuffix(name, ".go") {
+		if cfg.IsGoFile(name) && !cfg.IsLogosFile(name) {
 			gofiles = append(gofiles, name)
 		} else {
 			nongofiles = append(nongofiles, name)
@@ -1334,6 +1334,11 @@ func (b *Builder) vet(ctx context.Context, a *Action) error {
 	if vcfg == nil {
 		// Vet config should only be missing if the build failed.
 		return fmt.Errorf("vet config not found")
+	}
+	if len(vcfg.GoFiles) == 0 && a.Package.IsLogos() {
+		// A loGo/s package carries no .go sources for vet to parse;
+		// analysis of its lowered form is a later milestone.
+		return nil
 	}
 
 	sh := b.Shell(a)
@@ -2832,6 +2837,9 @@ func envList(key, def string) []string {
 	if v == "" {
 		v = def
 	}
+	if key == "CC" || key == "CXX" {
+		v = logosCompilerFallback(key, v)
+	}
 	args, err := quoted.Split(v)
 	if err != nil {
 		panic(fmt.Sprintf("could not parse environment variable %s with value %q: %v", key, v, err))
@@ -3038,6 +3046,7 @@ func (b *Builder) runCgo(ctx context.Context, a *Action) error {
 	// flags put together from source code (checked).
 	cgoenv := b.cCompilerEnv()
 	cgoenv = append(cgoenv, cfgChangedEnv...)
+	cgoenv = append(cgoenv, logosCgoToolEnv()...)
 	var ldflagsOption []string
 	if len(cgoLDFLAGS) > 0 {
 		flags := make([]string, len(cgoLDFLAGS))
