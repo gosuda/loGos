@@ -915,6 +915,7 @@ func FindExecCmd() []string {
 	if err == nil {
 		ExecCmd = []string{path}
 	}
+	ExecCmd = findWasmExecCmd(ExecCmd)
 	return ExecCmd
 }
 
