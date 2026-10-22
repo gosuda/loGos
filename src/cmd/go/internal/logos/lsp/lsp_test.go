@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -55,6 +56,12 @@ type fakeScript struct {
 	// CrashOn names a request method that makes the fake exit instead of
 	// answering.
 	CrashOn string `json:"crashOn"`
+
+	HoldMethod string `json:"holdMethod"`
+
+	HoldAddr string `json:"holdAddr"`
+
+	held bool
 }
 
 // TestMain turns the test binary into the fake gopls when asked to.
@@ -108,6 +115,12 @@ func runFakeGopls() int {
 func fakeHandle(wr *writer, script *fakeScript, m *message) error {
 	switch {
 	case m.isRequest():
+		if m.Method == script.HoldMethod && script.HoldAddr != "" && !script.held {
+			script.held = true
+			if err := holdForRelease(script.HoldAddr); err != nil {
+				return err
+			}
+		}
 		time.Sleep(time.Duration(script.DelayMillis) * time.Millisecond)
 		return wr.respond(m.ID, fakeResult(script, m.Method))
 	case m.Method == "textDocument/didOpen" || m.Method == "textDocument/didChange":
@@ -127,6 +140,20 @@ func fakeHandle(wr *writer, script *fakeScript, m *message) error {
 		}
 	}
 	return nil
+}
+
+func holdForRelease(addr string) error {
+	c, err := net.DialTimeout("tcp", addr, waitLimit)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if err := c.SetDeadline(time.Now().Add(waitLimit)); err != nil {
+		return err
+	}
+	var b [1]byte
+	_, err = io.ReadFull(c, b[:])
+	return err
 }
 
 // fakeResult returns the scripted result of method.
@@ -1417,5 +1444,73 @@ func TestProxyCodeActionWithoutLoweringUsesCompiler(t *testing.T) {
 	})
 	if strings.Contains(string(res2), "add ? to propagate the error") {
 		t.Errorf("a stale autofix crossed the edit: %s", res2)
+	}
+}
+
+func TestProxyCodeActionInflightEditDropsWholeAnswer(t *testing.T) {
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if err := ln.SetDeadline(time.Now().Add(waitLimit)); err != nil {
+		t.Fatalf("arming the gate accept: %v", err)
+	}
+	f := newFixture(t, map[string]string{"a/a.lgo": aLgo, "b/b.lgo": "package b\n\nSYNTAX ERROR\n"}, fixtureOptions{
+		Script: func(string) fakeScript {
+			return fakeScript{
+				HoldMethod: "textDocument/codeAction",
+				HoldAddr:   ln.Addr().String(),
+				Responses: map[string]json.RawMessage{
+					"textDocument/codeAction": toJSON(t, []any{map[string]any{"title": "from gopls"}}),
+				},
+			}
+		},
+		Tune: func(f *fixture, o *Options) {
+			o.Debounce = -1
+			o.CodeActions = codeActionsAdapter
+		},
+	})
+	aPath := f.path("a/a.lgo")
+	line := autofixLine(t, fixDiag{Schema: "1.0", File: aPath, Start: Position{Line: 5, Character: 1}, Len: 4, Description: "stale-proof fix", Replacement: "p"})
+	d, ok := parseDiagnostic(line)
+	if !ok {
+		t.Fatalf("parseDiagnostic rejected %s", line)
+	}
+	f.comp.setDiagnostics(filepath.Dir(aPath), d)
+	f.open("a/a.lgo", 1)
+	f.open("b/b.lgo", 1)
+	params := map[string]any{
+		"textDocument": map[string]any{"uri": f.uri("a/a.lgo")},
+		"range":        span(Position{Line: 5, Character: 1}, 4),
+		"context":      map[string]any{"diagnostics": []any{}},
+	}
+	id := f.client.request("textDocument/codeAction", params)
+	gate, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("the held backend never dialed the gate: %v", err)
+	}
+	defer gate.Close()
+	if err := gate.SetWriteDeadline(time.Now().Add(waitLimit)); err != nil {
+		t.Fatalf("arming the gate write: %v", err)
+	}
+	f.client.notify("textDocument/didChange", map[string]any{
+		"textDocument":   map[string]any{"uri": f.uri("a/a.lgo"), "version": 2},
+		"contentChanges": []any{map[string]any{"text": aLgo + "// crossed\n"}},
+	})
+	if res := f.client.call("textDocument/hover", positionParams(f.uri("b/b.lgo"), Position{Line: 0})); string(res) != "null" {
+		t.Fatalf("hover on a source with no lowering = %s, want null", res)
+	}
+	if _, err := gate.Write([]byte{1}); err != nil {
+		t.Fatalf("releasing the held backend: %v", err)
+	}
+	stale := f.client.await("textDocument/codeAction", id)
+	sameJSON(t, "stale codeAction crossed by an edit", stale.Result, []any{})
+	fresh := f.client.call("textDocument/codeAction", params)
+	if !strings.Contains(string(fresh), "from gopls") {
+		t.Errorf("fresh codeAction lost the backend action: %s", fresh)
+	}
+	if !strings.Contains(string(fresh), "stale-proof fix") {
+		t.Errorf("fresh codeAction lost the current autofix: %s", fresh)
 	}
 }
