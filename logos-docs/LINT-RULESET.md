@@ -4,7 +4,10 @@ Status: approved design. This document is the normative ruleset
 specification for the lint system covering both plain Go packages and
 loGo/s packages. Sources: the gVisor nogo discipline, the golangci-lint
 catalog, and this repository's lint machinery. The engineering backlog
-for this design lives in the implementation plan.
+for this design lives in the implementation plan. The per-rule
+reference, one entry per existing and planned rule with severity,
+scope, exemptions, enforcement, fixtures, and config keys, is
+[LINT-RULES.md](LINT-RULES.md).
 
 ## Verdict
 
@@ -134,6 +137,42 @@ logos/rt outside the lowering seam files.
   family.
 - No staticcheck family import into the compiler. A staticcheck check
   becomes a native rule only when a red-team row demands it.
+
+## Strict profile
+
+The strict profile raises the ceiling the standard profile sets.
+Style may Deny, builds run the full set, and the overhead budget
+is measured and reported, never a landing gate.
+
+```toml
+[lints.profile]
+name = "strict"        # default "standard"; the logos new-module template sets strict
+build = "full"         # findings fail builds; "lint-only" is the legacy value
+budget = "report"      # overhead measured and reported, never a rule gate
+```
+
+Rules the strict profile adds beyond the tiers above:
+
+| Rule | Group, strict severity | Checks |
+|---|---|---|
+| style::receiver_consistency | style, Deny | one receiver name per type; gVisor suppresses it only for generated code |
+| style::exported_needs_doc | style, Deny | every exported declaration documented; generated code excepted |
+| style::naming_convention | style, Deny | no underscores or ALL_CAPS outside the system-definition allowlist |
+| correctness::defer_in_loop | correctness, Forbid | a deferred call in a loop body defers to function exit |
+| correctness::time_tick_leak | correctness, Forbid | time.Tick in a scope that outlives the ticker |
+| suspicious::empty_branch | suspicious, Warn | an empty or comment-only branch body |
+| suspicious::self_assignment | suspicious, Warn | assigning a variable to itself |
+| suspicious::always_true_error_check | suspicious, Deny | comparing an error the types prove nil |
+| portability::uintptr_to_uint | portability, Warn | narrowing uintptr conversions that differ on wasm32 |
+| perf::range_copy | perf, Warn | ranging over large by-value structs |
+| perf::huge_param | perf, Warn | by-value parameters over the agreed size bound |
+| style::comment_formatting | style, Deny | eighty-column wrap and the verb rules from the style guide |
+| pedantic::exhaustive_switch | pedantic, Allow | exhaustive switching over enum-like named types |
+
+The named long item is concurrency::lock_state_contract, the
+annotation-driven lock-state prover matching the checklocks
+family. It is the largest build and lands after the vet-suite
+additions.
 
 ## Verification
 
