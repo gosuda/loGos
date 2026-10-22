@@ -56,6 +56,18 @@ func logosForceStopTheWorld() {
 	}
 }
 
+// logosGCModeIsSTW reports whether the selected mode collects only while the
+// world is stopped: batch and epsilon do. No collection then paces
+// concurrently, so the utilization a concurrent pacer targets is
+// unreachable.
+func logosGCModeIsSTW() bool {
+	switch logosGCMode {
+	case "batch", "epsilon":
+		return true
+	}
+	return false
+}
+
 // logosGCRefuses reports whether the mode forbids a collection that t
 // would start. Epsilon starts none on its own: only an explicit runtime.GC,
 // a gcTriggerCycle, collects. Batch collects only at its heap trigger, so it

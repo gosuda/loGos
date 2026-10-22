@@ -25,6 +25,11 @@ func LogosModeRefuses(mode string) (heap, periodic, explicit bool) {
 		logosModeRefuses(mode, gcTrigger{kind: gcTriggerCycle})
 }
 
+// LogosGCModeIsSTW exposes logosGCModeIsSTW.
+func LogosGCModeIsSTW() bool {
+	return logosGCModeIsSTW()
+}
+
 // LogosSanePhysMem exposes logosSanePhysMem.
 func LogosSanePhysMem(phys uint64) uint64 {
 	return logosSanePhysMem(phys)
