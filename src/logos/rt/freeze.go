@@ -22,9 +22,9 @@ import (
 // and two views of one child still view one copy. Nils stay nil.
 // Identical slice headers share their copy. Views with different lengths
 // or capacities copy separately. The copy includes elements up to capacity.
-// Functions, channels, and unsafe pointers copy by reference: they name
-// code or rendezvous,
-// not data, and have no copy semantics. A nil p returns nil.
+// Freeze panics on a reachable non-nil function, channel, or unsafe pointer
+// because it cannot isolate that value's referenced state. Nil leaves remain
+// nil. A nil p returns nil.
 //
 // Freeze performs one fresh allocation per reachable heap object plus
 // its bookkeeping; it performs no synchronization, so mutating the
@@ -87,6 +87,11 @@ func (fr *freezer) copy(dst, src reflect.Value) {
 		fr.copySlice(dst, src)
 	case reflect.Map:
 		fr.copyMap(dst, src)
+	case reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		if !src.IsNil() {
+			panic("logos/rt: Freeze cannot isolate " + src.Kind().String())
+		}
+		dst.SetZero()
 	default:
 		dst.Set(readable(src))
 	}

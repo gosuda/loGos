@@ -429,6 +429,12 @@ The same conversion MUST copy for any other provenance. [T-201]
 
 A later write to the source (or to a child object it points to) MUST NOT change the frozen view. [T-201]
 
+`Freeze` MUST panic on a reachable non-nil `func`, `chan`, or `unsafe.Pointer`. It cannot isolate their referenced state. [T-201]
+
+A nil `func`, `chan`, or `unsafe.Pointer` MUST remain valid and copy as nil. [T-201]
+
+Reachability MUST include map keys and values, interface payloads, and slice capacity tails. [T-201]
+
 ### 2.2 RFC-202: Non-nil pointers, option types, and nil flow
 
 `*T` in `.lgo` MUST be non-nil. [T-202]
@@ -1789,7 +1795,7 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #107 Native CPU settings break reproducibility: The deterministic target MUST select GOAMD64=v3 and GOARM64=v8.2 unless the environment overrides them. Host-specific selection MUST require `target_cpu = "native"`. See Sec 1.5. [T-105]
 - #108 Emit-go fallback for interface switch cases: Interface cases in run-time `const switch` MUST use assertion on the value. Native and ejected output MUST agree. See Sec 2.5. [T-205]
 - #109 Conversion changes unrelated source text: `logos next` MUST preserve comments and build lines outside its edits. The toolchain MUST NOT add a `logos fmt` rewriting command. See Sec 1.3. [T-103]
-- #110 Frozen view sharing mutable heap child: `logos/rt.Freeze` MUST deep-copy its argument and return a `const` view. A later write to the source or its child MUST NOT change the view. See Sec 2.1. [T-201]
+- #110 Frozen view sharing mutable heap child: `logos/rt.Freeze` MUST deep-copy its argument and return a `const` view. A later write to the source or its child MUST NOT change the view. `Freeze` MUST panic on a reachable non-nil `func`, `chan`, or `unsafe.Pointer`. Nil leaves MUST copy as nil. Reachability MUST include map keys and values, interface payloads, and slice capacity tails. See Sec 2.1. [T-201]
 - #111 Unsafe ARM64 load store pair fusion: Pairs MUST keep distinct destinations with encodable offsets only. Go 1.27 already enforces this and the test MUST pin it. See Sec 15.1. [T-303]
 - #112 Generated files clashing with source files: Ejected output MUST NOT emit `.gen.go` file names. It MUST NOT emit a `//go:build !logos` line. See Sec 0.3. [T-0.3]
 - #113 Inlined defer leaking resources in loops: A scope defer in a loop body MUST run every iteration. Cleanup on panic MUST use open-coded defers. See Sec 20.1. [T-104.7]

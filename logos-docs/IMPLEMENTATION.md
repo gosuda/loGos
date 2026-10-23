@@ -1596,11 +1596,11 @@ Anchor: Tony Hoare, John Carmack
 
 ### M5-S6 `logos/rt.Freeze`
 Anchor: Tony Hoare
-- Attack: `test/logos/run/freeze.lgo`: `f := rt.Freeze(&cfg)` returns a `const *Config`; later writes to `cfg` (and to a child object it points to) do not change `f` (#110); `testing.AllocsPerRun` shows one deep copy.
+- Attack: `test/logos/run/freeze.lgo`: `f := rt.Freeze(&cfg)` returns a `const *Config`; later writes to `cfg` (and to a child object it points to) do not change `f` (#110); `testing.AllocsPerRun` shows one deep copy. Rejection pins in `src/logos/rt/freeze_leaves_test.go`: `Freeze` panics on a reachable non-nil `func`, `chan`, or `unsafe.Pointer`. Cases cover direct values, map values, interface payloads, slice capacity tails, and comparable map keys. Nil leaves copy as nil (#110).
 - Attack (Go-facing export, R-U2): `src/cmd/go/testdata/script/logos_interop_const.txt`: package `c` (loGo/s) exports `func Primes() const []int` over a const composite, `func Count(m const map[string]int, k string) int`, and `func Snapshot(p *Config) const *Config` (through `rt.Freeze`); a Go package in another workspace module imports `c`: `Primes()` returns a plain `[]int`, `Count` takes a plain `map[string]int`, and `Snapshot` returns a plain `*Config`; `logos build ./...` builds and runs it; the test does not assert what a Go write through the `Primes()` result does (documented hole, A-GOBOUNDARY).
 - Build (Go-facing export): the lowered declaration erases const views, so Go importers read plain types from `__.PKGDEF`; `.lgo` importers read the `const` fact lines (M5-S1).
-- Build: `func Freeze[T any](p *T) *T` in `logos/rt` (deep copy through `reflect`, cycles preserved with a visited map); the `.lgo` signature in facts is `func Freeze[T any](p *T) const *T`. PLAN's immortal-span promotion is replaced by a deep copy, so no heap object can be both frozen and mutable.
-- Gate: testdir test; `go test cmd/go -run 'Script/^logos_interop_const$'`.
+- Build: `func Freeze[T any](p *T) *T` in `logos/rt` (deep copy through `reflect`, cycles preserved with a visited map); the `.lgo` signature in facts is `func Freeze[T any](p *T) const *T`. PLAN's immortal-span promotion is replaced by a deep copy, so no heap object can be both frozen and mutable. A reachable non-nil `func`, `chan`, or `unsafe.Pointer` panics instead of copying; nil leaves copy as nil.
+- Gate: testdir test; `go test cmd/go -run 'Script/^logos_interop_const$'`; `go test -count=1 -race logos/rt`.
 - Red-team rows: #2, #3, #16 (`s = s[:0]` buffer reuse on ordinary slices is unaffected: only const views have the `len` bound), #24, #41, #47, #50, #51, #54, #62, #70, #73, #83, #93, #98, #102, #103, #110, #140, #152, #180.
 - Docs: P1-S3, P2.
 - Milestone gate: G2.
