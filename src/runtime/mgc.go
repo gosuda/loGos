@@ -321,7 +321,7 @@ func pollFractionalWorkerExit() bool {
 	selfTime := p.gcFractionalMarkTime.Load() + (now - p.gcMarkWorkerStartTime)
 	// Add some slack to the utilization goal so that the
 	// fractional worker isn't behind again the instant it exits.
-	return float64(selfTime)/float64(delta) > 1.2*gcController.fractionalUtilizationGoal
+	return float64(selfTime)/float64(delta) > 1.2*gcController.fractionalUtilizationGoal.Load()
 }
 
 var work workType
