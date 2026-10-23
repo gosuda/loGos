@@ -20,9 +20,10 @@ import (
 // subobjects keep their shape through a visited map: a self-referential
 // value terminates, a back edge resolves to the copy under construction,
 // and two views of one child still view one copy. Nils stay nil.
-// Identical slice headers share their copy; slices that share a backing
-// array under different lengths copy separately. Functions, channels,
-// and unsafe pointers copy by reference: they name code or rendezvous,
+// Identical slice headers share their copy. Views with different lengths
+// or capacities copy separately. The copy includes elements up to capacity.
+// Functions, channels, and unsafe pointers copy by reference: they name
+// code or rendezvous,
 // not data, and have no copy semantics. A nil p returns nil.
 //
 // Freeze performs one fresh allocation per reachable heap object plus
@@ -44,18 +45,21 @@ func Freeze[T any](p *T) *T {
 // freezer holds one Freeze call's visited map: every heap object the
 // copy already rebuilt, keyed by the source object's identity. The key
 // carries the type so two objects that share an address under
-// different types never collide, and the length for slices so headers
-// over one backing array with different lengths never collide.
+// different types never collide, and the length and capacity for slices
+// so headers over one backing array with different lengths or capacities
+// never collide.
 type freezer struct {
 	visited map[freezeVisit]reflect.Value
 }
 
 // freezeVisit identifies one source heap object: a pointer, map, or
-// slice header. n holds the slice length and is zero otherwise.
+// slice header. n holds the slice length and c the slice capacity;
+// both are zero otherwise.
 type freezeVisit struct {
 	typ reflect.Type
 	ptr unsafe.Pointer
 	n   int
+	c   int
 }
 
 // copy rebuilds src into dst. dst is always addressable and settable:
@@ -127,31 +131,37 @@ func (fr *freezer) copyInterface(dst, src reflect.Value) {
 	dst.Set(nv)
 }
 
-// copySlice rebuilds one slice: nil stays nil, an empty slice keeps its
-// shape with no elements to visit, a revisited header resolves to its
-// copy, and a fresh header allocates before the element copies so a
-// cycle through the elements lands.
+// copySlice rebuilds one slice: nil stays nil, a revisited header resolves
+// to its copy, and a fresh header allocates the full capacity before the
+// element copies so a cycle through the elements lands. The copy preserves
+// the accessible backing storage through the original capacity and then
+// restores the original length: elements past the length are part of the
+// value a preserved capacity exposes via reslicing, so they are deep-copied
+// like the visible ones. Identical headers (same pointer, length, and
+// capacity) share their copy; headers that differ in length or capacity
+// copy separately. The visited entry holds the length-restored view, never
+// the full-length allocation, so a back edge never observes length cap.
 func (fr *freezer) copySlice(dst, src reflect.Value) {
 	src = readable(src)
 	if src.IsNil() {
 		dst.Set(reflect.Zero(src.Type()))
 		return
 	}
-	if src.Len() == 0 {
-		dst.Set(reflect.MakeSlice(src.Type(), 0, src.Cap()))
-		return
-	}
-	key := freezeVisit{typ: src.Type(), ptr: src.UnsafePointer(), n: src.Len()}
+	key := freezeVisit{typ: src.Type(), ptr: src.UnsafePointer(), n: src.Len(), c: src.Cap()}
 	if prev, ok := fr.visited[key]; ok {
 		dst.Set(prev)
 		return
 	}
-	ns := reflect.MakeSlice(src.Type(), src.Len(), src.Cap())
-	fr.visited[key] = ns
-	for i := range src.Len() {
-		fr.copy(settable(ns.Index(i)), readable(src.Index(i)))
+	ns := reflect.MakeSlice(src.Type(), src.Cap(), src.Cap())
+	view := ns.Slice3(0, src.Len(), src.Cap())
+	fr.visited[key] = view
+	if src.Type().Elem().Size() != 0 {
+		full := src.Slice(0, src.Cap())
+		for i := range full.Len() {
+			fr.copy(settable(ns.Index(i)), readable(full.Index(i)))
+		}
 	}
-	dst.Set(ns)
+	dst.Set(view)
 }
 
 // copyMap rebuilds one map: nil stays nil, a revisited map resolves to
