@@ -5,6 +5,7 @@
 package cfg
 
 import (
+	"internal/buildcfg"
 	"os"
 	"path/filepath"
 	"slices"
@@ -51,14 +52,18 @@ func TestRefreshLogosArenaEnablesFromLogosToml(t *testing.T) {
 	root := arenaModule(t, "[build]\narena = true\n")
 	for range 2 {
 		RefreshLogosArena([]string{root})
-		if !Experiment.LogosArena || RawGOEXPERIMENT != "logosarena" || CleanGOEXPERIMENT == "" {
+		if !Experiment.LogosArena || CleanGOEXPERIMENT == "" {
 			t.Fatalf("after refresh: LogosArena=%v Raw=%q Clean=%q, want the experiment on", Experiment.LogosArena, RawGOEXPERIMENT, CleanGOEXPERIMENT)
 		}
 		if n := arenaTagCount(); n != 1 {
 			t.Fatalf("goexperiment.logosarena tool tag appears %d times, want once", n)
 		}
-		if got := os.Getenv("GOEXPERIMENT"); got != "logosarena" {
-			t.Fatalf("process GOEXPERIMENT = %q, want logosarena", got)
+		publishedExp, err := buildcfg.ParseGOEXPERIMENT(Goos, Goarch, os.Getenv("GOEXPERIMENT"))
+		if err != nil {
+			t.Fatalf("parse process GOEXPERIMENT %q: %v", os.Getenv("GOEXPERIMENT"), err)
+		}
+		if !publishedExp.LogosArena {
+			t.Fatalf("process GOEXPERIMENT = %q, want logosarena enabled", os.Getenv("GOEXPERIMENT"))
 		}
 	}
 }
@@ -69,8 +74,15 @@ func TestRefreshLogosArenaFollowsTheCurrentRoots(t *testing.T) {
 	off := arenaModule(t, "[build]\narena = false\n")
 	RefreshLogosArena([]string{on})
 	RefreshLogosArena([]string{off})
-	if Experiment.LogosArena || RawGOEXPERIMENT != "" || arenaTagCount() != 0 {
-		t.Errorf("arena = false after arena = true: LogosArena=%v Raw=%q tags=%d, want the startup experiment back", Experiment.LogosArena, RawGOEXPERIMENT, arenaTagCount())
+	if Experiment.LogosArena || arenaTagCount() != 0 {
+		t.Errorf("arena = false after arena = true: LogosArena=%v tags=%d, want the startup experiment back", Experiment.LogosArena, arenaTagCount())
+	}
+	publishedExp, err := buildcfg.ParseGOEXPERIMENT(Goos, Goarch, os.Getenv("GOEXPERIMENT"))
+	if err != nil {
+		t.Fatalf("parse process GOEXPERIMENT %q: %v", os.Getenv("GOEXPERIMENT"), err)
+	}
+	if publishedExp.LogosArena {
+		t.Errorf("process GOEXPERIMENT = %q, want logosarena disabled", os.Getenv("GOEXPERIMENT"))
 	}
 	RefreshLogosArena([]string{off, on})
 	if !Experiment.LogosArena {
@@ -85,8 +97,16 @@ func TestRefreshLogosArenaKeepsOtherExperiments(t *testing.T) {
 	}
 	root := arenaModule(t, "[build]\narena = true\n")
 	RefreshLogosArena([]string{root})
-	if !Experiment.LogosArena || Experiment.JSONv2 || RawGOEXPERIMENT != "nojsonv2,logosarena" {
+	if !Experiment.LogosArena || Experiment.JSONv2 {
 		t.Errorf("LogosArena=%v JSONv2=%v Raw=%q, want the arena added to the user's nojsonv2", Experiment.LogosArena, Experiment.JSONv2, RawGOEXPERIMENT)
+	}
+	publishedExp, err := buildcfg.ParseGOEXPERIMENT(Goos, Goarch, os.Getenv("GOEXPERIMENT"))
+	if err != nil {
+		t.Fatalf("parse process GOEXPERIMENT %q: %v", os.Getenv("GOEXPERIMENT"), err)
+	}
+	if !publishedExp.LogosArena || publishedExp.JSONv2 {
+		t.Errorf("published GOEXPERIMENT=%q: LogosArena=%v JSONv2=%v, want arena enabled and jsonv2 disabled",
+			os.Getenv("GOEXPERIMENT"), publishedExp.LogosArena, publishedExp.JSONv2)
 	}
 }
 

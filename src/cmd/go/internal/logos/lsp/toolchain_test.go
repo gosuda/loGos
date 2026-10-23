@@ -217,16 +217,47 @@ func TestToolchainDiagnosesGoPackages(t *testing.T) {
 	}
 }
 
-// TestToolchainHints runs the hints runner over a loGo/s package: the
-// compiler writes its hints report and the runner returns it as JSON.
+// TestToolchainHints runs the hints runner over a loGo/s package importing os
+// across default and explicit GOEXPERIMENT settings (logosfastcgo, nologosfastcgo,
+// none), verifying that the compiler and list exports align and emit valid hints.
 func TestToolchainHints(t *testing.T) {
 	root, tc := realWorkspace(t)
-	hints, err := tc.Hints(t.Context(), filepath.Join(root, "lmod", "a"), nil)
-	if err != nil {
-		t.Fatal(err)
+	pkgDir := filepath.Join(root, "lmod", "a")
+
+	cases := []struct {
+		name       string
+		experiment string
+		set        bool
+	}{
+		{name: "default", set: false},
+		{name: "logosfastcgo", experiment: "logosfastcgo", set: true},
+		{name: "nologosfastcgo", experiment: "nologosfastcgo", set: true},
+		{name: "none", experiment: "none", set: true},
 	}
-	if !json.Valid(hints) {
-		t.Errorf("hints are not JSON: %s", hints)
+	for _, tcCase := range cases {
+		t.Run(tcCase.name, func(t *testing.T) {
+			if tcCase.set {
+				t.Setenv("GOEXPERIMENT", tcCase.experiment)
+			}
+			hints, err := tc.Hints(t.Context(), pkgDir, nil)
+			if err != nil {
+				t.Fatalf("Hints failed: %v", err)
+			}
+			var report struct {
+				SchemaVersion string `json:"schemaVersion"`
+				Package       string `json:"package"`
+				Files         []struct {
+					Path  string `json:"path"`
+					Hints []any  `json:"hints"`
+				} `json:"files"`
+			}
+			if err := json.Unmarshal(hints, &report); err != nil {
+				t.Fatalf("hints is not a valid HintsReport: %v\n%s", err, hints)
+			}
+			if report.Package != "example.com/lmod/a" {
+				t.Errorf("report package = %q, want example.com/lmod/a", report.Package)
+			}
+		})
 	}
 }
 

@@ -865,6 +865,12 @@ func TestFastcallLogosProfileParity(t *testing.T) {
 		t.Fatalf("plain top entry = %q, want the call site", topPlain)
 	}
 
+	if goexperiment.LogosFastCgo {
+		t.Setenv("GOEXPERIMENT", "logosfastcgo")
+	} else {
+		t.Setenv("GOEXPERIMENT", "nologosfastcgo")
+	}
+
 	bin := fixtureBin(t, "logosfast")
 	dir := t.TempDir()
 	prof := filepath.Join(dir, "lgo.prof")
