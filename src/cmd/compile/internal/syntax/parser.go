@@ -33,6 +33,8 @@ type parser struct {
 	fnest  int    // function nesting level (for error handling)
 	xnest  int    // expression nesting level (for complit ambiguity resolution)
 	indent []byte // tracing support
+
+	lambdaBan int // M6-S6: `=>` suppression depth for switch-expression arm cases.
 }
 
 func (p *parser) init(file *PosBase, r io.Reader, errh ErrorHandler, pragh PragmaHandler, mode Mode) {
@@ -446,8 +448,7 @@ func (p *parser) fileOrNil() *File {
 			f.DeclList = p.appendGroup(f.DeclList, p.importDecl)
 
 		case _Const:
-			p.next()
-			f.DeclList = p.appendGroup(f.DeclList, p.constDecl)
+			f.DeclList = p.logosConstDecl(f.DeclList) // M5-S2 hook: `const func` decls (SPEC T-201).
 
 		case _Type:
 			p.next()
@@ -599,7 +600,7 @@ func (p *parser) constDecl(group *Group) Decl {
 
 	d.NameList = p.nameList(p.name())
 	if p.tok != _EOF && p.tok != _Semi && p.tok != _Rparen {
-		d.Type = p.typeOrNil()
+		d.Type = p.logosOptionType(p.typeOrNil()) // M3-S2: `const C T?` is allowed.
 		if p.gotAssign() {
 			d.Values = p.exprList()
 		}
@@ -664,23 +665,23 @@ func (p *parser) typeDecl(group *Group) Decl {
 				// d.Name "[" pname ptype "," ...
 				d.TParamList = p.paramList(pname, ptype, _Rbrack, true, false) // ptype may be nil
 				d.Alias = p.gotAssign()
-				d.Type = p.typeOrNil()
+				d.Type = p.logosOptionType(p.typeOrNil()) // M3-S2: generic header with option body.
 			} else {
 				// d.Name "[" pname "]" ...
 				// d.Name "[" x ...
-				d.Type = p.arrayType(pos, x)
+				d.Type = p.logosOptionType(p.arrayType(pos, x)) // M3-S2: `type A [3]int?`.
 			}
 		case _Rbrack:
 			// d.Name "[" "]" ...
 			p.next()
-			d.Type = p.sliceType(pos)
+			d.Type = p.logosOptionType(p.sliceType(pos)) // M3-S2: `type A []int?`.
 		default:
 			// d.Name "[" ...
-			d.Type = p.arrayType(pos, nil)
+			d.Type = p.logosOptionType(p.arrayType(pos, nil)) // M3-S2: `type A [N]int?`.
 		}
 	} else {
 		d.Alias = p.gotAssign()
-		d.Type = p.typeOrNil()
+		d.Type = p.logosOptionType(p.logosTypeDeclType(d)) // M3-S2: `type A T?`; M2-S6 hook inside.
 	}
 
 	if d.Type == nil {
@@ -870,7 +871,7 @@ func (p *parser) expr() Expr {
 		defer p.trace("expr")()
 	}
 
-	return p.binaryExpr(nil, 0)
+	return p.logosLambdaOrExpr(p.binaryExpr(nil, 0)) // M6-S6 hook: lone `x => ...` lambdas.
 }
 
 // Expression = UnaryExpr | Expression binary_op Expression .
@@ -880,7 +881,17 @@ func (p *parser) binaryExpr(x Expr, prec int) Expr {
 	if x == nil {
 		x = p.unaryExpr()
 	}
-	for (p.tok == _Operator || p.tok == _Star) && p.prec > prec {
+	for (p.tok == _Operator || p.tok == _Star || p.tok == _Coalesce) && p.prec > prec {
+		if p.tok == _Coalesce {
+			// logos M3-S2 hook: `??` binds less tightly than `||`
+			// and groups to the right (SPEC T-104.3). The scanner
+			// only produces _Coalesce in LogosMode.
+			if p.mode&LogosMode == 0 {
+				break
+			}
+			x = p.logosCoalesce(x, p.pos())
+			continue
+		}
 		t := new(Operation)
 		t.pos = p.pos()
 		t.Op = p.op
@@ -1022,9 +1033,15 @@ func (p *parser) operand(keep_parens bool) Expr {
 		return p.name()
 
 	case _Literal:
+		if x := p.logosInterpOperand(); x != nil { // M6-S1 hook: `$"..."`.
+			return x
+		}
 		return p.oliteral()
 
 	case _Lparen:
+		if e, ok := p.logosParenOperand(keep_parens); ok { // M6-S5 hook: shared `(` rule.
+			return e
+		}
 		pos := p.pos()
 		p.next()
 		p.xnest++
@@ -1075,7 +1092,13 @@ func (p *parser) operand(keep_parens bool) Expr {
 	case _Lbrack, _Chan, _Map, _Struct, _Interface:
 		return p.type_() // othertype
 
+	case _Const:
+		return p.logosConstOperand() // M5-S5 hook: `const T(x)` conversions (SPEC T-201).
+
 	default:
+		if x := p.logosOperand(); x != nil { // M2-S5 hook: switch expressions.
+			return x
+		}
 		x := p.badExpr()
 		p.syntaxError("expected expression")
 		p.advance(_Rparen, _Rbrack, _Rbrace)
@@ -1148,8 +1171,20 @@ loop:
 				p.want(_Rparen)
 
 			default:
+				if fp := p.logosFieldProj(x, pos); fp != nil { // M7-S2 hook: `.[f]` projections.
+					x = fp
+					break
+				}
+				if sel := p.logosDotMap(); sel != nil { // M6-S7 hook: `.map` chains.
+					t := new(SelectorExpr)
+					t.pos = pos
+					t.X = x
+					t.Sel = sel
+					x = t
+					break
+				}
 				p.syntaxError("expected name or (")
-				p.advance(_Semi, _Rparen)
+				p.logosAdvanceSelector() // M2 hook: loGo/s recovery keeps `}`.
 			}
 
 		case _Lbrack:
@@ -1255,6 +1290,15 @@ loop:
 		case _Question:
 			x = p.logosQuestion(x, pos)
 
+		case _QuestionDot:
+			// logos M3-S2 hook: `?.` optional selection (SPEC
+			// T-104.3). The scanner only produces _QuestionDot in
+			// LogosMode.
+			if p.mode&LogosMode == 0 {
+				break loop
+			}
+			x = p.logosOptSelect(x, pos)
+
 		default:
 			break loop
 		}
@@ -1305,7 +1349,7 @@ func (p *parser) complitexpr() *CompositeLit {
 	p.want(_Lbrace)
 	x.Rbrace = p.list("composite literal", _Comma, _Rbrace, func() bool {
 		// value
-		e := p.bare_complitexpr()
+		e := p.logosSpreadOrElem() // M6-S4 hook: `..src` spread elements.
 		if p.tok == _Colon {
 			// key ':' value
 			l := new(KeyValueExpr)
@@ -1337,9 +1381,10 @@ func (p *parser) type_() Expr {
 		typ = p.badExpr()
 		p.syntaxError("expected type")
 		p.advance(_Comma, _Colon, _Semi, _Rparen, _Rbrack, _Rbrace)
+		return typ
 	}
 
-	return typ
+	return p.logosOptionType(typ) // M3-S2 hook: postfix `?` (SPEC T-202).
 }
 
 func newIndirect(pos Pos, typ Expr) Expr {
@@ -1364,10 +1409,13 @@ func (p *parser) typeOrNil() Expr {
 
 	pos := p.pos()
 	switch p.tok {
+	case _Const:
+		return p.logosConstType() // M5-S1 hook: `const T` const views (SPEC T-201).
+
 	case _Star:
 		// ptrtype
 		p.next()
-		return newIndirect(pos, p.type_())
+		return newIndirect(pos, p.logosTypeElem()) // M3-S2: `*U?` is an option of a pointer.
 
 	case _Arrow:
 		// recvchantype
@@ -1412,9 +1460,9 @@ func (p *parser) typeOrNil() Expr {
 		p.want(_Lbrack)
 		t := new(MapType)
 		t.pos = pos
-		t.Key = p.type_()
+		t.Key = p.logosTypeElem() // M3-S2: `?` after `]` belongs to the map.
 		p.want(_Rbrack)
-		t.Value = p.type_()
+		t.Value = p.logosTypeElem()
 		return t
 
 	case _Struct:
@@ -1427,6 +1475,9 @@ func (p *parser) typeOrNil() Expr {
 		return p.qualifiedName(nil)
 
 	case _Lparen:
+		if e, ok := p.logosParenType(); ok { // M6-S5 hook: shared `(` rule.
+			return e
+		}
 		p.next()
 		t := p.type_()
 		p.want(_Rparen)
@@ -1519,7 +1570,7 @@ func (p *parser) arrayType(pos Pos, len Expr) Expr {
 	t := new(ArrayType)
 	t.pos = pos
 	t.Len = len
-	t.Elem = p.type_()
+	t.Elem = p.logosTypeElem() // M3-S2: `?` after `]` belongs to the array.
 	return t
 }
 
@@ -1527,7 +1578,7 @@ func (p *parser) arrayType(pos Pos, len Expr) Expr {
 func (p *parser) sliceType(pos Pos) Expr {
 	t := new(SliceType)
 	t.pos = pos
-	t.Elem = p.type_()
+	t.Elem = p.logosTypeElem() // M3-S2: `?` after `]` belongs to the slice.
 	return t
 }
 
@@ -1578,7 +1629,7 @@ func (p *parser) interfaceType() *InterfaceType {
 	p.want(_Lbrace)
 	p.list("interface type", _Semi, _Rbrace, func() bool {
 		var f *Field
-		if p.tok == _Name {
+		if f = p.logosPropertyConst(); f == nil && p.tok == _Name { // M4-S1 hook: `const F T` properties.
 			f = p.methodDecl()
 		}
 		if f == nil || f.Name == nil {
@@ -1598,14 +1649,14 @@ func (p *parser) funcResult() []*Field {
 	}
 
 	if p.got(_Lparen) {
-		return p.paramList(nil, nil, _Rparen, false, false)
+		return p.logosOptionResult(p.paramList(nil, nil, _Rparen, false, false)) // M3-S2: `func() (T?)?`.
 	}
 
 	pos := p.pos()
 	if typ := p.typeOrNil(); typ != nil {
 		f := new(Field)
 		f.pos = pos
-		f.Type = typ
+		f.Type = p.logosOptionType(typ) // M3-S2: `func() int?` returns an option.
 		return []*Field{f}
 	}
 
@@ -1671,6 +1722,7 @@ func (p *parser) fieldDecl(styp *StructType) {
 			typ = p.type_()
 		}
 
+		typ = p.logosFieldDefault(typ) // M6-S3 hook: `F T = const` defaults.
 		tag := p.oliteral()
 
 		for _, name := range names {
@@ -1724,7 +1776,7 @@ func (p *parser) arrayOrTArgs() Expr {
 	pos := p.pos()
 	p.want(_Lbrack)
 	if p.got(_Rbrack) {
-		return p.sliceType(pos)
+		return p.logosOptionType(p.sliceType(pos)) // M3-S2: field `F []int?`.
 	}
 
 	// x [n]E or x[n,], x[n1, n2], ...
@@ -1737,7 +1789,7 @@ func (p *parser) arrayOrTArgs() Expr {
 			t.pos = pos
 			t.Len = n
 			t.Elem = elem
-			return t
+			return p.logosOptionType(t) // M3-S2: field `F [3]int?`.
 		}
 	}
 
@@ -1775,6 +1827,10 @@ func (p *parser) methodDecl() *Field {
 	name := p.name()
 
 	const context = "interface method"
+
+	if pf := p.logosPropertyRest(name, f); pf != nil { // M4-S1 hook: `F T` properties.
+		return pf
+	}
 
 	switch p.tok {
 	case _Lparen:
@@ -1954,7 +2010,7 @@ func (p *parser) paramDeclOrNil(name *Name, follow token) *Field {
 
 		if p.tok == _Dot {
 			// name "." ...
-			f.Type = p.qualifiedName(name)
+			f.Type = p.logosOptionType(p.qualifiedName(name)) // M3-S2: `(pkg.T?)`.
 			if typeSetsOk && p.tok == _Operator && p.op == Or {
 				// name "." name "|" ...
 				f = p.embeddedElem(f)
@@ -1976,7 +2032,7 @@ func (p *parser) paramDeclOrNil(name *Name, follow token) *Field {
 		t := new(DotsType)
 		t.pos = p.pos()
 		p.next()
-		t.Elem = p.typeOrNil()
+		t.Elem = p.logosOptionType(p.typeOrNil()) // M3-S2: `...int?` is variadic of option.
 		if t.Elem == nil {
 			f.Type = p.badExpr()
 			p.syntaxError("... is missing type")
@@ -1993,6 +2049,15 @@ func (p *parser) paramDeclOrNil(name *Name, follow token) *Field {
 	}
 
 	f.Type = p.typeOrNil()
+	if f.Type == nil && f.Name != nil && (p.tok == _Question || p.tok == _Coalesce) {
+		// M3-S2: unnamed parameter of option type (`(int?)`): the
+		// name just read is the type. (`T??` reports through the
+		// wrap below.) Plain mode never sees these tokens.
+		f.Type = p.logosOptionType(f.Name)
+		f.Name = nil
+	} else {
+		f.Type = p.logosOptionType(f.Type) // M3-S2 hook: parameter types may be options.
+	}
 	if typeSetsOk && p.tok == _Operator && p.op == Or && f.Type != nil {
 		// [name] type "|"
 		f = p.embeddedElem(f)
@@ -2631,6 +2696,12 @@ func (p *parser) stmtOrNil() Stmt {
 		if s := p.logosErrdefer(lhs); s != nil { // M1-S2 hook: errdefer statement.
 			return s
 		}
+		if s := p.logosYield(lhs); s != nil { // M6-S9 hook: yield statement.
+			return s
+		}
+		if s := p.logosScopeDefer(lhs); s != nil { // M6-S10 hook: scope defer statement.
+			return s
+		}
 		return p.simpleStmt(lhs, 0)
 	}
 
@@ -2639,6 +2710,12 @@ func (p *parser) stmtOrNil() Stmt {
 		return p.declStmt(p.varDecl)
 
 	case _Const:
+		if s := p.logosConstStmt(); s != nil { // M7-S1/S4 hook: `const if` and `const switch` statements.
+			return s
+		}
+		if s := p.logosConstForStmt(); s != nil { // M7-S2 hook: `const for` statements.
+			return s
+		}
 		return p.declStmt(p.constDecl)
 
 	case _Type:
@@ -2692,6 +2769,9 @@ func (p *parser) stmtOrNil() Stmt {
 		return s
 
 	case _Go, _Defer:
+		if s := p.logosGoStmt(); s != nil { // M8-S2 hook: go group and child blocks.
+			return s
+		}
 		return p.callStmt()
 
 	case _Goto:
@@ -2876,10 +2956,10 @@ func (p *parser) typeList(strict bool) (x Expr, comma bool) {
 	}
 	if p.got(_Comma) {
 		comma = true
-		if t := p.typeOrNil(); t != nil {
+		if t := p.logosOptionType(p.typeOrNil()); t != nil {
 			list := []Expr{x, t}
 			for p.got(_Comma) {
-				if t = p.typeOrNil(); t == nil {
+				if t = p.logosOptionType(p.typeOrNil()); t == nil {
 					break
 				}
 				list = append(list, t)

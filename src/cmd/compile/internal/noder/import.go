@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"internal/buildcfg"
 	"internal/exportdata"
-	"internal/pkgbits"
 	"os"
 	pathpkg "path"
 	"runtime"
@@ -18,10 +17,6 @@ import (
 	"unicode/utf8"
 
 	"cmd/compile/internal/base"
-	"cmd/compile/internal/importer"
-	"cmd/compile/internal/ir"
-	"cmd/compile/internal/typecheck"
-	"cmd/compile/internal/types"
 	"cmd/compile/internal/types2"
 	"cmd/internal/bio"
 	"cmd/internal/goobj"
@@ -42,8 +37,7 @@ func (m *gcimports) ImportFrom(path, srcDir string, mode types2.ImportMode) (*ty
 		panic("mode must be 0")
 	}
 
-	_, pkg, err := readImportFile(path, typecheck.Target, m.ctxt, m.packages)
-	return pkg, err
+	return logosImportFrom(m, path)
 }
 
 func isDriveLetter(b byte) bool {
@@ -165,68 +159,6 @@ func resolveImportPath(path string) (string, error) {
 	}
 
 	return path, nil
-}
-
-// readImportFile reads the import file for the given package path and
-// returns its types.Pkg representation. If packages is non-nil, the
-// types2.Package representation is also returned.
-func readImportFile(path string, target *ir.Package, env *types2.Context, packages map[string]*types2.Package) (pkg1 *types.Pkg, pkg2 *types2.Package, err error) {
-	path, err = resolveImportPath(path)
-	if err != nil {
-		return
-	}
-
-	if path == "unsafe" {
-		pkg1, pkg2 = types.UnsafePkg, types2.Unsafe
-
-		// TODO(mdempsky): Investigate if this actually matters. Why would
-		// the linker or runtime care whether a package imported unsafe?
-		if !pkg1.Direct {
-			pkg1.Direct = true
-			target.Imports = append(target.Imports, pkg1)
-		}
-
-		return
-	}
-
-	pkg1 = types.NewPkg(path, "")
-	if packages != nil {
-		pkg2 = packages[path]
-		if !(pkg1.Direct == (pkg2 != nil && pkg2.Complete())) {
-
-			base.Fatalf("pkg1.Direct == (pkg2 != nil && pkg2.Complete()), path=%s\npackages=%v", path, packages)
-		}
-	}
-
-	if pkg1.Direct {
-		return
-	}
-	pkg1.Direct = true
-	target.Imports = append(target.Imports, pkg1)
-
-	f, err := openPackage(path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	data, err := readExportData(f)
-	if err != nil {
-		return
-	}
-
-	if base.Debug.Export != 0 {
-		fmt.Printf("importing %s (%s)\n", path, f.Name())
-	}
-
-	pr := pkgbits.NewPkgDecoder(pkg1.Path, data)
-
-	// Read package descriptors for both types2 and compiler backend.
-	readPackage(newPkgReader(pr), pkg1, false)
-	pkg2 = importer.ReadPackage(env, packages, pr)
-
-	err = addFingerprint(path, data)
-	return
 }
 
 // readExportData returns the contents of GC-created unified export data.

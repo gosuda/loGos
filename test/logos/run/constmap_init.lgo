@@ -1,0 +1,104 @@
+// run
+
+package main
+
+// M5-S3 and M5-S4 read-only placement (SPEC Sec 2.1, Sec 9.1, T-201;
+// T-PERF PLAN:687): touching const composites adds no heap bytes at
+// init, and a const array and both tables of a 1,000-key const map are
+// read-only symbols (type R in go tool nm).
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+const initSlice = []int{2, 3, 5, 7, 11, 13, 17, 19}
+const initArray = [8]int{1, 2, 3, 4, 5, 6, 7, 8}
+
+// probeSrc builds the nm probe: a const array and a 1,000-key const map,
+// which lowers to a perfect-hash table (more than 8 keys).
+func probeSrc() string {
+	var b strings.Builder
+	b.WriteString("package main\n\nimport \"fmt\"\n\nconst initArray = [8]int{1, 2, 3, 4, 5, 6, 7, 8}\n\nconst squares = map[int]int{")
+	for k := range 1000 {
+		b.WriteString(fmt.Sprintf("%d: %d, ", k, k*k))
+	}
+	b.WriteString("}\n\nfunc main() {\n\tn := 0\n\tfor range squares {\n\t\tn++\n\t}\n\tfmt.Println(initArray, squares[31] ?? -1, n)\n}\n")
+	return b.String()
+}
+
+//logos:allow(complexity::cognitive_overflow)
+func main() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	runtime.ReadMemStats(&m)
+	before := m.HeapAlloc
+	sum := 0
+	for _, v := range initSlice {
+		sum += v
+	}
+	for _, v := range initArray {
+		sum += v
+	}
+	if sum != 113 {
+		fmt.Printf("FAIL sum=%d\n", sum)
+		os.Exit(1)
+	}
+	runtime.ReadMemStats(&m)
+	after := m.HeapAlloc
+	fmt.Printf("heap delta=%d\n", after-before)
+	if after != before {
+		fmt.Println("FAIL heap grew at init")
+		os.Exit(1)
+	}
+	binDir := filepath.Join(runtime.GOROOT(), "bin")
+	goBin := filepath.Join(binDir, "go")
+	logosBin := filepath.Join(binDir, "logos")
+	if runtime.GOOS == "windows" {
+		goBin += ".exe"
+		logosBin += ".exe"
+	}
+	dir, err := os.MkdirTemp("", "initnm")
+	if err != nil {
+		fmt.Printf("FAIL tempdir: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module probe\n\ngo 1.27\n"), 0644); err != nil {
+		fmt.Printf("FAIL gomode: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.lgo"), []byte(probeSrc()), 0644); err != nil {
+		fmt.Printf("FAIL source: %v\n", err)
+		os.Exit(1)
+	}
+	cmd := exec.Command(logosBin, "build", "-o", "probe.exe", ".")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		fmt.Printf("FAIL probe build: %v\n%s", err, out)
+		os.Exit(1)
+	}
+	nmOut, err := exec.Command(goBin, "tool", "nm", filepath.Join(dir, "probe.exe")).CombinedOutput()
+	if err != nil {
+		fmt.Printf("FAIL nm: %v\n%s", err, nmOut)
+		os.Exit(1)
+	}
+	symType := map[string]string{}
+	for _, line := range strings.Split(string(nmOut), "\n") {
+		if f := strings.Fields(line); len(f) >= 3 {
+			symType[f[len(f)-1]] = f[1]
+		}
+	}
+	for _, sym := range []string{"main.initArray", "main._logos_cm0_squares_sorted", "main._logos_cm0_squares_tab"} {
+		kind := symType[sym] ?? ""
+		fmt.Printf("%s=%s\n", sym, kind)
+		if kind != "R" {
+			fmt.Printf("FAIL %s not in rodata\n", sym)
+			os.Exit(1)
+		}
+	}
+	fmt.Println("init OK")
+}

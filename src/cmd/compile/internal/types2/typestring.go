@@ -185,6 +185,36 @@ func (w *typeWriter) typ(typ Type) {
 		w.byte('*')
 		w.typ(t.base)
 
+	case *ConstView: // logos M5-S1 hook: loGo/s const view `const T` prints with the caller's qualifier.
+		w.string("const ")
+		w.typ(t.Elem)
+
+	case *LogosTuple: // logos M6-S5 hook: loGo/s tuple `(A, B)` prints in source form.
+		w.byte('(')
+		for i := range t.Len() {
+			if i > 0 {
+				w.string(", ")
+			}
+			if name := t.Name(i); name != "" {
+				w.string(name)
+				w.byte(' ')
+			}
+			w.typ(t.Elem(i))
+		}
+		w.byte(')')
+
+	case *Option: // logos M3-S2 hook: loGo/s option type `T?` prints with the caller's qualifier.
+		// A nested option needs parentheses (`(T?)?`), because the
+		// joined spelling `T??` is not valid source (SPEC T-202).
+		if _, ok := t.Elem.(*Option); ok {
+			w.byte('(')
+			w.typ(t.Elem)
+			w.string(")?")
+		} else {
+			w.typ(t.Elem)
+			w.byte('?')
+		}
+
 	case *Tuple:
 		w.tuple(t, false)
 

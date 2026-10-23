@@ -720,7 +720,7 @@ func (p *printer) printRawNode(n Node) {
 			p.printDeclList(n.DeclList)
 		}
 
-	case *TryExpr, *ErrdeferStmt: // M1-S2 hook: loGo/s nodes.
+	case *TryExpr, *ErrdeferStmt, *SwitchExpr, *ArmClause, *AssertedStruct, *PropertyType, *OptionType, *CoalesceExpr, *OptSelectExpr, *ConstType, *ConstFuncDecl, *YieldStmt, *ScopeDeferStmt, *FieldDefault, *SpreadExpr, *InterpExpr, *TupleType, *TupleLit, *LambdaExpr, *ConstIfStmt, *ConstSwitchStmt, *ConstForStmt, *FieldProjExpr, *GroupStmt, *GroupChild: // M1-S2, M2, M3-S2, M4-S1, M5-S1, M5-S2, M6-S1, M6-S3, M6-S4, M6-S5, M6-S6, M6-S9, M6-S10, M7-S1, M7-S2, M7-S4, M8-S2 hook: loGo/s nodes.
 		printLogos(p, n)
 	default:
 		panic(fmt.Sprintf("syntax.Iterate: unexpected node type %T", n))
@@ -769,8 +769,12 @@ func (p *printer) printMethodList(methods []*Field) {
 			p.print(_Semi, newline)
 		}
 		if m.Name != nil {
-			p.printNode(m.Name)
-			p.printSignature(m.Type.(*FuncType))
+			if pt, ok := m.Type.(*PropertyType); ok { // M4-S1 hook: `const F T` / `F T` elements.
+				logosPrintProperty(p, m.Name, pt)
+			} else {
+				p.printNode(m.Name)
+				p.printSignature(m.Type.(*FuncType))
+			}
 		} else {
 			p.printNode(m.Type)
 		}
@@ -816,6 +820,8 @@ func groupFor(d Decl) (token, *Group) {
 	case *VarDecl:
 		return _Var, d.Group
 	case *FuncDecl:
+		return _Func, nil
+	case *ConstFuncDecl: // M5-S2: a const func prints as a standalone func.
 		return _Func, nil
 	default:
 		panic("unreachable")

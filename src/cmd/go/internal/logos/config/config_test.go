@@ -31,7 +31,7 @@ var validDocs = []validCase{
 		data: "",
 		want: File{
 			Project: Project{Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "forbid"},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -39,7 +39,7 @@ var validDocs = []validCase{
 		data: "[project]\nname = \"myapp\"\n",
 		want: File{
 			Project: Project{Name: "myapp", Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "forbid"},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -47,7 +47,7 @@ var validDocs = []validCase{
 		data: "[project]\nname = 'myapp'\n",
 		want: File{
 			Project: Project{Name: "myapp", Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "forbid"},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -55,7 +55,7 @@ var validDocs = []validCase{
 		data: "# leading comment\n[project] # table comment\n# full line\nname = \"m\" # trailing\n",
 		want: File{
 			Project: Project{Name: "m", Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "forbid"},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -63,7 +63,7 @@ var validDocs = []validCase{
 		data: "[project]\r\nname = \"m\"\r\n",
 		want: File{
 			Project: Project{Name: "m", Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "forbid"},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -71,7 +71,7 @@ var validDocs = []validCase{
 		data: "[project]\nstrict_files = [\".lgo\", \".⚡\"]\n[build]\ncgo_allowlist = [\"example.com/m/ok/**\"]\n",
 		want: File{
 			Project: Project{Edition: "2026", StrictFiles: []string{".lgo", ".⚡"}},
-			Build:   Build{Cgo: "forbid", CgoAllowlist: []string{"example.com/m/ok/**"}},
+			Build:   Build{Cgo: "forbid", CgoAllowlist: []string{"example.com/m/ok/**"}, OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -79,7 +79,7 @@ var validDocs = []validCase{
 		data: "[project]\nstrict_files = [\n\".lgo\",\n\".⚡\",\n]\n",
 		want: File{
 			Project: Project{Edition: "2026", StrictFiles: []string{".lgo", ".⚡"}},
-			Build:   Build{Cgo: "forbid"},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -87,7 +87,7 @@ var validDocs = []validCase{
 		data: "[build]\ncgo = \"allow\"\n",
 		want: File{
 			Project: Project{Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "allow", CgoSet: true},
+			Build:   Build{Cgo: "allow", CgoSet: true, OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -95,7 +95,7 @@ var validDocs = []validCase{
 		data: "[project]\nname = \"m\"\n",
 		want: File{
 			Project: Project{Name: "m", Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "forbid"},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -103,7 +103,7 @@ var validDocs = []validCase{
 		data: "[build]\ncgo = \"forbid\"\n",
 		want: File{
 			Project: Project{Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "forbid", CgoSet: true},
+			Build:   Build{Cgo: "forbid", CgoSet: true, OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -111,7 +111,7 @@ var validDocs = []validCase{
 		data: "[build]\ncgo = \"restricted\"\n",
 		want: File{
 			Project: Project{Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "restricted", CgoSet: true},
+			Build:   Build{Cgo: "restricted", CgoSet: true, OptLevel: "O2", TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -119,7 +119,23 @@ var validDocs = []validCase{
 		data: "[build]\ncgo = \"allow\"\n",
 		want: File{
 			Project: Project{Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "allow", CgoSet: true},
+			Build:   Build{Cgo: "allow", CgoSet: true, OptLevel: "O2", TargetCPU: "deterministic"},
+		},
+	},
+	{
+		name: "opt level, synthetic pgo, and target cpu",
+		data: "[build]\nopt_level = \"O3\"\nsynthetic_pgo = \"aggressive\"\ntarget_cpu = \"native\"\n",
+		want: File{
+			Project: Project{Edition: "2026", StrictFiles: fourExts},
+			Build:   Build{Cgo: "forbid", OptLevel: "O3", SyntheticPGO: "aggressive", SynthPGOSet: true, TargetCPU: "native"},
+		},
+	},
+	{
+		name: "synthetic pgo off tracks presence",
+		data: "[build]\nsynthetic_pgo = \"off\"\n",
+		want: File{
+			Project: Project{Edition: "2026", StrictFiles: fourExts},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", SyntheticPGO: "off", SynthPGOSet: true, TargetCPU: "deterministic"},
 		},
 	},
 	{
@@ -127,13 +143,112 @@ var validDocs = []validCase{
 		data: "[project]\nname = \"m\"\nedition = \"2026\"\nstrict_files = [\".lgo\", \".📜\", \".⚡\", \".ʕ◔ϖ◔ʔ\"]\n[build]\ncgo = \"restricted\"\ncgo_allowlist = [\"example.com/m/ok/**\"]\n",
 		want: File{
 			Project: Project{Name: "m", Edition: "2026", StrictFiles: fourExts},
-			Build:   Build{Cgo: "restricted", CgoSet: true, CgoAllowlist: []string{"example.com/m/ok/**"}},
+			Build:   Build{Cgo: "restricted", CgoSet: true, CgoAllowlist: []string{"example.com/m/ok/**"}, OptLevel: "O2", TargetCPU: "deterministic"},
+		},
+	},
+	{
+		name: "capabilities severities",
+		data: "[capabilities]\ndirect_reflect = \"allow\"\ntransitive_reflect = \"deny\"\ntransitive_exec = \"warn\"\ntransitive_net = \"allow\"\ntransitive_unsafe = \"warn\"\n",
+		want: File{
+			Project: Project{Edition: "2026", StrictFiles: fourExts},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
+			Capabilities: Capabilities{
+				DirectReflect:     "allow",
+				TransitiveReflect: "deny",
+				TransitiveExec:    "warn",
+				TransitiveNet:     "allow",
+				TransitiveUnsafe:  "warn",
+			},
+		},
+	},
+	{
+		name: "capabilities allowlists",
+		data: "[capabilities]\nreflect_allowlist = [\"example.com/rt/**\"]\ntransitive_exec_allowlist = [\"example.com/exec\"]\ntransitive_net_allowlist = [\"example.com/net/**\"]\ntransitive_unsafe_allowlist = [\"example.com/dep/**\", \"example.com/other\"]\n",
+		want: File{
+			Project: Project{Edition: "2026", StrictFiles: fourExts},
+			Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
+			Capabilities: Capabilities{
+				DirectReflect:             "deny",
+				TransitiveReflect:         "warn",
+				TransitiveExec:            "deny",
+				TransitiveNet:             "deny",
+				TransitiveUnsafe:          "deny",
+				ReflectAllowlist:          []string{"example.com/rt/**"},
+				TransitiveExecAllowlist:   []string{"example.com/exec"},
+				TransitiveNetAllowlist:    []string{"example.com/net/**"},
+				TransitiveUnsafeAllowlist: []string{"example.com/dep/**", "example.com/other"},
+			},
 		},
 	},
 }
 
+func checkCapabilities(t *testing.T, got, want Capabilities) {
+	t.Helper()
+	if got.DirectReflect != want.DirectReflect {
+		t.Errorf("DirectReflect = %q, want %q", got.DirectReflect, want.DirectReflect)
+	}
+	if got.TransitiveReflect != want.TransitiveReflect {
+		t.Errorf("TransitiveReflect = %q, want %q", got.TransitiveReflect, want.TransitiveReflect)
+	}
+	if got.TransitiveExec != want.TransitiveExec {
+		t.Errorf("TransitiveExec = %q, want %q", got.TransitiveExec, want.TransitiveExec)
+	}
+	if got.TransitiveNet != want.TransitiveNet {
+		t.Errorf("TransitiveNet = %q, want %q", got.TransitiveNet, want.TransitiveNet)
+	}
+	if got.TransitiveUnsafe != want.TransitiveUnsafe {
+		t.Errorf("TransitiveUnsafe = %q, want %q", got.TransitiveUnsafe, want.TransitiveUnsafe)
+	}
+	if !slices.Equal(got.ReflectAllowlist, want.ReflectAllowlist) {
+		t.Errorf("ReflectAllowlist = %q, want %q", got.ReflectAllowlist, want.ReflectAllowlist)
+	}
+	if !slices.Equal(got.TransitiveExecAllowlist, want.TransitiveExecAllowlist) {
+		t.Errorf("TransitiveExecAllowlist = %q, want %q", got.TransitiveExecAllowlist, want.TransitiveExecAllowlist)
+	}
+	if !slices.Equal(got.TransitiveNetAllowlist, want.TransitiveNetAllowlist) {
+		t.Errorf("TransitiveNetAllowlist = %q, want %q", got.TransitiveNetAllowlist, want.TransitiveNetAllowlist)
+	}
+	if !slices.Equal(got.TransitiveUnsafeAllowlist, want.TransitiveUnsafeAllowlist) {
+		t.Errorf("TransitiveUnsafeAllowlist = %q, want %q", got.TransitiveUnsafeAllowlist, want.TransitiveUnsafeAllowlist)
+	}
+}
+
+func defaultCapabilities() Capabilities {
+	return Capabilities{
+		DirectReflect:     "deny",
+		TransitiveReflect: "warn",
+		TransitiveExec:    "deny",
+		TransitiveNet:     "deny",
+		TransitiveUnsafe:  "deny",
+	}
+}
+
+// withCapDefaults fills unset severity fields with their defaults, so
+// cases that only set allowlists still expect the default severities.
+func withCapDefaults(c Capabilities) Capabilities {
+	d := defaultCapabilities()
+	if c.DirectReflect == "" {
+		c.DirectReflect = d.DirectReflect
+	}
+	if c.TransitiveReflect == "" {
+		c.TransitiveReflect = d.TransitiveReflect
+	}
+	if c.TransitiveExec == "" {
+		c.TransitiveExec = d.TransitiveExec
+	}
+	if c.TransitiveNet == "" {
+		c.TransitiveNet = d.TransitiveNet
+	}
+	if c.TransitiveUnsafe == "" {
+		c.TransitiveUnsafe = d.TransitiveUnsafe
+	}
+	return c
+}
+
 func checkFile(t *testing.T, got *File, want File) {
 	t.Helper()
+	want.Capabilities = withCapDefaults(want.Capabilities)
+	checkCapabilities(t, got.Capabilities, want.Capabilities)
 	if got.Project.Name != want.Project.Name {
 		t.Errorf("Project.Name = %q, want %q", got.Project.Name, want.Project.Name)
 	}
@@ -151,6 +266,18 @@ func checkFile(t *testing.T, got *File, want File) {
 	}
 	if !slices.Equal(got.Build.CgoAllowlist, want.Build.CgoAllowlist) {
 		t.Errorf("Build.CgoAllowlist = %q, want %q", got.Build.CgoAllowlist, want.Build.CgoAllowlist)
+	}
+	if got.Build.OptLevel != want.Build.OptLevel {
+		t.Errorf("Build.OptLevel = %q, want %q", got.Build.OptLevel, want.Build.OptLevel)
+	}
+	if got.Build.SyntheticPGO != want.Build.SyntheticPGO {
+		t.Errorf("Build.SyntheticPGO = %q, want %q", got.Build.SyntheticPGO, want.Build.SyntheticPGO)
+	}
+	if got.Build.SynthPGOSet != want.Build.SynthPGOSet {
+		t.Errorf("Build.SynthPGOSet = %v, want %v", got.Build.SynthPGOSet, want.Build.SynthPGOSet)
+	}
+	if got.Build.TargetCPU != want.Build.TargetCPU {
+		t.Errorf("Build.TargetCPU = %q, want %q", got.Build.TargetCPU, want.Build.TargetCPU)
 	}
 }
 
@@ -192,9 +319,17 @@ func TestParseViolations(t *testing.T) {
 		{"float", "[project]\nname = 1.5\n", `logos.toml:2:8: float not allowed`},
 		{"date", "[project]\nname = 1979-05-27\n", `logos.toml:2:8: date not allowed`},
 		{"invalid cgo value", "[build]\ncgo = \"sometimes\"\n", `logos.toml:2:7: invalid cgo value "sometimes" (want forbid, restricted, or allow)`},
+		{"invalid capabilities severity", "[capabilities]\ntransitive_unsafe = \"forbid\"\n", `logos.toml:2:21: invalid transitive_unsafe value "forbid" (want deny, warn, or allow)`},
+		{"capabilities key in build table", "[build]\ntransitive_unsafe = \"deny\"\n", `logos.toml:2:1: unknown key "transitive_unsafe"`},
+		{"build key in capabilities table", "[capabilities]\ncgo = \"allow\"\n", `logos.toml:2:1: unknown key "cgo"`},
+		{"invalid capabilities allowlist pattern", "[capabilities]\ntransitive_unsafe_allowlist = [\"[\"]\n", `logos.toml:2:32: [configuration::invalid_capabilities_allowlist] transitive_unsafe_allowlist pattern "[": syntax error in pattern`},
 		{"invalid strict_files entry", "[project]\nstrict_files = [\".go\"]\n", `logos.toml:2:17: invalid strict_files entry ".go" (want ".lgo", ".📜", ".⚡", or ".ʕ◔ϖ◔ʔ")`},
 		{"empty project name", "[project]\nname = \"\"\n", `logos.toml:2:8: project name must not be empty`},
 		{"unsupported edition", "[project]\nedition = \"2027\"\n", `logos.toml:2:11: unsupported edition "2027" (want "2026")`},
+		{"bare opt level rejected", "[build]\nopt_level = \"3\"\n", `logos.toml:2:13: opt_level must be one of O0, O1, O2, O3, Os, Oz`},
+		{"unknown opt level rejected", "[build]\nopt_level = \"O4\"\n", `logos.toml:2:13: opt_level must be one of O0, O1, O2, O3, Os, Oz`},
+		{"invalid synthetic pgo", "[build]\nsynthetic_pgo = \"turbo\"\n", `logos.toml:2:17: synthetic_pgo must be one of off, standard, aggressive`},
+		{"invalid target cpu", "[build]\ntarget_cpu = \"laptop\"\n", `logos.toml:2:14: target_cpu must be one of deterministic, baseline, native`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -259,7 +394,7 @@ func TestLoadAbsentReturnsDefaults(t *testing.T) {
 	}
 	checkFile(t, got, File{
 		Project: Project{Edition: "2026", StrictFiles: fourExts},
-		Build:   Build{Cgo: "forbid"},
+		Build:   Build{Cgo: "forbid", OptLevel: "O2", TargetCPU: "deterministic"},
 	})
 }
 
@@ -275,7 +410,7 @@ func TestLoadReadsFile(t *testing.T) {
 	}
 	checkFile(t, got, File{
 		Project: Project{Name: "m", Edition: "2026", StrictFiles: fourExts},
-		Build:   Build{Cgo: "allow", CgoSet: true},
+		Build:   Build{Cgo: "allow", CgoSet: true, OptLevel: "O2", TargetCPU: "deterministic"},
 	})
 }
 

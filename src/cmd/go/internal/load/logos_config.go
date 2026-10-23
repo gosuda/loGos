@@ -19,6 +19,7 @@ import (
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/logos/capabilities"
 	"cmd/go/internal/logos/config"
 	"cmd/go/internal/modload"
 	"golang.org/x/mod/module"
@@ -106,6 +107,27 @@ func checkLogosConfig(ld *modload.Loader, p *Package) {
 // directory, or defaults when there is no such module.
 func logosConfig(ld *modload.Loader) (*config.File, error) {
 	return logosConfigAt(logosConfigRoot(ld))
+}
+
+// MainModuleLinkPolicy resolves the linker capabilities inputs for one
+// build: the logos.toml of the main module containing the current
+// directory (the same config the load-phase audit enforces, never the
+// linked dependency's own file) and the sorted paths of every modload
+// main module. A config load failure returns the error; the load phase
+// already reports it before linking.
+func MainModuleLinkPolicy(ld *modload.Loader) (*config.File, []string, error) {
+	cf, err := logosConfig(ld)
+	if err != nil {
+		return nil, nil, err
+	}
+	var mains []string
+	if ld != nil && ld.MainModules != nil {
+		for _, m := range ld.MainModules.Versions() {
+			mains = append(mains, m.Path)
+		}
+	}
+	slices.Sort(mains)
+	return cf, mains, nil
 }
 
 // logosConfigAt loads the logos.toml at one module root, memoized by root.
@@ -203,6 +225,7 @@ func checkLogosCgo(ld *modload.Loader, p *Package) {
 	}
 	allow, msg := cfg.CgoPolicyAllow(cf, cfg.StartupCgoEnabled(), p.ImportPath)
 	if allow {
+		capabilities.NoteCgoAllowed(p.ImportPath)
 		return
 	}
 	logosDenyCgo(p, msg)

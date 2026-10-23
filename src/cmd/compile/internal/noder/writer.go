@@ -920,7 +920,7 @@ func (w *writer) doObj(wext *writer, obj types2.Object) pkgbits.CodeObj {
 		w.pos(obj)
 		w.typeParamNames(named.TypeParams())
 		wext.typeExt(obj)
-		w.typ(named.Underlying())
+		w.logosUnderlying(obj, named.Underlying())
 
 		// separate generic and non-generic methods
 		var methods, gmethods []*types2.Func
@@ -2723,7 +2723,7 @@ func (w *writer) exprType(iface types2.Type, typ syntax.Expr) {
 	w.Sync(pkgbits.SyncExprType)
 	w.pos(typ)
 
-	if w.Bool(iface != nil && !iface.Underlying().(*types2.Interface).Empty()) {
+	if w.Bool(iface != nil && hasMethodTable(iface)) { // logos M2-S1 hook: unions fold to method sets.
 		w.itab(tv.Type, iface)
 	} else {
 		w.rtype(tv.Type)
@@ -3038,7 +3038,9 @@ func (w *writer) pkgDecl(decl syntax.Decl) {
 		// Skip type declarations for interfaces that are only usable as
 		// type parameter bounds.
 		if iface, ok := name.Type().Underlying().(*types2.Interface); ok && !iface.IsMethodSet() {
-			break
+			if logosSkipUnionDecl(w.p, name) { // logos M2-S7 hook: value-used unions keep their declaration.
+				break
+			}
 		}
 
 		w.Code(declOther)

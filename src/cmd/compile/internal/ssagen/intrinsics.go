@@ -131,6 +131,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
 	alias := func(pkg, fn, pkg2, fn2 string, archs ...*sys.Arch) {
 		intrinsics.alias(pkg, fn, pkg2, fn2, archs...)
 	}
+	logosRegisterCold(add)
 
 	/******** runtime ********/
 	if !cfg.instrumenting {
@@ -1675,6 +1676,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
 		// Only enable intrinsics, if SIMD experiment.
 		simdAMD64Intrinsics(addF)
 		simdARM64Intrinsics(addF)
+		logosSimdIntrinsics(addF)
 		initWasmSIMD()
 
 		addF(simdPackage, "ClearAVXUpperBits",

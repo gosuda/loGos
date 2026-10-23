@@ -80,6 +80,10 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 		}
 	}
 
+	if check.logosConstBuiltin(x, call, id, args) { // logos M5-S1 hook: builtins over const views.
+		return
+	}
+
 	switch id {
 	case _Append:
 		// append(s S, x ...E) S, where E is the element type of S
@@ -577,6 +581,7 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 		if check.recordTypes() {
 			check.recordBuiltinType(call.Fun, makeSig(x.typ(), types...))
 		}
+		check.logosZeroMake(call, T) // logos M3-S3 hook.
 
 	case _Max, _Min:
 		// max(x, ...)
@@ -655,6 +660,7 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 		case typexpr:
 			// new(T)
 			check.validVarType(arg, x.typ())
+			check.logosZeroNew(arg, x.typ()) // logos M3-S3 hook.
 		default:
 			// new(expr)
 			if isUntyped(x.typ()) {

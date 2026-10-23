@@ -607,6 +607,29 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 			return u.nify(x.elem, y.elem, emode, p)
 		}
 
+	case *Option: // logos M3-S2 hook: option types unify if their element types unify.
+		if y, ok := y.(*Option); ok {
+			return u.nify(x.Elem, y.Elem, emode, p)
+		}
+
+	case *LogosTuple: // logos M6-S5 hook: tuples unify element-wise over identical names.
+		if y, ok := y.(*LogosTuple); ok {
+			if x.Len() != y.Len() {
+				return false
+			}
+			for i := range x.Len() {
+				if x.Name(i) != y.Name(i) || !u.nify(x.Elem(i), y.Elem(i), emode, p) {
+					return false
+				}
+			}
+			return true
+		}
+
+	case *ConstView: // logos M5-S1 hook: const views unify if their element types unify.
+		if y, ok := y.(*ConstView); ok {
+			return u.nify(x.Elem, y.Elem, emode, p)
+		}
+
 	case *Struct:
 		// Two struct types unify if they have the same sequence of fields,
 		// and if corresponding fields have the same names, their (field) types unify,

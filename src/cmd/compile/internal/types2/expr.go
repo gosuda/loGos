@@ -136,6 +136,12 @@ func (check *Checker) unary(x *operand, e *syntax.Operation) {
 	op := e.Op
 	switch op {
 	case syntax.And:
+		if check.logosPropertyAddress(x, e) { // logos M4-S1 hook: `&x.F` on a property interface.
+			return
+		}
+		if check.logosAddrFresh(x, e) { // logos M6-S2 hook: `&expr` over a non-addressable operand.
+			return
+		}
 		// spec: "As an exception to the addressability
 		// requirement x may also be a composite literal."
 		if _, ok := syntax.Unparen(e.X).(*syntax.CompositeLit); !ok && x.mode() != variable {
@@ -414,6 +420,9 @@ func (check *Checker) implicitTypeAndValue(x *operand, target Type) (Type, const
 	if !x.isValid() || isTyped(x.typ()) || !isValid(target) {
 		return x.typ(), nil, 0
 	}
+	if t, val, code, ok := check.logosOptionImplicit(x, target); ok { // logos M3-S2 hook.
+		return t, val, code
+	}
 	// x is untyped
 
 	if isUntyped(target) {
@@ -481,6 +490,9 @@ func (check *Checker) implicitTypeAndValue(x *operand, target Type) (Type, const
 		// (interface) type: values must have concrete dynamic types.
 		// Untyped nil was handled upfront.
 		if !u.Empty() {
+			if t, ok := check.logosUnionDefault(x, u); ok { // logos M2-S2 hook.
+				return t, nil, 0
+			}
 			return nil, nil, InvalidUntypedConversion // cannot assign untyped values to non-empty interfaces
 		}
 		return Default(x.typ()), nil, 0 // default type for nil is nil
@@ -792,8 +804,15 @@ func (check *Checker) binary(x *operand, e syntax.Expr, lhs, rhs syntax.Expr, op
 	var y operand
 
 	check.expr(nil, x, lhs)
+	anded := check.logosPushAndCond(op, lhs) // logos M3-S4 hook: `x != nil && rest` narrows x for rest.
 	check.expr(nil, &y, rhs)
+	if anded {
+		check.logosPopNarrow() // logos M3-S4 hook.
+	}
 
+	if e == nil {
+		check.logosUnwrapMapIndex(x) // logos M3-S6 hook: `m[k] += v` stores V.
+	}
 	if !x.isValid() {
 		return
 	}
@@ -803,6 +822,7 @@ func (check *Checker) binary(x *operand, e syntax.Expr, lhs, rhs syntax.Expr, op
 		return
 	}
 
+	check.logosConstBinary(x, &y) // logos M5-S1 hook: const view operands.
 	if isShift(op) {
 		check.shift(x, &y, e, op)
 		return
@@ -829,6 +849,10 @@ func (check *Checker) binary(x *operand, e syntax.Expr, lhs, rhs syntax.Expr, op
 			}
 		}
 		x.invalidate()
+		return
+	}
+
+	if check.logosSimdBinary(x, e, op) { // logos M14-S1 hook: element-wise array operators.
 		return
 	}
 
@@ -1084,6 +1108,9 @@ func (check *Checker) exprInternal(T *target, x *operand, e syntax.Expr, hint Ty
 	case *syntax.SelectorExpr:
 		check.selector(x, e, false)
 
+	case *syntax.FieldProjExpr:
+		check.logosFieldProjExpr(x, e) // logos M7-S2 hook.
+
 	case *syntax.IndexExpr:
 		if check.indexExpr(x, e) {
 			if !enableReverseTypeInference {
@@ -1139,6 +1166,23 @@ func (check *Checker) exprInternal(T *target, x *operand, e syntax.Expr, hint Ty
 
 	case *syntax.TryExpr:
 		return check.logosTryOperand(x, e) // logos M1-S3 hook.
+	case *syntax.CoalesceExpr:
+		return check.logosCoalesce(x, e) // logos M3-S2 hook.
+	case *syntax.OptSelectExpr:
+		return check.logosOptSelect(x, e) // logos M3-S2 hook.
+	case *syntax.SwitchExpr:
+		return check.logosSwitchExpr(x, e) // logos M2-S5 hook.
+	case *syntax.InterpExpr:
+		return check.logosInterp(x, e) // logos M6-S1 hook.
+	case *syntax.ConstType:
+		return check.logosConstTypeExpr(x, e) // logos M5-S5 hook: `const T` in conversion position.
+	case *syntax.SpreadExpr:
+		check.logosSpreadMisplaced(x, e) // logos M6-S4 hook: `..src` outside a struct literal.
+		goto Error
+	case *syntax.TupleLit:
+		return check.logosTupleLit(x, e) // logos M6-S5 hook.
+	case *syntax.LambdaExpr:
+		return check.logosLambda(x, T, e) // logos M6-S6 hook.
 	case *syntax.CallExpr:
 		return check.callExpr(x, e)
 
@@ -1180,6 +1224,7 @@ func (check *Checker) exprInternal(T *target, x *operand, e syntax.Expr, hint Ty
 					check.validVarType(e.X, x.typ())
 					x.typ_ = &Pointer{base: x.typ()}
 				default:
+					check.logosConstUnwrapBase(x) // logos M5-S1 hook: dereference through const views.
 					var base Type
 					if !underIs(x.typ(), func(u Type) bool {
 						p, _ := u.(*Pointer)
@@ -1202,6 +1247,7 @@ func (check *Checker) exprInternal(T *target, x *operand, e syntax.Expr, hint Ty
 					}
 					x.mode_ = variable
 					x.typ_ = base
+					check.logosConstWrapBase(x, e.X) // logos M5-S1 hook: dereference reads through const views.
 				}
 				break
 			}
@@ -1296,6 +1342,9 @@ func keyVal(x constant.Value) any {
 
 // typeAssertion checks x.(T). The type of x must be an interface.
 func (check *Checker) typeAssertion(e syntax.Expr, x *operand, T Type, typeSwitch bool) {
+	if check.logosNonMemberAssert(e, x, T) { // logos M2-S2 hook.
+		return
+	}
 	var cause string
 	if check.assertableTo(x.typ(), T, &cause) {
 		return // success
@@ -1345,12 +1394,14 @@ func (check *Checker) multiExpr(e syntax.Expr, allowCommaOk bool) (list []*opera
 			dummy := syntax.NewName(syntax.StartPos(e), nth(i+1, "function result"))
 			list[i] = &operand{mode_: value, expr: dummy, typ_: v.typ}
 		}
+		check.logosMarkTupleDummies(e, list) // logos M3-S5 hook.
 		return
 	}
 
 	// exactly one (possibly invalid or comma-ok) value
 	list = []*operand{&x}
 	if allowCommaOk && (x.mode() == mapindex || x.mode() == commaok || x.mode() == commaerr) {
+		check.logosUnwrapMapIndex(&x) // logos M3-S2 hook: `v, ok := m[k]` keeps Go types.
 		var what string = "ok value of (comma, ok) expression"
 		var typ Type = Typ[UntypedBool]
 		if x.mode() == commaerr {

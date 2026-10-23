@@ -1,0 +1,23 @@
+// errorcheck
+
+package main
+
+// #75: a `nil` switch-expression arm reaching a non-nil pointer result
+// is now rejected by the non-nil zero-value rule (M3-S3), in either arm
+// position. An option type (*P?) is the nilable shape this fixture
+// exercised when `*P` could still hold nil.
+type P struct{ V int }
+
+func pickNilFirst(b bool) *P {
+	return switch b {
+	case true => nil // ERROR "nil_to_nonnil"
+	default => &P{V: 2}
+	}
+}
+
+func pickNilLast(b bool) *P {
+	return switch b {
+	case true => &P{V: 1}
+	default => nil // ERROR "nil_to_nonnil"
+	}
+}

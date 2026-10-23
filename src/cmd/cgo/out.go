@@ -667,7 +667,7 @@ func (p *Package) writeDefsFunc(fgo2 io.Writer, n *Name, callsMalloc *bool) {
 	if n.AddError {
 		prefix = "errno := "
 	}
-	fmt.Fprintf(fgo2, "\t%s_cgo_runtime_cgocall(%s, %s)\n", prefix, cname, arg)
+	fmt.Fprintf(fgo2, "\t%s%s(%s, %s)\n", prefix, logosCgoCall(p, n), cname, arg)
 	if n.AddError {
 		fmt.Fprintf(fgo2, "\tif errno != 0 { r2 = syscall.Errno(errno) }\n")
 	}
@@ -790,9 +790,12 @@ func (p *Package) writeOutputFunc(fgcc *os.File, n *Name) {
 	if (n.Kind != "macro" && len(n.FuncType.Params) > 0) || tr != nil {
 		fmt.Fprintf(fgcc, "\t%s %v *_cgo_a = v;\n", ctype, p.packedAttribute())
 	}
+	stableReturnFrame := tr != nil && logosStableFastCall(p, n)
 	if tr != nil {
-		// Save the stack top for use below.
-		fmt.Fprintf(fgcc, "\tchar *_cgo_stktop = _cgo_topofstack();\n")
+		if !stableReturnFrame {
+			// Save the stack top for use below.
+			fmt.Fprintf(fgcc, "\tchar *_cgo_stktop = _cgo_topofstack();\n")
+		}
 		fmt.Fprintf(fgcc, "\t__typeof__(_cgo_a->r) _cgo_r;\n")
 	}
 	fmt.Fprintf(fgcc, "\t_cgo_tsan_acquire();\n")
@@ -823,9 +826,11 @@ func (p *Package) writeOutputFunc(fgcc *os.File, n *Name) {
 	}
 	fmt.Fprintf(fgcc, "\t_cgo_tsan_release();\n")
 	if tr != nil {
-		// The cgo call may have caused a stack copy (via a callback).
-		// Adjust the return value pointer appropriately.
-		fmt.Fprintf(fgcc, "\t_cgo_a = (void*)((char*)_cgo_a + (_cgo_topofstack() - _cgo_stktop));\n")
+		if !stableReturnFrame {
+			// The cgo call may have caused a stack copy (via a callback).
+			// Adjust the return value pointer appropriately.
+			fmt.Fprintf(fgcc, "\t_cgo_a = (void*)((char*)_cgo_a + (_cgo_topofstack() - _cgo_stktop));\n")
+		}
 		// Save the return value.
 		fmt.Fprintf(fgcc, "\t_cgo_a->r = _cgo_r;\n")
 		// The return value is on the Go stack. If we are using msan,
@@ -1714,6 +1719,9 @@ static const char *_GoStringPtr(_GoString_ s) { return s.p; }
 const goProlog = `
 //go:linkname _cgo_runtime_cgocall runtime.cgocall
 func _cgo_runtime_cgocall(unsafe.Pointer, uintptr) int32
+
+//go:linkname _cgo_runtime_cgocall_fast runtime.logosCgocallFast
+func _cgo_runtime_cgocall_fast(unsafe.Pointer, uintptr) int32
 
 //go:linkname _cgoCheckPointer runtime.cgoCheckPointer
 //go:noescape

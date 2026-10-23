@@ -24,6 +24,7 @@
 package types2
 
 import (
+	"cmd/compile/internal/logos/ctfe"
 	"cmd/compile/internal/syntax"
 	"fmt"
 	"go/constant"
@@ -172,6 +173,16 @@ type Config struct {
 
 	Logos bool // package sources are .lgo files
 
+	// LogosUnions lets closed unions occupy value positions (SPEC Sec 2.3,
+	// T-203.1). It is set for every check of a package of .lgo files,
+	// including the recheck of lowered code, where Logos is off.
+	LogosUnions bool
+
+	// LogosCTFEMaxSteps bounds M5-S2 const evaluation (SPEC T-201,
+	// T-102). Zero selects the default of 100,000 steps; configuration
+	// MAY raise it through max_ctfe_steps.
+	LogosCTFEMaxSteps int
+
 	// If a non-empty ErrorURL format string is provided, it is used
 	// to format an error URL link that is appended to the first line
 	// of an error message. ErrorURL must be a format string containing
@@ -310,6 +321,24 @@ type Info struct {
 	// Version strings begin with “go”, like “go1.21”, and
 	// are suitable for use with the [go/version] package.
 	FileVersions map[*syntax.PosBase]string
+
+	LogosChecks        map[syntax.Expr]LogosCheck      // logos M3-S5 hook: MustNonNil sites for platform-pointer stores.
+	LogosAddrFresh     map[syntax.Expr]bool            // logos M6-S2 hook: `&expr` operations lowering to new(expr).
+	LogosFieldDefaults map[*Struct][]LogosFieldDefault // logos M6-S3 hook: struct field defaults.
+
+	LogosConstSlices map[syntax.Expr]bool                   // logos M5-S1 hook: slice expressions over const views with non-constant bounds, for the lowering-time runtime check.
+	LogosPropDecls   []*LogosPropDecl                       // logos M4-S2 hook: asserted property interfaces per declaring struct.
+	LogosCTFE        map[*Const]ctfe.Value                  // logos M5-S2 hook: evaluated const values (scalars and composites) for lowering.
+	LogosSpreads     map[*syntax.CompositeLit][]LogosSpread // logos M6-S4 hook: checked `..src` spreads per struct literal.
+
+	LogosConstIfDead map[syntax.Stmt]bool                             // logos M7-S1 hook: statements of dead `const if` branches, for comptime checks.
+	LogosConstSel    map[*syntax.SelectorExpr]*syntax.ConstSwitchCase // logos M7-S4 hook: interface-case selectors on the switched value, by their case.
+	LogosConstCases  map[*syntax.ConstSwitchCase]LogosConstCase       // logos M7-S4 hook: the case-scope substitution of each `const switch` case.
+	LogosConstFor    map[syntax.Node]*LogosConstFor                   // logos M7-S2 hook: checked `const for` statements for unrolling.
+	LogosDisqual     map[*syntax.BlockStmt][]map[string]bool          // logos M7-S2 hook: narrowing-disqualified names per function body, for copy checks.
+	LogosImporter    Importer                                         // logos M7-S3 hook: the importer of the check, for comptime copies that name packages the checked files do not import.
+
+	LogosPlatformRets map[syntax.Pos][]LogosPlatformRet // logos M9-S2 hook: start positions of return operands holding platform pointers that convert to an interface result.
 }
 
 func (info *Info) recordTypes() bool {

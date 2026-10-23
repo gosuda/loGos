@@ -32,6 +32,46 @@ var Logos = strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe") == "logos"
 // upstream text.
 var Pedantic bool
 
+// PedanticSet reports whether --pedantic appeared on the command line, so
+// --pedantic=false can override a pedantic key of logos.toml.
+var PedanticSet bool
+
+// LogosJSON is set by the logos-only --json-diagnostics flag of logos build
+// and logos lint: compile diagnostics print as one JSON object per line
+// (SPEC Sec 16). Plain go never sets it.
+var LogosJSON bool
+
+// BuildWasmLoader is the value of the --wasm-loader build flag (SPEC Sec
+// 14.2): when true and the build writes a .wasm output with -o, the build
+// also writes the host loader beside it. The flag defaults to true under
+// logos and to false under plain go until the run.bash flip (R-U1), and it
+// carries no help text, so "go help build" keeps the upstream text.
+var BuildWasmLoader bool
+
+// WasmLoader is the text of the host loader a wasm build writes beside its
+// output. cmd/go/internal/logos sets it at program start, because that
+// package imports the packages that import work and so work cannot import
+// it.
+var WasmLoader string
+
+// LogosLintCmd is set while logos lint runs: every main-module package is
+// linted by its own lint action, so an ordinary compile in the same run
+// passes no lint policy to the compiler.
+var LogosLintCmd bool
+
+// BuildGC is the value of the -gc flag (SPEC Sec 19), and BuildGCSet reports
+// whether the flag appeared, so -gc= can be told from an absent flag.
+var (
+	BuildGC    string
+	BuildGCSet bool
+)
+
+// LogosGC is the collector mode the build selected, checked and defaulted by
+// work.BuildInit: the -gc flag, else logos.toml [build] gc under logos, else
+// the logos default. It is empty when plain go selected no mode, which keeps
+// the upstream collector and compiles with write barriers.
+var LogosGC string
+
 // logosInitCC snapshots the user CC at process startup, covering both the
 // process environment and the GOENV file. main.invoke later injects every
 // MkEnv value (including a CC default) into the process environment, so a
@@ -209,6 +249,13 @@ func logosRootCgo(root string) (bool, bool) {
 		return false, false
 	}
 	return false, true
+}
+
+// LogosCWDModuleRoot reports the module root above the working directory
+// by walking up to the nearest go.mod, or "" when there is none. The -O
+// level reader uses it to find logos.toml.
+func LogosCWDModuleRoot() string {
+	return cwdModuleRoot()
 }
 
 // cwdModuleRoot returns the module root above the working directory by

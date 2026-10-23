@@ -52,11 +52,13 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info, map[*
 
 recheck:
 	// typechecking
+	base.Logos = allLogos(noders)
 	ctxt := types2.NewContext()
 	importer := gcimports{
 		ctxt:     ctxt,
 		packages: make(map[string]*types2.Package),
 	}
+	logosMarkImporter(&importer, base.Logos) // logos M2-S7 hook: the import kind selects union handling.
 	conf := types2.Config{
 		Context:            ctxt,
 		GoVersion:          base.Flag.Lang,
@@ -64,6 +66,7 @@ recheck:
 		Importer:           &importer,
 		Sizes:              types2.SizesFor("gc", buildcfg.GOARCH),
 		Logos:              allLogos(noders) && !didLogos,
+		LogosUnions:        allLogos(noders), // logos M2-S1 hook: unions stay legal in the recheck.
 	}
 	if base.Flag.ErrorURL {
 		conf.ErrorURL = " [go.dev/e/%s]"
@@ -81,6 +84,12 @@ recheck:
 	}
 	conf.Error = func(err error) {
 		terr := err.(types2.Error)
+		if logosDeferSoftWarn(terr) { // logos M6-S3 hook: warn-severity rules never fail, and the lint pass resolves them.
+			return
+		}
+		if logosReportNilDeref(&m, files, info, terr) { // logos M9-S2 hook: nil_deref_unproven carries autofix candidates.
+			return
+		}
 		msg := terr.Msg
 		if versionErrorRx.MatchString(msg) {
 			fileBase := terr.Pos.FileBase()
@@ -100,6 +109,7 @@ recheck:
 	}
 
 	pkg, err := conf.Check(base.Ctxt.Pkgpath, files, info)
+	logosFlushSoftWarns(&m, files, err)
 	base.ExitIfErrors()
 	if err != nil {
 		base.FatalfAt(src.NoXPos, "conf.Check error: %v", err)
@@ -183,9 +193,10 @@ recheck:
 		dumpSyntax(pkg, info, files, "checked")
 	}
 
-	if conf.Logos && !didLogos {
+	if !didLogos {
 		didLogos = true
-		if lowerLogosHook(pkg, info, files) {
+		logosLintHook(&m, files, pkg, info) // logos M9 hook: lints see the unlowered tree.
+		if logosRecheckHook(&conf, pkg, info, files) {
 			goto recheck
 		}
 	}
@@ -227,6 +238,7 @@ recheck:
 	}
 
 	writeLogosEject(files)
+	logosNextHook(pkg, info, files)
 
 	return pkg, info, rangeInfo
 }

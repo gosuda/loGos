@@ -58,11 +58,13 @@ func BuildInit(ld *modload.Loader) {
 	base.AtExit(closeBuilders)
 
 	modload.Init(ld)
-	refreshLogosCgoPolicy(ld)
+	refreshLogosPolicy(ld)
+	initLogosGC(ld)
 	instrumentInit()
 	buildModeInit()
 	initCompilerConcurrencyPool()
 	cfgChangedEnv = makeCfgChangedEnv()
+	logosApplyOpt()
 
 	if err := fsys.Init(); err != nil {
 		base.Fatal(err)

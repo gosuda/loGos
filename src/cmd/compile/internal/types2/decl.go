@@ -351,6 +351,9 @@ func (check *Checker) constDecl(obj *Const, typ, init syntax.Expr, inherited boo
 		}
 		check.expr(nil, &x, init)
 	}
+	if check.logosConstEval(obj, init, &x) { // M5-S2 hook: const composites and const func calls (SPEC T-201).
+		return
+	}
 	check.initConst(obj, &x)
 }
 
@@ -375,12 +378,18 @@ func (check *Checker) varDecl(obj *Var, lhs []*Var, typ, init syntax.Expr) {
 		if typ == nil {
 			// error reported before by arityMatch
 			obj.typ = Typ[Invalid]
+		} else {
+			check.logosZeroDecl(obj)             // logos M3-S3 hook.
+			check.logosWarnZeroDefault(obj, typ) // logos M6-S3 hook: zero declaration of a defaulted struct.
 		}
 		return
 	}
 
 	if lhs == nil || len(lhs) == 1 {
 		assert(lhs == nil || lhs[0] == obj)
+		if check.logosTupleVarSpec(obj, init) { // logos M6-S5 hook: pack multi-value calls into tuples.
+			return
+		}
 		var x operand
 		check.expr(newTarget(obj.typ, obj.name), &x, init)
 		check.initVar(obj, &x, "variable declaration")
@@ -705,6 +714,7 @@ func (check *Checker) funcDecl(obj *Func, decl *declInfo) {
 		check.later(func() {
 			check.funcBody(decl, obj.name, sig, fdecl.Body, nil)
 		}).describef(obj, "func %s", obj.name)
+		check.logosSchedulePurity(obj, fdecl) // M5-S2 hook: const func purity runs after its body check (SPEC T-201).
 	}
 }
 

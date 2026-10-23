@@ -128,6 +128,11 @@ func (check *Checker) importPackage(pos syntax.Pos, path, dir string) *Package {
 	// Checker.impMap only caches packages that are marked Complete
 	// or fake (dummy packages for failed imports). Incomplete but
 	// non-fake packages do require an import to complete them.
+	var logosImp *Package
+	check.logosComptimeImport(&logosImp, path, dir) // logos M7-S2 hook: virtual comptime package.
+	if logosImp != nil {
+		return logosImp
+	}
 	key := importKey{path, dir}
 	imp := check.impMap[key]
 	if imp != nil {
@@ -240,6 +245,7 @@ func (check *Checker) collectObjects() {
 		first := -1                // index of first ConstDecl in the current group, or -1
 		var last *syntax.ConstDecl // last ConstDecl with init expressions, or nil
 		for index, decl := range file.DeclList {
+			decl = check.logosUnwrapConstFunc(decl) // M5-S2 hook: `const func` decls check as funcs (SPEC T-201).
 			if _, ok := decl.(*syntax.ConstDecl); !ok {
 				first = -1 // we're not in a constant declaration
 			}
@@ -536,6 +542,7 @@ func (check *Checker) sortObjects() {
 // ptr is true, base is T, and tparams is [A, _] (assuming unpackParams is set).
 // Note that base may not be a *syntax.Name for erroneous programs.
 func (check *Checker) unpackRecv(rtyp syntax.Expr, unpackParams bool) (ptr bool, base syntax.Expr, tparams []*syntax.Name) {
+	rtyp = check.logosUnpackConstRecv(rtyp) // logos M5-S1 hook: `const *T` receivers collect on T.
 	// unpack receiver type
 	base = syntax.Unparen(rtyp)
 	if t, _ := base.(*syntax.Operation); t != nil && t.Op == syntax.Mul && t.Y == nil {

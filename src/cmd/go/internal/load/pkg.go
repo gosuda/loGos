@@ -245,6 +245,8 @@ type PackageInternal struct {
 	Asmflags   []string // -asmflags for this package
 	Gcflags    []string // -gcflags for this package
 	LogosEject bool     // compile with -logos.eject and skip the build cache
+	LogosNext  bool     // compile with -logos.mode=next and skip the build cache
+	LogosLint  []byte   // -logos.cfg lint policy JSON; nil means no lints
 	Ldflags    []string // -ldflags for this package
 	Gccgoflags []string // -gccgoflags for this package
 }
@@ -1091,6 +1093,9 @@ func newPreload() *preload {
 func (pre *preload) preloadMatches(ld *modload.Loader, ctx context.Context, opts PackageOpts, matches []*search.Match) {
 	for _, m := range matches {
 		for _, pkg := range m.Pkgs {
+			if logosSkipVirtualImport(pkg) { // logos M7 hook: the virtual comptime package has no files to preload.
+				continue
+			}
 			select {
 			case <-pre.cancel:
 				return
@@ -1115,6 +1120,9 @@ func (pre *preload) preloadImports(ld *modload.Loader, ctx context.Context, opts
 	parentIsStd := parent.Goroot && parent.ImportPath != "" && search.IsStandardImportPath(parent.ImportPath)
 	for _, path := range imports {
 		if path == "C" || path == "unsafe" {
+			continue
+		}
+		if logosSkipVirtualImport(path) { // M7-S2 hook: virtual comptime package needs no loading.
 			continue
 		}
 		select {
@@ -1973,6 +1981,21 @@ func (p *Package) load(ld *modload.Loader, ctx context.Context, opts PackageOpts
 			addImport("logos/rt", true)
 		}
 
+		// Fixed-array SIMD lowers through simd/archsimd when
+		// GOEXPERIMENT=simd, so every logos package carries that
+		// import under the experiment (M14-S1).
+		if needsLogosSimd(p) {
+			addImport("simd/archsimd", true)
+		}
+
+		// Interpolated strings lower to strconv appends and unsafe
+		// conversions, so every logos package carries both imports
+		// even when no source file names them (M6-S1).
+		if needsLogosInterp(p) {
+			addImport("strconv", true)
+			addImport("unsafe", true)
+		}
+
 		// SWIG adds imports of some standard packages.
 		if p.UsesSwig() {
 			addImport("unsafe", true)
@@ -2079,6 +2102,9 @@ func (p *Package) load(ld *modload.Loader, ctx context.Context, opts PackageOpts
 		if path == "C" {
 			continue
 		}
+		if logosSkipVirtualImport(path) { // logos M7-S5 hook: virtual comptime package has no files.
+			continue
+		}
 		p1, err := loadImport(ld, ctx, opts, nil, path, p.Dir, p, stk, p.Internal.Build.ImportPos[path], ResolveImport|allowInternalSimdImport)
 		if err != nil && p.Error == nil {
 			p.Error = err
@@ -2097,8 +2123,9 @@ func (p *Package) load(ld *modload.Loader, ctx context.Context, opts PackageOpts
 		}
 	}
 	p.Internal.Imports = imports
-	checkLogosAliases(p)
+	addLogosRTForGoImporter(ld, ctx, opts, p)
 	checkLogosConfig(ld, p)
+	checkLogosAliases(ld, p)
 	checkLogosCgo(ld, p)
 	if p.Error == nil && p.Name == "main" && !p.Internal.ForceLibrary && !p.Incomplete && !opts.SuppressBuildInfo {
 		// TODO(bcmills): loading VCS metadata can be fairly slow.
@@ -2960,7 +2987,7 @@ func PackagesAndErrors(ld *modload.Loader, ctx context.Context, opts PackageOpts
 			if fi, err := fsys.Stat(p); err == nil && !fi.IsDir() {
 				pkgs := []*Package{GoFilesPackage(ld, ctx, opts, patterns)}
 				setPGOProfilePath(pkgs)
-				checkLogosModules(PackageList(pkgs))
+				checkLogosLoaded(ld, PackageList(pkgs))
 				return pkgs
 			}
 		}
@@ -2992,6 +3019,9 @@ func PackagesAndErrors(ld *modload.Loader, ctx context.Context, opts PackageOpts
 		for _, pkg := range m.Pkgs {
 			if pkg == "" {
 				panic(fmt.Sprintf("ImportPaths returned empty package for pattern %s", m.Pattern()))
+			}
+			if logosSkipVirtualImport(pkg) { // logos M7 hook: the virtual comptime package matches "all" but has no files.
+				continue
 			}
 			mode := cmdlinePkg
 			if m.IsLiteral() {
@@ -3044,7 +3074,7 @@ func PackagesAndErrors(ld *modload.Loader, ctx context.Context, opts PackageOpts
 
 	setPGOProfilePath(pkgs)
 
-	checkLogosModules(PackageList(pkgs))
+	checkLogosLoaded(ld, PackageList(pkgs))
 
 	return pkgs
 }
@@ -3286,6 +3316,9 @@ func setToolFlags(ld *modload.Loader, pkgs ...*Package) {
 		p.Internal.Asmflags = BuildAsmflags.For(ld, p)
 		p.Internal.Gcflags = BuildGcflags.For(ld, p)
 		p.Internal.Gcflags = append(p.Internal.Gcflags, logosEjectGcflags(p)...)
+		p.Internal.Gcflags = append(p.Internal.Gcflags, logosNextGcflags(p)...)
+		p.Internal.Gcflags = append(p.Internal.Gcflags, logosGCGcflags(p)...)
+		logosLintMark(ld, p)
 		p.Internal.Ldflags = BuildLdflags.For(ld, p)
 		p.Internal.Gccgoflags = BuildGccgoflags.For(ld, p)
 	}

@@ -410,6 +410,9 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 		}
 	}
 
+	logosLintActionID(h, a) // loGos hook: lint policy of loGo/s packages.
+	logosWasmActionID(h)    // loGos hook: wasm profile flags.
+
 	// Input files.
 	inputFiles := str.StringList(
 		p.GoFiles,
@@ -437,6 +440,8 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 			fmt.Fprintf(h, "pgofile %s\n", b.fileHash(a1.built))
 		}
 	}
+
+	logosSynthActionID(h, a) // loGos hook: transitive packages a loGo/s root may synthesize imports of.
 
 	return h.Sum()
 }
@@ -885,6 +890,8 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 		}
 		fmt.Fprintf(&icfg, "packagefile %s=%s\n", p1.ImportPath, a1.built)
 	}
+
+	logosSynthImportCfg(&icfg, a) // loGos hook: transitive packages a loGo/s root may synthesize imports of.
 
 	// Prepare Go embed config if needed.
 	// Unlike the import config, it's okay for the embed config to be empty.
@@ -1596,6 +1603,7 @@ func (b *Builder) printLinkerConfig(h io.Writer, p *load.Package) {
 		if p != nil {
 			fmt.Fprintf(h, "linkflags %q\n", p.Internal.Ldflags)
 		}
+		logosHashLinkPolicy(h)
 
 		// GOARM, GOMIPS, etc.
 		key, val, _ := cfg.GetArchEnv()

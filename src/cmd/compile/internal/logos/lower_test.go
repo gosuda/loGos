@@ -7,6 +7,7 @@ package logos
 import (
 	"errors"
 	"go/build"
+	"internal/testenv"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -44,6 +45,16 @@ func runLogosDir(t *testing.T) string {
 type testImporter struct {
 	pkgs map[string]*types2.Package
 	busy map[string]bool
+	// goroot is always testenv.GOROOT(t) supplied by newTestImporter.
+	goroot string
+}
+
+// newTestImporter returns a testImporter rooted at testenv.GOROOT(t).
+// Invariant: the source fallback in importFromSource uses exactly this
+// root, with no build.Default fallback.
+func newTestImporter(t *testing.T) *testImporter {
+	t.Helper()
+	return &testImporter{pkgs: make(map[string]*types2.Package), busy: make(map[string]bool), goroot: testenv.GOROOT(t)}
 }
 
 func (m *testImporter) Import(path string) (*types2.Package, error) {
@@ -72,7 +83,7 @@ func (m *testImporter) importFromSource(path string) (*types2.Package, error) {
 	if m.busy[path] {
 		return nil, errors.New("import cycle: " + path)
 	}
-	dir := filepath.Join(runtime.GOROOT(), "src", filepath.FromSlash(path))
+	dir := filepath.Join(m.goroot, "src", filepath.FromSlash(path))
 	p, err := build.ImportDir(dir, 0)
 	if err != nil {
 		return nil, err
@@ -116,17 +127,27 @@ func checkConfig(m *testImporter) (types2.Config, *[]error) {
 	errs := new([]error)
 	conf := types2.Config{
 		Importer: m,
-		Error:    func(err error) { *errs = append(*errs, err) },
+		Error: func(err error) {
+			if types2.LogosWarnOnly(err) { // M6-S3: warn-severity rules never fail lowering.
+				return
+			}
+			*errs = append(*errs, err)
+		},
 	}
 	return conf, errs
 }
 
-// countLogosNodes counts surviving loGo/s nodes under root.
+// countLogosNodes counts surviving loGo/s nodes under root: the same union
+// rejectSurvivors enforces in Lower, so the unit test cannot pass with survivors.
 func countLogosNodes(root syntax.Node) int {
 	n := 0
 	syntax.Inspect(root, func(x syntax.Node) bool {
 		switch x.(type) {
-		case *syntax.TryExpr, *syntax.ErrdeferStmt:
+		case *syntax.TryExpr, *syntax.ErrdeferStmt, *syntax.SwitchExpr, *syntax.ArmClause, *syntax.AssertedStruct,
+			*syntax.OptionType, *syntax.CoalesceExpr, *syntax.OptSelectExpr, *syntax.ConstType, *syntax.ConstFuncDecl,
+			*syntax.YieldStmt, *syntax.ScopeDeferStmt, *syntax.FieldDefault, *syntax.SpreadExpr, *syntax.InterpExpr,
+			*syntax.TupleType, *syntax.TupleLit, *syntax.LambdaExpr, *syntax.ConstIfStmt, *syntax.ConstSwitchStmt,
+			*syntax.ConstForStmt, *syntax.FieldProjExpr, *syntax.GroupStmt, *syntax.GroupChild:
 			n++
 		}
 		return true
@@ -135,14 +156,14 @@ func countLogosNodes(root syntax.Node) int {
 }
 
 // TestNoLogosNodesSurvive lowers every test/logos/run file and asserts the
-// lowered files hold no TryExpr or ErrdeferStmt (invariant A1).
+// lowered files hold no loGo/s nodes (invariant A1).
 func TestNoLogosNodesSurvive(t *testing.T) {
 	dir := runLogosDir(t)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	imp := &testImporter{pkgs: make(map[string]*types2.Package), busy: make(map[string]bool)}
+	imp := newTestImporter(t)
 	found := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lgo") {
@@ -159,7 +180,7 @@ func TestNoLogosNodesSurvive(t *testing.T) {
 }
 
 // checkLoweredClean parses, checks, and lowers one file, then asserts no
-// TryExpr or ErrdeferStmt survives in the lowered files and that every
+// loGo/s node survives in the lowered files and that every
 // edit applies to the original source.
 func checkLoweredClean(t *testing.T, imp *testImporter, path string) {
 	t.Helper()
@@ -183,8 +204,13 @@ func checkLoweredClean(t *testing.T, imp *testImporter, path string) {
 	var cerrs []error
 	conf := types2.Config{
 		Importer: imp,
-		Error:    func(err error) { cerrs = append(cerrs, err) },
-		Logos:    true,
+		Error: func(err error) {
+			if types2.LogosWarnOnly(err) { // M6-S3: warn-severity rules never fail lowering.
+				return
+			}
+			cerrs = append(cerrs, err)
+		},
+		Logos: true,
 	}
 	files := []*syntax.File{f}
 	src := map[*syntax.File][]byte{f: data}

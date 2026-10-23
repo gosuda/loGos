@@ -325,6 +325,7 @@ func AddBuildFlags(cmd *base.Command, mask BuildFlagMask) {
 	cmd.Flag.Var((*buildvcsFlag)(&cfg.BuildBuildvcs), "buildvcs", "")
 	cmd.Flag.Var(&load.BuildGcflags, "gcflags", "")
 	cmd.Flag.Var(&load.BuildGccgoflags, "gccgoflags", "")
+	addLogosGCFlag(cmd)
 	if mask&OmitModFlag == 0 {
 		base.AddModFlag(&cmd.Flag)
 	}
@@ -348,17 +349,20 @@ func AddBuildFlags(cmd *base.Command, mask BuildFlagMask) {
 	cmd.Flag.BoolVar(&cfg.BuildLinkshared, "linkshared", false, "")
 	cmd.Flag.BoolVar(&cfg.BuildMSan, "msan", false, "")
 	cmd.Flag.StringVar(&cfg.BuildPGO, "pgo", "auto", "")
+	addWasmLoaderFlag(&cmd.Flag)
 	cmd.Flag.StringVar(&cfg.BuildPkgdir, "pkgdir", "", "")
 	cmd.Flag.BoolVar(&cfg.BuildRace, "race", false, "")
 	cmd.Flag.Var((*tagsFlag)(&cfg.BuildContext.BuildTags), "tags", "")
 	cmd.Flag.Var((*base.StringsFlag)(&cfg.BuildToolexec), "toolexec", "")
 	cmd.Flag.BoolVar(&cfg.BuildTrimpath, "trimpath", false, "")
 	cmd.Flag.BoolVar(&cfg.BuildWork, "work", false, "")
+	logosAddWasmFeaturesFlag(cmd) // loGos hook: --wasm-features.
 
 	// Undocumented, unstable debugging flags.
 	cmd.Flag.StringVar(&cfg.DebugActiongraph, "debug-actiongraph", "", "")
 	cmd.Flag.StringVar(&cfg.DebugRuntimeTrace, "debug-runtime-trace", "", "")
 	cmd.Flag.StringVar(&cfg.DebugTrace, "debug-trace", "", "")
+	logosAddOptFlag(cmd)
 }
 
 // AddCoverFlags adds coverage-related flags to "cmd".
@@ -547,6 +551,7 @@ func runBuild(ctx context.Context, cmd *base.Command, args []string) {
 		p.StaleReason = "build -o flag in use"
 		a := b.AutoAction(moduleLoader, ModeInstall, depMode, p)
 		b.Do(ctx, a)
+		b.writeWasmLoader(p)
 		return
 	}
 
@@ -910,6 +915,7 @@ func FindExecCmd() []string {
 	if err == nil {
 		ExecCmd = []string{path}
 	}
+	ExecCmd = findWasmExecCmd(ExecCmd)
 	return ExecCmd
 }
 

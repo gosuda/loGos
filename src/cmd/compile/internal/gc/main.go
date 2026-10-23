@@ -17,6 +17,7 @@ import (
 	"cmd/compile/internal/inline/interleaved"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/logopt"
+	"cmd/compile/internal/logos"
 	"cmd/compile/internal/loopvar"
 	"cmd/compile/internal/noder"
 	"cmd/compile/internal/pgoir"
@@ -84,6 +85,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	base.DebugSSA = ssa.PhaseOption
 	base.ParseFlags()
+
+	if base.LogosMode == "context" {
+		logos.RunContext()
+		return
+	}
 
 	if flagGCStart := base.Debug.GCStart; flagGCStart > 0 || // explicit flags overrides environment variable disable of GC boost
 		os.Getenv("GOGC") == "" && os.Getenv("GOMEMLIMIT") == "" && base.Flag.LowerC != 1 { // explicit GC knobs or no concurrency implies default heap
@@ -297,6 +303,8 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	loopvar.LogTransformations(transformed)
 
+	logosLintAfterEscape() // logos M9 hook: escape lints, then logos lint stops.
+
 	// Collect information for go:nowritebarrierrec
 	// checking. This must happen before transforming closures during Walk
 	// We'll do the final check after write barriers are
@@ -361,6 +369,8 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 		break
 	}
+
+	logosWasmFinish() // logos M16-S1 hook: solve wasm yield facts, assemble held functions.
 
 	base.Timer.AddEvent(int64(len(typecheck.Target.Funcs)), "funcs")
 

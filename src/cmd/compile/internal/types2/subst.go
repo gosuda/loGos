@@ -312,6 +312,27 @@ func (subst *subster) typ(typ Type) Type {
 			return &Chan{dir: t.dir, elem: elem}
 		}
 
+	case *Option: // logos M3-S2 hook: substitute inside the element type.
+		if elem := subst.typ(t.Elem); elem != t.Elem {
+			return &Option{Elem: elem}
+		}
+
+	case *LogosTuple: // logos M6-S5 hook: substitute inside the element types.
+		changed := false
+		elems := make([]Type, t.Len())
+		for i := range elems {
+			elems[i] = subst.typ(t.Elem(i))
+			changed = changed || elems[i] != t.Elem(i)
+		}
+		if changed {
+			return NewLogosTuple(nopos, t.pkg, t.names, elems)
+		}
+
+	case *ConstView: // logos M5-S1 hook: substitute inside the element type.
+		if elem := subst.typ(t.Elem); elem != t.Elem {
+			return &ConstView{Elem: elem}
+		}
+
 	case *Named:
 		// subst is called during expansion, so in this function we need to be
 		// careful not to call any methods that would cause t to be expanded: doing

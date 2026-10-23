@@ -169,6 +169,15 @@ func (check *Checker) instantiateSignature(pos syntax.Pos, expr syntax.Expr, typ
 }
 
 func (check *Checker) callExpr(x *operand, call *syntax.CallExpr) exprKind {
+	if check.logosChainCall(x, call) { // logos M6-S7 hook: slice chain methods.
+		return statement
+	}
+	if check.logosComptimeCall(x, call) { // logos M7-S2 hook: compile-time-only calls and predicates.
+		return expression
+	}
+	if check.logosSimdCall(x, call) { // logos M14-S1 hook: array reductions.
+		return statement
+	}
 	var inst *syntax.IndexExpr // function instantiation, if any
 	if iexpr, _ := call.Fun.(*syntax.IndexExpr); iexpr != nil {
 		if check.indexExpr(x, iexpr) {
@@ -211,13 +220,22 @@ func (check *Checker) callExpr(x *operand, call *syntax.CallExpr) exprKind {
 			check.expr(newTarget(T, "conversion"), x, call.ArgList[0])
 			if x.isValid() {
 				if t, _ := T.Underlying().(*Interface); t != nil && !isTypeParam(T) {
-					if !t.IsMethodSet() {
+					if !t.IsMethodSet() && !check.logosConversionUnion(T) { // logos M2-S1 hook.
 						check.errorf(call, MisplacedConstraintIface, "cannot use interface %s in conversion (contains specific type constraints or is comparable)", T)
 						break
 					}
 				}
 				if hasDots(call) {
 					check.errorf(call.ArgList[0], BadDotDotDotSyntax, "invalid use of ... in conversion to %s", T)
+					break
+				}
+				if check.logosUnionConversion(x, T) { // logos M2-S1 hook.
+					break
+				}
+				if check.logosZeroCopyConvert(x, T) { // logos M5-S5 hook: conversions to const views (SPEC T-201).
+					break
+				}
+				if check.logosConstConvert(x, T) { // logos M5-S1 hook: conversions out of const views.
 					break
 				}
 				check.conversion(x, T)
@@ -235,12 +253,17 @@ func (check *Checker) callExpr(x *operand, call *syntax.CallExpr) exprKind {
 		if !check.builtin(x, call, id) {
 			x.invalidate()
 		}
+		check.logosWarnNewDefault(x, call, id) // logos M6-S3 hook: new(T) of a defaulted struct stays zero.
 		x.expr = call
 		// a non-constant result implies a function call
 		if x.isValid() && x.mode() != constant_ {
 			check.hasCallOrRecv = true
 		}
 		return predeclaredFuncs[id].kind
+	}
+
+	if check.logosOptionalCall(x, call) { // logos M3-S2 hook: `x?.M(args)`.
+		return statement
 	}
 
 	// ordinary function/method call
@@ -306,6 +329,8 @@ func (check *Checker) callExpr(x *operand, call *syntax.CallExpr) exprKind {
 	}
 
 	// evaluate arguments
+	sig = check.logosHotUpdateSig(call, sig) // logos M8-S5 hook: sync.Hot.Update takes func(const *T) *T.
+	check.logosLambdaCallArgs(call, sig)     // logos M6-S6 hook: lambdas against parameter types.
 	args, atargs := check.genericExprList(call.ArgList)
 	sig = check.arguments(call, sig, targs, xlist, args, atargs)
 
@@ -344,6 +369,9 @@ func (check *Checker) callExpr(x *operand, call *syntax.CallExpr) exprKind {
 	if x.mode() == value && sig.TypeParams().Len() > 0 && isParameterized(sig.TypeParams().list(), x.typ()) {
 		x.invalidate()
 	}
+
+	check.logosFreezeResult(call, x)  // logos M5-S6 hook: rt.Freeze returns const *T.
+	check.logosHotLoadResult(call, x) // logos M8-S5 hook: sync.Hot.Load returns const *T.
 
 	return statement
 }
@@ -415,8 +443,10 @@ func (check *Checker) genericExprList(elist []syntax.Expr) (resList []*operand, 
 			resList = []*operand{&x}
 		} else {
 			// x is not a function instantiation (it may still be a generic function).
-			check.rawExpr(nil, &x, e, nil, true)
-			check.exclude(&x, 1<<novalue|1<<builtin|1<<typexpr)
+			if !check.logosLambdaPrechecked(&x, e) { // logos M6-S6 hook.
+				check.rawExpr(nil, &x, e, nil, true)
+				check.exclude(&x, 1<<novalue|1<<builtin|1<<typexpr)
+			}
 			if t, ok := x.typ().(*Tuple); ok && x.isValid() {
 				// x is a function call returning multiple values; it cannot be generic.
 				resList = make([]*operand, t.Len())
@@ -447,7 +477,7 @@ func (check *Checker) genericExprList(elist []syntax.Expr) (resList []*operand, 
 					// use the usual expression evaluators.
 					check.record(&x)
 				}
-			} else {
+			} else if !check.logosLambdaPrechecked(&x, e) { // logos M6-S6 hook.
 				// x is exactly one value (possibly invalid or uninstantiated generic function).
 				check.genericExpr(&x, e, nil)
 			}
@@ -612,6 +642,7 @@ func (check *Checker) arguments(call *syntax.CallExpr, sig *Signature, targs []T
 	assert(len(tparams) == len(targs))
 
 	// at the moment we only support implicit instantiations of argument functions
+	check.logosConstMapArgs(call, sigParams, args) // logos M5-S4 hook: const map arguments before inference.
 	_ = len(genericArgs) > 0 && check.verifyVersionf(args[genericArgs[0]], go1_21, "implicitly instantiated function as argument")
 
 	// tparams holds the type parameters of the callee and generic function arguments, if any:
@@ -662,9 +693,18 @@ func (check *Checker) arguments(call *syntax.CallExpr, sig *Signature, targs []T
 	// check arguments
 	if len(args) > 0 {
 		context := check.sprintf("argument to %s", call.Fun)
+		check.logosPushGoCall(call) // logos M3-S5 hook.
+		if n > 0 {
+			check.logosPushGenericArgs(targs) // logos M3-S5 hook.
+		} else {
+			check.logosPushConcreteArgs() // logos M3-S5 hook.
+		}
+		check.logosConstArgs(call, sigParams, args) // logos M5-S1 hook: const view arguments.
 		for i, a := range args {
 			check.assignment(a, sigParams.vars[i].typ, context)
 		}
+		check.logosPopGenericCall() // logos M3-S5 hook.
+		check.logosPopGoCall()      // logos M3-S5 hook.
 	}
 
 	return
@@ -822,6 +862,23 @@ func (check *Checker) selector(x *operand, e *syntax.SelectorExpr, wantType bool
 		goto Error
 	}
 
+	if check.logosOptionSelect(x, e, sel) { // logos M3-S2 hook: plain selection on `T?`.
+		return
+	}
+
+	if check.logosPropertySelector(x, e, sel) { // logos M4-S1 hook: `x.F` on a property interface.
+		return
+	}
+
+	if check.logosTupleSelect(x, e) { // logos M6-S5 hook: `t.x` on tuple values.
+		return
+	}
+
+	check.logosFieldVarSelMark(x, e)       // logos M7-S2 hook: selections on const-for field variables.
+	if check.logosConstSelect(x, e, sel) { // logos M5-S1 hook: selections through const views.
+		return
+	}
+
 	obj, index, indirect = lookupFieldOrMethod(x.typ(), x.mode() == variable, check.pkg, sel, false)
 	if obj == nil {
 		// Don't report another error if the underlying type was invalid (go.dev/issue/49541).
@@ -850,6 +907,12 @@ func (check *Checker) selector(x *operand, e *syntax.SelectorExpr, wantType bool
 		} else {
 			alt, _, _ := lookupFieldOrMethod(x.typ(), x.mode() == variable, check.pkg, sel, true)
 			why = check.lookupError(x.typ(), sel, alt, false)
+		}
+		if check.logosImportedTupleSelect(x, e) { // logos M6-S5 hook: `T_` fallback on imported tuples.
+			return
+		}
+		if check.logosConstIfaceSelect(x, e, sel) { // logos M7-S4 hook: case-interface methods on the switched type.
+			return
 		}
 		check.errorf(e.Sel, MissingFieldOrMethod, "%s.%s undefined (%s)", x.expr, sel, why)
 		goto Error

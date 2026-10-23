@@ -154,6 +154,9 @@ func (check *Checker) compositeLit(x *operand, e *syntax.CompositeLit, hint Type
 		if len(e.ElemList) == 0 {
 			break
 		}
+		if check.logosSpreadLiteral(x, e, utyp, typ) { // logos M6-S4 hook: struct literals with `..src` spread elements.
+			return
+		}
 		// Convention for error messages on invalid struct literals:
 		// we mention the struct type only if it clarifies the error
 		// (e.g., a duplicate field error doesn't need the struct type).
@@ -334,6 +337,7 @@ func (check *Checker) compositeLit(x *operand, e *syntax.CompositeLit, hint Type
 		}
 	}
 
+	check.logosZeroLiteral(e, typ, base) // logos M3-S3 hook.
 	x.mode_ = value
 	x.typ_ = typ
 }

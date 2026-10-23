@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"maps"
-	"os"
 	"slices"
 	"strings"
 
@@ -30,52 +29,6 @@ func (p *Package) IsLogos() bool {
 		}
 	}
 	return false
-}
-
-// logosIsCanonicalLgo reports whether name is a canonical .lgo file, after
-// stripping trailing variation selectors the same way the shared filename
-// predicate does.
-func logosIsCanonicalLgo(name string) bool {
-	return strings.HasSuffix(strings.TrimRight(name, "\uFE0E\uFE0F"), ".lgo")
-}
-
-// checkLogosAliases emits the alias-extension warnings for one package
-// after its imports have resolved. The generated test main is exempt.
-func checkLogosAliases(p *Package) {
-	if !cfg.Logos || p.Internal.TestmainGo != nil {
-		return
-	}
-	emitLogosAliasWarnings(p)
-}
-
-// emitLogosAliasWarnings prints one warning per accepted alias-extension
-// source file, including the test lists. Canonical .lgo files never warn.
-// Only packages in a main module whose path starts with a dotted element
-// warn: those are the modules that could be published, where the module
-// zip rules reject alias extensions. Each package is checked once when it
-// finishes loading, so no warning state is kept beyond the load.
-func emitLogosAliasWarnings(p *Package) {
-	mod := p.Module
-	if mod == nil || !mod.Main {
-		return
-	}
-	elem, _, _ := strings.Cut(mod.Path, "/")
-	if !strings.Contains(elem, ".") {
-		return
-	}
-	for _, files := range [][]string{p.GoFiles, p.CgoFiles, p.TestGoFiles, p.XTestGoFiles} {
-		for _, name := range files {
-			warnLogosAliasFile(name)
-		}
-	}
-}
-
-// warnLogosAliasFile warns once for an alias-extension source file.
-func warnLogosAliasFile(name string) {
-	if !cfg.IsLogosFile(name) || logosIsCanonicalLgo(name) {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "go: warning: [portability::alias_extension] %s: loGo/s alias extension file; rename to .lgo before publishing\n", name)
 }
 
 // moduleKinds groups one module's loaded packages by kind, keyed by import
@@ -108,6 +61,47 @@ func checkLogosModules(all []*Package) {
 	for _, modPath := range slices.Sorted(maps.Keys(byModule)) {
 		reportMixedModule(modPath, byModule[modPath])
 	}
+}
+
+// addLogosRTForGoImporter loads the implicit logos/rt import for a Go
+// package directly importing a loGo/s package (M3-S7, beside the M1-S4
+// needsLogosRT hook in pkg.go). It runs during load after the package's
+// own imports resolve, so the rt archive joins the importcfg; plain Go
+// packages without loGo/s imports keep no new dependency.
+func addLogosRTForGoImporter(ld *modload.Loader, ctx context.Context, opts PackageOpts, p *Package) {
+	if p == nil || p.IsLogos() || !cfg.Logos {
+		return
+	}
+	hasLogosDep := false
+	for _, q := range p.Internal.Imports {
+		if q != nil && q.IsLogos() {
+			hasLogosDep = true
+			break
+		}
+	}
+	if !hasLogosDep {
+		return
+	}
+	for _, dep := range p.Internal.CompiledImports {
+		if dep == LogosRTPkg {
+			return
+		}
+	}
+	for _, q := range p.Internal.Imports {
+		if q != nil && q.ImportPath == LogosRTPkg {
+			return
+		}
+	}
+	nstk := ImportStack{{Pkg: p.ImportPath}}
+	p1, err := loadImport(ld, ctx, opts, nil, LogosRTPkg, p.Dir, p, &nstk, nil, ResolveImport)
+	if err != nil && p.Error == nil {
+		p.Error = err
+	}
+	if err != nil || p1.Incomplete {
+		p.Incomplete = true
+	}
+	p.Internal.Imports = append(p.Internal.Imports, p1)
+	p.Internal.CompiledImports = append(p.Internal.CompiledImports, p1.ImportPath)
 }
 
 // hasSourceFiles reports whether any source list of p holds a file.
@@ -188,16 +182,42 @@ func firstCleanPackage(g *moduleKinds, goNames, logosNames []string) *Package {
 
 // needsLogosRT decides the implicit logos/rt import: every logos package
 // gets it, so lowered code can call TraceErr, Join, and the helpers later
-// milestones add, even when no source file names the import. Plain Go
-// packages never get it. M11 appends logos/rt/json and M14 appends
+// milestones add, even when no source file names the import. A Go main
+// package gets it only when its build emits the wasm host loader (SPEC Sec
+// 14.2), so its //go:wasmexport functions share the loader helpers; other
+// plain Go packages never get it. M11 appends logos/rt/json and M14 appends
 // simd/archsimd after this import, in that fixed order.
 func needsLogosRT(p *Package) bool {
-	return p.IsLogos()
+	return p.IsLogos() || EmitsWasmLoader(p)
 }
 
 // LogosRTPkg is the import path of the loGo/s support package implicitly
 // imported by every logos package.
 const LogosRTPkg = "logos/rt"
+
+// LogosSimdPkg is the import path implicitly imported by every logos
+// package when GOEXPERIMENT=simd, so lowered fixed-array SIMD code can
+// call into it without naming it (M14-S1).
+const LogosSimdPkg = "simd/archsimd"
+
+// needsLogosSimd reports whether p needs the implicit simd/archsimd
+// import: every logos package gets it when the simd experiment is on
+// for amd64 or arm64, the only targets whose lowering calls archsimd
+// (SPEC T-204.2). Other targets keep scalar code and no archsimd import.
+func needsLogosSimd(p *Package) bool {
+	if !p.IsLogos() || !cfg.Experiment.SIMD {
+		return false
+	}
+	return cfg.BuildContext.GOARCH == "amd64" || cfg.BuildContext.GOARCH == "arm64"
+}
+
+// needsLogosInterp reports whether p needs the implicit strconv and
+// unsafe imports: every logos package gets them, so lowered
+// interpolations can append without naming them (M6-S1). Plain Go
+// packages never get them.
+func needsLogosInterp(p *Package) bool {
+	return p.IsLogos()
+}
 
 // addLogosRTXTestImport loads the implicit LogosRTPkg import for the
 // external test package of a logos package. The base package gains the
@@ -224,4 +244,63 @@ func addLogosRTXTestImport(ld *modload.Loader, ctx context.Context, opts Package
 	}
 	pxtest.Internal.Imports = append(pxtest.Internal.Imports, p1)
 	pxtest.Internal.CompiledImports = append(pxtest.Internal.CompiledImports, p1.ImportPath)
+	addLogosInterpXTestImport(ld, ctx, opts, pre, pxtest)
+	addLogosSimdXTestImport(ld, ctx, opts, pre, pxtest)
+}
+
+// addLogosSimdXTestImport loads the implicit simd/archsimd import for
+// the external test package of a logos package (M14-S1), mirroring
+// addLogosRTXTestImport: lowered array operators in external test
+// files need the same archive under GOEXPERIMENT=simd.
+func addLogosSimdXTestImport(ld *modload.Loader, ctx context.Context, opts PackageOpts, pre *preload, pxtest *Package) {
+	if pxtest == nil || !needsLogosSimd(pxtest) {
+		return
+	}
+	for _, q := range pxtest.Internal.Imports {
+		if q.ImportPath == LogosSimdPkg {
+			return
+		}
+	}
+	stk := ImportStack{{Pkg: pxtest.ImportPath}}
+	p1, err := loadImport(ld, ctx, opts, pre, LogosSimdPkg, pxtest.Dir, pxtest, &stk, nil, ResolveImport)
+	if err != nil && pxtest.Error == nil {
+		pxtest.Error = err
+	}
+	if err != nil || p1.Incomplete {
+		pxtest.Incomplete = true
+	}
+	pxtest.Internal.Imports = append(pxtest.Internal.Imports, p1)
+	pxtest.Internal.CompiledImports = append(pxtest.Internal.CompiledImports, p1.ImportPath)
+}
+
+// addLogosInterpXTestImport loads the implicit strconv and unsafe
+// imports for the external test package of a logos package (M6-S1),
+// mirroring addLogosRTXTestImport: lowered interpolations in external
+// test files need the same archives.
+func addLogosInterpXTestImport(ld *modload.Loader, ctx context.Context, opts PackageOpts, pre *preload, pxtest *Package) {
+	if pxtest == nil || !needsLogosInterp(pxtest) {
+		return
+	}
+	for _, path := range []string{"strconv", "unsafe"} {
+		present := false
+		for _, q := range pxtest.Internal.Imports {
+			if q.ImportPath == path {
+				present = true
+				break
+			}
+		}
+		if present {
+			continue
+		}
+		stk := ImportStack{{Pkg: pxtest.ImportPath}}
+		p1, err := loadImport(ld, ctx, opts, pre, path, pxtest.Dir, pxtest, &stk, nil, ResolveImport)
+		if err != nil && pxtest.Error == nil {
+			pxtest.Error = err
+		}
+		if err != nil || p1.Incomplete {
+			pxtest.Incomplete = true
+		}
+		pxtest.Internal.Imports = append(pxtest.Internal.Imports, p1)
+		pxtest.Internal.CompiledImports = append(pxtest.Internal.CompiledImports, p1.ImportPath)
+	}
 }

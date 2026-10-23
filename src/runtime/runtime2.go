@@ -547,6 +547,7 @@ type g struct {
 	ditWanted       bool // set if g wants to be executed with DIT enabled
 	syncSafePoint   bool // set if g is stopped at a synchronous safe point.
 	runningCleanups atomic.Bool
+	logosErrLen     uint8 // loGo/s: valid entries in logosErrSite; fills the padding before sig
 	sig             uint32
 	secret          int32 // current nesting of runtime/secret.Do calls.
 	writebuf        []byte
@@ -598,11 +599,17 @@ type g struct {
 	// pointers for the latest error, oldest first. Lowered code uses
 	// package-level sites, so retention is free.
 	logosErrSite [8]unsafe.Pointer
-	// logosErrLen is the number of valid entries in logosErrSite.
-	logosErrLen uint8
+	// logosGroup holds the loGo/s group slot of this goroutine (M8-S1):
+	// logos/rt.Group.Go tags its children with the slot the runtime
+	// allocator lent the group (logos_group.go), 0 outside a group.
+	logosGroup uint32
 	// logosErrLast is the data word of the error that filled the ring:
 	// identity only, not a reference, so the trace keeps no error alive.
 	logosErrLast uintptr
+	// logosArena is the newest chunk of the loGo/s arena chain leased to
+	// this goroutine (M18-S1); older chunks hang off sideStackChunk.next.
+	// Nil when the goroutine holds no arena chunk.
+	logosArena *sideStackChunk
 }
 
 // gTrackingPeriod is the number of transitions out of _Grunning between
@@ -665,6 +672,7 @@ type m struct {
 	newSigstack     bool // minit on C thread called sigaltstack
 	printlock       int8
 	incgo           bool          // m is executing a cgo call
+	inFastCall      bool          // m is executing a logos fast cgo call (M20-S1)
 	isextra         bool          // m is an extra m
 	isExtraInC      bool          // m is an extra m that does not have any Go frames
 	isExtraInSig    bool          // m is an extra m in a signal handler
@@ -687,6 +695,10 @@ type m struct {
 	lockedInt       uint32      // tracking for internal lockOSThread
 	mWaitList       mWaitList   // list of runtime lock waiters
 	ditEnabled      bool        // set if DIT is currently enabled on this M
+
+	// logosWbScratch is the write barrier buffer of a store made without a P
+	// (GOEXPERIMENT=logosgen).
+	logosWbScratch logosGenScratch
 
 	mLockProfile mLockProfile // fields relating to runtime.lock contention
 	profStack    []uintptr    // used for memory/block/mutex stack traces
@@ -736,6 +748,10 @@ type m struct {
 
 	// self points this M until mexit clears it to return nil.
 	self mWeakPointer
+
+	// Fast-cgo diagnostics belong to the original M across _Gsyscall.
+	fastCgoFrame      [4]uintptr
+	fastCallEnterNano int64
 }
 
 const mRedZoneSize = (16 << 3) * asanenabledBit // redZoneSize(2048)
@@ -849,6 +865,11 @@ type p struct {
 	// Cache of a single pinner object to reduce allocations from repeated
 	// pinner creation.
 	pinnerCache *pinner
+
+	// loGo/s arena chunk cache (M18-S1): chunks whose regions are at base,
+	// owned by this P and linked through sideStackChunk.next.
+	logosArenaPool  *sideStackChunk
+	logosArenaPoolN int32
 
 	trace pTraceState
 

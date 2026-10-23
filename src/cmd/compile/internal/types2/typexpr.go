@@ -37,6 +37,7 @@ func (check *Checker) ident(x *operand, e *syntax.Name, wantType bool) {
 	}
 
 	check.recordUse(e, obj)
+	check.logosFieldVarNote(e, obj) // logos M7-S2 hook: bare const-for field uses.
 
 	// If we want a type but don't have one, stop right here and avoid potential problems
 	// with missing underlying types. This also gives better error messages in some cases
@@ -95,6 +96,10 @@ func (check *Checker) ident(x *operand, e *syntax.Name, wantType bool) {
 				return
 			}
 			x.val = check.iota
+		} else if check.logosConstUse(obj, x) { // M5-S2 hook: recorded const composites read as values (SPEC T-201).
+			x.mode_ = value
+			x.typ_ = typ
+			return
 		} else {
 			x.val = obj.val
 		}
@@ -133,6 +138,7 @@ func (check *Checker) ident(x *operand, e *syntax.Name, wantType bool) {
 	}
 
 	x.typ_ = typ
+	check.logosNarrowIdent(x, obj) // logos M3-S4 hook: narrowed reads take the element type.
 }
 
 // typ type-checks the type expression e and returns its type, or Typ[Invalid].
@@ -166,6 +172,9 @@ func (check *Checker) validVarType(e syntax.Expr, typ Type) {
 			pos := syntax.StartPos(e)
 			tset := computeInterfaceTypeSet(check, pos, t) // TODO(gri) is this the correct position?
 			if !tset.IsMethodSet() {
+				if check.logosValueType(pos, typ, tset) { // logos M2-S1 hook.
+					return
+				}
 				if tset.comparable {
 					check.softErrorf(pos, MisplacedConstraintIface, "cannot use type %s outside a type constraint: interface is (or embeds) comparable", typ)
 				} else {
@@ -261,6 +270,9 @@ func (check *Checker) typInternal(e0 syntax.Expr, def *TypeName) (T Type) {
 
 	case *syntax.SelectorExpr:
 		var x operand
+		if check.logosFieldTypeType(e, &x) { // logos M7-S2 hook: f.Type in type position.
+			return x.typ()
+		}
 		check.selector(&x, e, true)
 
 		switch x.mode() {
@@ -310,7 +322,20 @@ func (check *Checker) typInternal(e0 syntax.Expr, def *TypeName) (T Type) {
 	case *syntax.StructType:
 		typ := new(Struct)
 		check.structType(typ, e)
+		check.logosStructDefaults(e, typ) // logos M6-S3 hook: `F T = const` defaults.
 		return typ
+
+	case *syntax.AssertedStruct:
+		return check.logosAssertedStruct(e, def) // logos M2-S6 hook.
+
+	case *syntax.OptionType:
+		return check.logosOptionType(e, def) // logos M3-S2 hook.
+
+	case *syntax.ConstType:
+		return check.logosConstType(e, def) // logos M5-S1 hook.
+
+	case *syntax.TupleType:
+		return check.logosTupleType(e, def) // logos M6-S5 hook.
 
 	case *syntax.Operation:
 		if e.Op == syntax.Mul && e.Y == nil {

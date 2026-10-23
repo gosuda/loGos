@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
@@ -33,6 +34,7 @@ func onPanic() (err error) {
 	panic("boom")
 }
 
+//logos:allow(slop::discarded_error)
 func recoverIt() (s string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -55,7 +57,7 @@ func (e *typedErr) Error() string { return e.msg }
 
 func typedNil() (err error) {
 	errdefer note("typed-nil")
-	var p *typedErr
+	p := (*typedErr)(nil)
 	return p
 }
 
@@ -82,12 +84,15 @@ func argEval() (err error) {
 	return errPrimary
 }
 
+//logos:allow(correctness::unbounded_channel_op)
 func goexitWorker(done chan string) (err error) {
 	errdefer func() { done <- "goexit-ran" }()
 	runtime.Goexit()
 	return nil
 }
 
+//logos:allow(correctness::unbounded_channel_op)
+//logos:allow(slop::discarded_error)
 func run() error {
 	_ = onError()
 	_ = onSuccess()
@@ -98,7 +103,9 @@ func run() error {
 	_ = lifo()
 	_ = argEval()
 	done := make(chan string, 1)
-	go goexitWorker(done)
+	go group (context.Background()) {
+		go goexitWorker(done)
+	}
 	select {
 	case msg := <-done:
 		fmt.Println("goexit:", msg)

@@ -320,6 +320,9 @@ type heapArena struct {
 	// stored directly at the top end of the span's memory.
 	pageUseSpanInlineMarkBits [pagesPerArena / 8]uint8
 
+	// logosCards is the card table of GOEXPERIMENT=logosgen; nil otherwise.
+	logosCards *logosGenCardTable
+
 	// checkmarks stores the debug.gccheckmark state. It is only
 	// used if debug.gccheckmark > 0 or debug.checkfinalizers > 0.
 	checkmarks *checkmarksMap
@@ -506,6 +509,7 @@ type mspan struct {
 	state                 mSpanStateBox // mSpanInUse etc; accessed atomically (get/set methods)
 	needzero              uint8         // needs to be zeroed before allocation
 	isUserArenaChunk      bool          // whether or not this span represents a user arena
+	isLogosArenaChunk     bool          // whether or not this span is a loGo/s arena chunk (arena_logos.go)
 	allocCountBeforeCache uint16        // a copy of allocCount that is stored just before this span is cached
 	elemsize              uintptr       // computed from sizeclass or from npages
 	limit                 uintptr       // end of data in span
@@ -513,6 +517,7 @@ type mspan struct {
 	specials              *special      // linked list of special records sorted by offset.
 	userArenaChunkFree    addrRange     // interval for managing chunk allocation
 	largeType             *_type        // malloc header for large objects.
+	logosAge              uint8         // cycles survived, saturating at logosGenMatureAge (GOEXPERIMENT=logosgen)
 }
 
 func (s *mspan) base() uintptr {
@@ -978,9 +983,10 @@ func (h *mheap) reclaimChunk(arenas []arenaIdx, pageIdx, n uintptr) uintptr {
 type spanAllocType uint8
 
 const (
-	spanAllocHeap    spanAllocType = iota // heap span
-	spanAllocStack                        // stack span
-	spanAllocWorkBuf                      // work buf span
+	spanAllocHeap       spanAllocType = iota // heap span
+	spanAllocStack                           // stack span
+	spanAllocWorkBuf                         // work buf span
+	spanAllocLogosArena                      // loGo/s arena chunk span (arena_logos.go)
 )
 
 // manual returns true if the span allocation is manually managed.
@@ -1407,7 +1413,7 @@ HaveSpan:
 	switch typ {
 	case spanAllocHeap:
 		atomic.Xaddint64(&stats.inHeap, int64(nbytes))
-	case spanAllocStack:
+	case spanAllocStack, spanAllocLogosArena:
 		atomic.Xaddint64(&stats.inStacks, int64(nbytes))
 	case spanAllocWorkBuf:
 		atomic.Xaddint64(&stats.inWorkBufs, int64(nbytes))
@@ -1761,7 +1767,7 @@ func (h *mheap) freeSpanLocked(s *mspan, typ spanAllocType) {
 	switch typ {
 	case spanAllocHeap:
 		atomic.Xaddint64(&stats.inHeap, -int64(nbytes))
-	case spanAllocStack:
+	case spanAllocStack, spanAllocLogosArena:
 		atomic.Xaddint64(&stats.inStacks, -int64(nbytes))
 	case spanAllocWorkBuf:
 		atomic.Xaddint64(&stats.inWorkBufs, -int64(nbytes))
@@ -1820,7 +1826,9 @@ func (span *mspan) init(base uintptr, npages uintptr) {
 	span.elemsize = 0
 	span.speciallock.key = 0
 	span.specials = nil
+	span.logosAge = 0
 	span.needzero = 0
+	span.isLogosArenaChunk = false
 	span.freeindex = 0
 	span.freeIndexForScan = 0
 	span.allocBits = nil

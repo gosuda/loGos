@@ -95,7 +95,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		e.discard(n.Index)
 	case ir.OSLICE, ir.OSLICEARR, ir.OSLICE3, ir.OSLICE3ARR, ir.OSLICESTR:
 		n := n.(*ir.SliceExpr)
-		e.expr(k.note(n, "slice"), n.X)
+		e.expr(e.logosSlice(k, n).note(n, "slice"), n.X) // logos M9: large backing store tracking.
 		e.discard(n.Low)
 		e.discard(n.High)
 		e.discard(n.Max)
@@ -156,6 +156,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 		e.discard(n.Cap)
 	case ir.OMAKECHAN:
 		n := n.(*ir.MakeExpr)
+		e.logosMakeChan(n) // logos M22: a channel is always heap-allocated.
 		e.discard(n.Len)
 	case ir.OMAKEMAP:
 		n := n.(*ir.MakeExpr)

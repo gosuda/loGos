@@ -68,6 +68,9 @@ const (
 	_Type        // type
 	_Var         // var
 	_Question    // ?
+	_FatArrow    // =>
+	_QuestionDot // ?.
+	_Coalesce    // ??
 
 	// empty line comment to exclude it from .String
 	tokenCount //
@@ -104,6 +107,7 @@ const (
 	ImagLit
 	RuneLit
 	StringLit
+	InterpLit // M6-S1: `$"..."` interpolated string (LogosMode only).
 )
 
 type Operator uint
@@ -152,6 +156,7 @@ const (
 // Operator precedences
 const (
 	_ = iota
+	precCoalesce
 	precOrOr
 	precAndAnd
 	precCmp

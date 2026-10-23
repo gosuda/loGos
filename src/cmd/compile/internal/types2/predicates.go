@@ -209,8 +209,10 @@ func hasNil(t Type) bool {
 	switch u := t.Underlying().(type) {
 	case *Basic:
 		return u.kind == UnsafePointer
-	case *Slice, *Pointer, *Signature, *Map, *Chan:
+	case *Slice, *Pointer, *Signature, *Map, *Chan, *Option: // logos M3-S2 hook: `nil` is assignable to every `T?`.
 		return true
+	case *ConstView: // logos M5-S1 hook: `nil` belongs to a const view with a nil-capable element.
+		return hasNil(u.Elem)
 	case *Interface:
 		return !isTypeParam(t) || underIs(t, func(u Type) bool {
 			return u != nil && hasNil(u)
@@ -306,6 +308,34 @@ func (c *comparer) identical(x, y Type, p *ifacePair) bool {
 		// Two pointer types are identical if they have identical base types.
 		if y, ok := y.(*Pointer); ok {
 			return c.identical(x.base, y.base, p)
+		}
+
+	case *Option: // logos M3-S2 hook: option identity is structural over elements.
+		// Two option types are identical if they have identical element types.
+		if y, ok := y.(*Option); ok {
+			return c.identical(x.Elem, y.Elem, p)
+		}
+
+	case *LogosTuple: // logos M6-S5 hook: tuple identity is structural over names and elements.
+		if y, ok := y.(*LogosTuple); ok {
+			if x.Len() != y.Len() {
+				return false
+			}
+			for i := range x.Len() {
+				if x.Name(i) != y.Name(i) || !c.identical(x.Elem(i), y.Elem(i), p) {
+					return false
+				}
+			}
+			return true
+		}
+		if checkTupleStructIdentical(x, y) {
+			return true
+		}
+
+	case *ConstView: // logos M5-S1 hook: const view identity is structural over elements.
+		// Two const views are identical if they have identical element types.
+		if y, ok := y.(*ConstView); ok {
+			return c.identical(x.Elem, y.Elem, p)
 		}
 
 	case *Tuple:

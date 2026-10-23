@@ -884,8 +884,11 @@ var depsRules = `
 	FMT
 	< math/big/internal/asmgen;
 
-	context, errors, unsafe
+	context, errors, reflect, unsafe
 	< logos/rt;
+
+	sync, sync/atomic
+	< logos/sync;
 `
 
 // listStdPkgs returns the same list of packages as "go list std".

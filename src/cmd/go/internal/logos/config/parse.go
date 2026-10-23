@@ -222,7 +222,7 @@ func (p *parser) parseTable() error {
 	}
 	p.tables[name] = true
 	switch name {
-	case "project", "build":
+	case "project", "build", "capabilities", "lints", "lints.thresholds":
 		p.table = name
 	default:
 		return p.errorf(start, "unknown table %q", name)
@@ -238,9 +238,15 @@ func keyOwner(table, key string) (string, bool) {
 	switch key {
 	case "name", "edition", "strict_files":
 		owner = "project"
-	case "cgo", "cgo_allowlist":
+	case "cgo", "cgo_allowlist", "opt_level", "synthetic_pgo", "target_cpu", "arena", "gc":
 		owner = "build"
+	case "direct_reflect", "transitive_reflect", "transitive_exec", "transitive_net", "transitive_unsafe",
+		"reflect_allowlist", "transitive_exec_allowlist", "transitive_net_allowlist", "transitive_unsafe_allowlist":
+		owner = "capabilities"
 	default:
+		owner = lintsOwner(key)
+	}
+	if owner == "" {
 		return "", false
 	}
 	if table != owner {
@@ -251,7 +257,12 @@ func keyOwner(table, key string) (string, bool) {
 
 // isArrayKey reports whether key takes a string array value.
 func isArrayKey(key string) bool {
-	return key == "strict_files" || key == "cgo_allowlist"
+	switch key {
+	case "strict_files", "cgo_allowlist",
+		"reflect_allowlist", "transitive_exec_allowlist", "transitive_net_allowlist", "transitive_unsafe_allowlist":
+		return true
+	}
+	return false
 }
 
 // parseKeyVal parses a key = value line. The cursor is at the key start.
@@ -278,9 +289,14 @@ func (p *parser) parseKeyVal() error {
 	}
 	p.keys[id] = true
 	var err error
-	if isArrayKey(key) {
+	switch {
+	case isArrayKey(key):
 		err = p.parseArrayValue(key)
-	} else {
+	case isBoolKey(key):
+		err = p.parseBoolValue(key, valStart)
+	case isLintThreshold(key):
+		err = p.parseIntValue(key, valStart)
+	default:
 		err = p.parseStringValue(key, valStart)
 	}
 	if err != nil {
@@ -383,6 +399,11 @@ func (p *parser) parseArrayValue(key string) error {
 					return p.errorf(elemStart, "[configuration::invalid_cgo_allowlist] cgo_allowlist pattern %q: %s", s, err)
 				}
 			}
+			if isCapabilitiesAllowlist(key) {
+				if _, err := path.Match(s, ""); err != nil {
+					return p.errorf(elemStart, "[configuration::invalid_capabilities_allowlist] %s pattern %q: %s", key, s, err)
+				}
+			}
 			out = append(out, s)
 		case c == '{':
 			return p.errorf(elemStart, "inline table not allowed")
@@ -439,16 +460,89 @@ func (p *parser) assignString(key, s string, valStart int) error {
 		}
 		p.file.Build.Cgo = s
 		p.file.Build.CgoSet = true
+	case "gc":
+		p.file.Build.GC = s
+		p.file.Build.GCSet = true
+	case "direct_reflect", "transitive_reflect", "transitive_exec", "transitive_net", "transitive_unsafe":
+		if s != "deny" && s != "warn" && s != "allow" {
+			return p.errorf(valStart, "invalid %s value %q (want deny, warn, or allow)", key, s)
+		}
+		assignSeverity(&p.file.Capabilities, key, s)
+	case "opt_level", "synthetic_pgo", "target_cpu":
+		return p.assignBuildEnum(key, s, valStart)
+	default:
+		if isLintGroup(key) {
+			return p.assignLintGroup(key, s, valStart)
+		}
 	}
 	return nil
 }
 
+// buildEnums lists the accepted spellings of the enumerated [build] keys.
+var buildEnums = map[string][]string{
+	"opt_level":     {"O0", "O1", "O2", "O3", "Os", "Oz"},
+	"synthetic_pgo": {"off", "standard", "aggressive"},
+	"target_cpu":    {"deterministic", "baseline", "native"},
+}
+
+// assignBuildEnum validates one enumerated [build] value against its
+// accepted spellings and stores it.
+func (p *parser) assignBuildEnum(key, s string, valStart int) error {
+	if !slices.Contains(buildEnums[key], s) {
+		return p.errorf(valStart, "%s must be one of %s", key, strings.Join(buildEnums[key], ", "))
+	}
+	switch key {
+	case "opt_level":
+		p.file.Build.OptLevel = s
+	case "synthetic_pgo":
+		p.file.Build.SyntheticPGO = s
+		p.file.Build.SynthPGOSet = true
+	case "target_cpu":
+		p.file.Build.TargetCPU = s
+	}
+	return nil
+}
+
+// assignSeverity stores a validated capabilities severity value.
+func assignSeverity(c *Capabilities, key, s string) {
+	switch key {
+	case "direct_reflect":
+		c.DirectReflect = s
+	case "transitive_reflect":
+		c.TransitiveReflect = s
+	case "transitive_exec":
+		c.TransitiveExec = s
+	case "transitive_net":
+		c.TransitiveNet = s
+	case "transitive_unsafe":
+		c.TransitiveUnsafe = s
+	}
+}
+
+// isCapabilitiesAllowlist reports whether key is a capabilities allowlist.
+func isCapabilitiesAllowlist(key string) bool {
+	switch key {
+	case "reflect_allowlist", "transitive_exec_allowlist", "transitive_net_allowlist", "transitive_unsafe_allowlist":
+		return true
+	}
+	return false
+}
+
 // assignArray stores an array value.
 func (p *parser) assignArray(key string, out []string) error {
-	if key == "strict_files" {
+	switch key {
+	case "strict_files":
 		p.file.Project.StrictFiles = out
-	} else {
+	case "cgo_allowlist":
 		p.file.Build.CgoAllowlist = out
+	case "reflect_allowlist":
+		p.file.Capabilities.ReflectAllowlist = out
+	case "transitive_exec_allowlist":
+		p.file.Capabilities.TransitiveExecAllowlist = out
+	case "transitive_net_allowlist":
+		p.file.Capabilities.TransitiveNetAllowlist = out
+	case "transitive_unsafe_allowlist":
+		p.file.Capabilities.TransitiveUnsafeAllowlist = out
 	}
 	return nil
 }

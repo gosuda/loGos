@@ -464,6 +464,7 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason w
 	if status != _Grunning && status != _Gscanrunning {
 		throw("gopark: bad g status")
 	}
+	logosArenaPark(gp)
 	mp.waitlock = lock
 	mp.waitunlockf = unlockf
 	gp.waitreason = reason
@@ -4511,6 +4512,7 @@ func goexit0(gp *g) {
 		// Since this is running on g0, our registers are already zeroed from going through
 		// mcall in secret mode.
 	}
+	logosStackNoteExit(gp)
 	gdestroy(gp)
 	schedule()
 }
@@ -4538,6 +4540,7 @@ func gdestroy(gp *g) {
 	gp.labels = nil
 	gp.timer = nil
 	logosClearErrTrace(gp)
+	logosArenaExit(gp)
 	gp.bubble = nil
 	gp.fipsOnlyBypass = false
 	gp.secret = 0
@@ -5366,6 +5369,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 	if newg.stack.hi == 0 {
 		throw("newproc1: newg missing stack")
 	}
+	logosStackFit(newg, callerpc)
 
 	if readgstatus(newg) != _Gdead {
 		throw("newproc1: new g is not Gdead")
@@ -6022,8 +6026,10 @@ func (pp *p) destroy() {
 		println("runtime: p id", pp.id, "destroyed during GC phase", phase)
 		throw("P destroyed while GC is running")
 	}
+	logosGenDrainCards(pp)
 	// We should free the queues though.
 	pp.gcw.spanq.destroy()
+	logosArenaFlushP(pp)
 
 	clear(pp.sudogbuf[:])
 	pp.sudogcache = pp.sudogbuf[:0]

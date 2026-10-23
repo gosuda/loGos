@@ -1,0 +1,372 @@
+# M9-S1 (R-U1): logos lint applies the language-neutral rules to the Go
+# packages of the main module, while logos build and plain go run no lint.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+# logos lint fails on the dropped error in the .go file, reports no
+# loGo/s-only rule for the bare go statement, and writes no binary.
+cd dropped
+! logos lint ./...
+stderr 'main\.go:10:2: \[slop::discarded_error\]'
+! stderr 'unsupervised_goroutine'
+! exists dropped
+! exists dropped$GOEXE
+cd ..
+
+# logos build ./... and go build ./... on the same module print no lint
+# diagnostic and exit 0.
+cd dropped
+logos build ./...
+! stderr .
+go build ./...
+! stderr .
+cd ..
+
+# //logos:allow(slop::discarded_error) silences the diagnostic.
+cd allowed
+logos lint ./...
+! stderr .
+cd ..
+
+# logos.toml slop = "warn" turns it into a warning that does not fail.
+cd warned
+logos lint ./...
+stderr 'main\.go:6:2: warning: \[slop::discarded_error\]'
+cd ..
+
+# correctness::infinite_recursion defaults to forbid but runs at deny in a
+# Go package.
+cd recursive
+! logos lint ./...
+stderr 'main\.go:3:6: \[correctness::infinite_recursion\]'
+! stderr 'allow_forbidden_rule'
+cd ..
+
+# The directive silences it in the .go file.
+cd recursive_allowed
+logos lint ./...
+! stderr .
+cd ..
+
+# The same directive in a .lgo file fails with allow_forbidden_rule.
+cd recursive_lgo
+! logos lint ./...
+stderr 'main\.lgo:3:1: \[correctness::allow_forbidden_rule\]'
+cd ..
+
+# logos lint --json-diagnostics prints one record whose file ends in .go
+# with severity deny (the Go cap);
+# TestLogosJSONDiagnostics checks the record as JSON.
+cd dropped
+! logos lint --json-diagnostics ./...
+cd ..
+
+# The capped severity of a forbid-default rule is deny in the JSON output;
+# TestLogosJSONDiagnostics checks the record as JSON.
+cd recursive
+! logos lint --json-diagnostics ./...
+cd ..
+
+# A group configured forbid still runs at deny in a Go package, so the
+# directive silences it there.
+cd goforbid
+logos lint ./...
+! stderr .
+cd ..
+
+# A Go dependency module, not the main module, gets no lint diagnostic, even
+# when named on the command line.
+cd app
+logos lint ./...
+! stderr .
+logos lint example.com/dep
+! stderr .
+logos build ./...
+! stderr .
+cd ..
+
+# A loGo dependency module, not the main module, gets no lint diagnostic,
+# even when named on the command line. No logos.toml disables any lint.
+cd lgoapp
+logos lint ./...
+! stderr .
+logos lint example.com/lgodep
+! stderr .
+logos build ./...
+! stderr .
+cd ..
+
+# The same dependency linted as its own main module fails, proving the
+# exclusion above is third-party status and not a clean file.
+cd lgodep
+! logos lint ./...
+stderr 'dep\.lgo:6:2: \[slop::discarded_error\]'
+cd ..
+
+# Positive control: the same package of a workspace module, a main module of
+# the build, is linted.
+cd ws/a
+! logos lint example.com/wsb
+stderr 'b\.go:6:2: \[slop::discarded_error\]'
+cd ../..
+
+-- dropped/go.mod --
+module example.com/dropped
+
+go 1.27
+
+-- dropped/main.go --
+package main
+
+import (
+	"os"
+
+	"example.com/dropped/lib"
+)
+
+func run() {
+	os.Remove("missing")
+	go work()
+}
+
+func work() {}
+
+func main() {
+	run()
+	println(lib.Name())
+}
+
+-- dropped/lib/lib.go --
+package lib
+
+func Name() string { return "lib" }
+
+-- allowed/go.mod --
+module example.com/allowed
+
+go 1.27
+
+-- allowed/main.go --
+package main
+
+import "os"
+
+func main() {
+	//logos:allow(slop::discarded_error)
+	os.Remove("missing")
+}
+
+-- allowed/lib/lib.go --
+package lib
+
+func Name() string { return "lib" }
+
+-- warned/go.mod --
+module example.com/warned
+
+go 1.27
+
+-- warned/logos.toml --
+[lints]
+slop = "warn"
+
+-- warned/main.go --
+package main
+
+import "os"
+
+func main() {
+	os.Remove("missing")
+}
+
+-- warned/lib/lib.go --
+package lib
+
+func Name() string { return "lib" }
+
+-- recursive/go.mod --
+module example.com/recursive
+
+go 1.27
+
+-- recursive/main.go --
+package main
+
+func loop(n int) int {
+	return loop(n)
+}
+
+func main() {
+	println(loop(1))
+}
+
+-- recursive/lib/lib.go --
+package lib
+
+func Name() string { return "lib" }
+
+-- recursive_allowed/go.mod --
+module example.com/recursive_allowed
+
+go 1.27
+
+-- recursive_allowed/main.go --
+package main
+
+//logos:allow(correctness::infinite_recursion)
+func loop(n int) int {
+	return loop(n)
+}
+
+func main() {
+	println(loop(1))
+}
+
+-- recursive_allowed/lib/lib.go --
+package lib
+
+func Name() string { return "lib" }
+
+-- recursive_lgo/go.mod --
+module example.com/recursive_lgo
+
+go 1.27
+
+-- recursive_lgo/main.lgo --
+package main
+
+//logos:allow(correctness::infinite_recursion)
+func loop(n int) int {
+	return loop(n)
+}
+
+func main() {
+	println(loop(1))
+}
+
+-- goforbid/go.mod --
+module example.com/goforbid
+
+go 1.27
+
+-- goforbid/logos.toml --
+[lints]
+slop = "forbid"
+
+-- goforbid/main.go --
+package main
+
+import "os"
+
+func main() {
+	//logos:allow(slop::discarded_error)
+	os.Remove("missing")
+}
+
+-- goforbid/lib/lib.go --
+package lib
+
+func Name() string { return "lib" }
+
+-- app/go.mod --
+module example.com/app
+
+go 1.27
+
+require example.com/dep v0.0.0
+
+replace example.com/dep => ../dep
+
+-- app/main.go --
+package main
+
+import "example.com/dep"
+
+func main() {
+	println(dep.Name())
+}
+
+-- app/lib/lib.go --
+package lib
+
+func Name() string { return "lib" }
+
+-- ws/go.work --
+go 1.27
+
+use (
+	./a
+	./b
+)
+
+-- ws/a/go.mod --
+module example.com/wsa
+
+go 1.27
+
+-- ws/a/a.go --
+package a
+
+func A() {}
+
+-- ws/b/go.mod --
+module example.com/wsb
+
+go 1.27
+
+-- ws/b/b.go --
+package b
+
+import "os"
+
+func B() {
+	os.Remove("missing")
+}
+
+-- dep/go.mod --
+module example.com/dep
+
+go 1.27
+
+-- dep/dep.go --
+package dep
+
+import "os"
+
+func Name() string {
+	os.Remove("missing")
+	return "dep"
+}
+
+-- lgoapp/go.mod --
+module example.com/lgoapp
+
+go 1.27
+
+require example.com/lgodep v0.0.0
+
+replace example.com/lgodep => ../lgodep
+
+-- lgoapp/main.lgo --
+package main
+
+import "example.com/lgodep"
+
+func main() {
+	println(lgodep.Name())
+}
+
+-- lgodep/go.mod --
+module example.com/lgodep
+
+go 1.27
+
+-- lgodep/dep.lgo --
+package lgodep
+
+import "os"
+
+func Name() string {
+	os.Remove("missing")
+	return "dep"
+}
