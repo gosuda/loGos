@@ -1,6 +1,8 @@
 # M9-S2: perf::large_backing_array_pin reads escape analysis and
 # perf::time_after_in_loop reads syntax; both are warn rules that apply to
 # loGo/s packages on every build and to Go packages under logos lint only.
+# Timer receives use cancelable selects so the hard channel rule remains
+# enabled while each case tests the independent performance warning.
 env GOPROXY=off
 env GOTOOLCHAIN=local
 
@@ -10,8 +12,8 @@ mkdir $WORK/bin
 # comes from the compile, after escape analysis.
 cd lgo
 logos build -o $WORK/bin/lgo$GOEXE .
-stderr 'main\.lgo:7:\d+: warning: \[perf::large_backing_array_pin\] subslice of a 65537-byte backing array escapes'
-stderr 'main\.lgo:12:5: warning: \[perf::time_after_in_loop\] time\.After in a loop body'
+stderr 'main\.lgo:10:\d+: warning: \[perf::large_backing_array_pin\] subslice of a 65537-byte backing array escapes'
+stderr 'main\.lgo:18:10: warning: \[perf::time_after_in_loop\] time\.After in a loop body'
 exists $WORK/bin/lgo$GOEXE
 cd ..
 
@@ -27,7 +29,7 @@ cd ..
 
 cd lgodenytime
 ! logos build -o $WORK/bin/lgodenytime$GOEXE .
-stderr 'main\.lgo:7:5: \[perf::time_after_in_loop\]'
+stderr 'main\.lgo:13:10: \[perf::time_after_in_loop\]'
 ! stderr 'warning:'
 ! exists $WORK/bin/lgodenytime$GOEXE
 cd ..
@@ -50,8 +52,8 @@ cd ..
 # 0; logos build and go build print nothing.
 cd gopkg
 logos lint ./...
-stderr 'main\.go:7:\d+: warning: \[perf::large_backing_array_pin\] subslice of a 65537-byte backing array escapes'
-stderr 'main\.go:12:5: warning: \[perf::time_after_in_loop\]'
+stderr 'main\.go:10:\d+: warning: \[perf::large_backing_array_pin\] subslice of a 65537-byte backing array escapes'
+stderr 'main\.go:18:10: warning: \[perf::time_after_in_loop\]'
 ! exists gopkg
 ! exists gopkg$GOEXE
 logos build ./...
@@ -70,14 +72,14 @@ cd ..
 
 cd godenytime
 ! logos lint ./...
-stderr 'main\.go:7:5: \[perf::time_after_in_loop\]'
+stderr 'main\.go:13:10: \[perf::time_after_in_loop\]'
 ! stderr 'warning:'
 cd ..
 
 # The JSON record of the escape finding names the rule and the file.
 cd gopkg
 logos lint --json-diagnostics ./...
-stderr '"severity":"warn","rule_id":"perf::large_backing_array_pin","file":"[^"]*main\.go","span":\{"start_line":7,'
+stderr '"severity":"warn","rule_id":"perf::large_backing_array_pin","file":"[^"]*main\.go","span":\{"start_line":10,'
 cd ..
 
 -- lgo/go.mod --
@@ -88,22 +90,29 @@ go 1.27
 -- lgo/main.lgo --
 package main
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 func head() []byte {
 	var buf [65537]byte
 	return buf[:10]
 }
 
-func wait(d time.Duration) {
+func wait(ctx context.Context, d time.Duration) {
 	for i := 0; i < 2; i++ {
-		<-time.After(d)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(d):
+		}
 	}
 }
 
 func main() {
 	println(len(head()))
-	wait(time.Millisecond)
+	wait(context.Background(), time.Millisecond)
 }
 
 -- lgodeny/go.mod --
@@ -139,16 +148,23 @@ perf = "deny"
 -- lgodenytime/main.lgo --
 package main
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
-func wait(d time.Duration) {
+func wait(ctx context.Context, d time.Duration) {
 	for i := 0; i < 2; i++ {
-		<-time.After(d)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(d):
+		}
 	}
 }
 
 func main() {
-	wait(time.Millisecond)
+	wait(context.Background(), time.Millisecond)
 }
 
 -- lgoallow/go.mod --
@@ -163,22 +179,29 @@ perf = "allow"
 -- lgoallow/main.lgo --
 package main
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 func head() []byte {
 	var buf [65537]byte
 	return buf[:10]
 }
 
-func wait(d time.Duration) {
+func wait(ctx context.Context, d time.Duration) {
 	for i := 0; i < 2; i++ {
-		<-time.After(d)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(d):
+		}
 	}
 }
 
 func main() {
 	println(len(head()))
-	wait(time.Millisecond)
+	wait(context.Background(), time.Millisecond)
 }
 
 -- lgoallowed/go.mod --
@@ -193,7 +216,10 @@ perf = "deny"
 -- lgoallowed/main.lgo --
 package main
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 func head() []byte {
 	var buf [65537]byte
@@ -201,16 +227,20 @@ func head() []byte {
 	return buf[:10]
 }
 
-func wait(d time.Duration) {
+func wait(ctx context.Context, d time.Duration) {
 	for i := 0; i < 2; i++ {
+		select {
+		case <-ctx.Done():
+			return
 		//logos:allow(perf::time_after_in_loop)
-		<-time.After(d)
+		case <-time.After(d):
+		}
 	}
 }
 
 func main() {
 	println(len(head()))
-	wait(time.Millisecond)
+	wait(context.Background(), time.Millisecond)
 }
 
 -- gopkg/go.mod --
@@ -221,22 +251,29 @@ go 1.27
 -- gopkg/main.go --
 package main
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 func head() []byte {
 	var buf [65537]byte
 	return buf[:10]
 }
 
-func wait(d time.Duration) {
+func wait(ctx context.Context, d time.Duration) {
 	for i := 0; i < 2; i++ {
-		<-time.After(d)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(d):
+		}
 	}
 }
 
 func main() {
 	println(len(head()))
-	wait(time.Millisecond)
+	wait(context.Background(), time.Millisecond)
 }
 
 -- godeny/go.mod --
@@ -272,14 +309,21 @@ perf = "deny"
 -- godenytime/main.go --
 package main
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
-func wait(d time.Duration) {
+func wait(ctx context.Context, d time.Duration) {
 	for i := 0; i < 2; i++ {
-		<-time.After(d)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(d):
+		}
 	}
 }
 
 func main() {
-	wait(time.Millisecond)
+	wait(context.Background(), time.Millisecond)
 }
