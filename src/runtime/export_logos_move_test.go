@@ -4,7 +4,15 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/goexperiment"
+	"unsafe"
+)
+
+// LogosMovingExperiment reports goexperiment.LogosGCMoving.
+func LogosMovingExperiment() bool {
+	return goexperiment.LogosGCMoving
+}
 
 // Test seam for M19-S5 and M19-S8: opaque wrappers over the relocation
 // exclusion flag for package runtime_test, which cannot name mspan.

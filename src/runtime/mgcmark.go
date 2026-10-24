@@ -72,6 +72,10 @@ func (gp *g) internalBlocked() bool {
 func allGsSnapshotSortedForGC() ([]*g, int) {
 	assertWorldStoppedOrLockHeld(&allglock)
 
+	if gs, n, ok := logosCheckmarkStackRoots(); ok {
+		return gs, n
+	}
+
 	// Reset the status of leaked goroutines in order to improve
 	// the precision of goroutine leak detection.
 	for _, gp := range allgs {

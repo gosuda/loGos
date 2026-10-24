@@ -40,6 +40,9 @@ func logosWaitForGC(t *testing.T, done <-chan struct{}, what string) {
 // TestLogosNoRelocFinalizerSetAndRemove checks #175: attaching a finalizer
 // flags the span, and removing the finalizer does not clear the flag.
 func TestLogosNoRelocFinalizerSetAndRemove(t *testing.T) {
+	if !runtime.LogosMovingExperiment() {
+		t.Skip("relocation exclusion is inactive when GOEXPERIMENT=logosgcmoving is off")
+	}
 	x := new([1000]byte)
 	if runtime.LogosSpanNoReloc(unsafePointer(x)) {
 		t.Skip("size class span already flagged by an earlier test")
@@ -58,6 +61,9 @@ func TestLogosNoRelocFinalizerSetAndRemove(t *testing.T) {
 // TestLogosNoRelocCleanupSetAndStop checks #175: attaching a cleanup flags
 // the span, and Cleanup.Stop does not clear the flag.
 func TestLogosNoRelocCleanupSetAndStop(t *testing.T) {
+	if !runtime.LogosMovingExperiment() {
+		t.Skip("relocation exclusion is inactive when GOEXPERIMENT=logosgcmoving is off")
+	}
 	x := new([2000]byte)
 	if runtime.LogosSpanNoReloc(unsafePointer(x)) {
 		t.Skip("size class span already flagged by an earlier test")
@@ -76,6 +82,9 @@ func TestLogosNoRelocCleanupSetAndStop(t *testing.T) {
 // TestLogosNoRelocIgnoresWeakHandle checks that only finalizer and cleanup
 // specials flag a span.
 func TestLogosNoRelocIgnoresWeakHandle(t *testing.T) {
+	if !runtime.LogosMovingExperiment() {
+		t.Skip("relocation exclusion is inactive when GOEXPERIMENT=logosgcmoving is off")
+	}
 	x := new([3000]byte)
 	if runtime.LogosSpanNoReloc(unsafePointer(x)) {
 		t.Skip("size class span already flagged by an earlier test")
@@ -92,6 +101,9 @@ func TestLogosNoRelocIgnoresWeakHandle(t *testing.T) {
 
 // TestLogosNoRelocClearedByInit checks #175: only mspan.init clears the flag.
 func TestLogosNoRelocClearedByInit(t *testing.T) {
+	if !runtime.LogosMovingExperiment() {
+		t.Skip("relocation exclusion is inactive when GOEXPERIMENT=logosgcmoving is off")
+	}
 	before, after := runtime.LogosSpanInitClearsNoReloc()
 	if !before {
 		t.Fatal("flag not set before init")
