@@ -310,6 +310,9 @@ func walkExpr1(n ir.Node, init *ir.Nodes) ir.Node {
 
 	case ir.OMAKESLICE:
 		n := n.(*ir.MakeExpr)
+		if r := walkLogosArenaMake(n, init); r != nil {
+			return r
+		}
 		return walkMakeSlice(n, init)
 
 	case ir.OMAKESLICECOPY:

@@ -8,6 +8,7 @@ package runtime_test
 
 import (
 	"fmt"
+	"internal/goexperiment"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -783,4 +784,51 @@ func TestLogosArenaFieldOffset(t *testing.T) {
 	if want := 4 * unsafe.Sizeof(uintptr(0)); runtime.LogosArenaFieldOffset != want {
 		t.Errorf("unsafe.Offsetof(g{}.logosArena) = %d, want %d (4*PtrSize)", runtime.LogosArenaFieldOffset, want)
 	}
+}
+
+//go:noinline
+func arenaEligibleMake(n int) uintptr {
+	b := make([]byte, n)
+	if len(b) > 0 {
+		b[0] = 42
+	}
+	during := runtime.LogosArenaStat().NoscanUsed
+	if len(b) > 0 && b[0] != 42 {
+		panic("memory corrupted")
+	}
+	return during
+}
+
+// M18-S3: an arena-eligible make of dynamic size allocates from the arena
+// bump allocator, advancing the watermark, and restores the watermark when
+// the frame exits.
+func TestLogosArenaDynamicMakeWatermark(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	inFreshGoroutine(t, func() {
+		before := runtime.LogosArenaStat().NoscanUsed
+
+		// First call: dynamic make of 1024 bytes.
+		during1 := arenaEligibleMake(1024)
+		after1 := runtime.LogosArenaStat().NoscanUsed
+
+		if during1 <= before {
+			t.Errorf("call 1: watermark during make = %d, want > %d (watermark did not advance)", during1, before)
+		}
+		if after1 != before {
+			t.Errorf("call 1: watermark after frame exit = %d, want %d (watermark did not fall back)", after1, before)
+		}
+
+		// Second call: dynamic make of 2048 bytes.
+		during2 := arenaEligibleMake(2048)
+		after2 := runtime.LogosArenaStat().NoscanUsed
+
+		if during2 <= before {
+			t.Errorf("call 2: watermark during make = %d, want > %d (watermark did not advance)", during2, before)
+		}
+		if after2 != before {
+			t.Errorf("call 2: watermark after frame exit = %d, want %d (watermark did not fall back)", after2, before)
+		}
+	})
 }

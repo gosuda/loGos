@@ -11,3 +11,4 @@ import "internal/goarch"
 // offset cannot be derived here; TestLogosArenaFieldOffset in src/runtime
 // asserts unsafe.Offsetof(g{}.logosArena) equals this value.
 const logosArenaGOffset = 4 * goarch.PtrSize
+const LogosArenaGOffset = logosArenaGOffset

@@ -1377,7 +1377,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 
 	case ssa.OpAMD64LoweredLogosArenaBump:
 		chunk := v.Args[0].Reg()
-		res := v.Reg()
+		res := v.Reg0()
 		tmp := v.RegTmp()
 		rnd := v.AuxInt
 		opregreg(s, x86.ATESTQ, chunk, chunk)

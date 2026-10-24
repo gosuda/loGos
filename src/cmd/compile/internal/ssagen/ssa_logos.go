@@ -36,6 +36,7 @@ func logosColdBuilder(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 // logosRegisterCold registers the Cold intrinsic on every architecture.
 func logosRegisterCold(add func(string, string, intrinsicBuilder, ...*sys.Arch)) {
 	add("logos/rt", "Cold", logosColdBuilder, sys.Archs[:]...)
+	logosRegisterArena(add)
 }
 
 // logosSynthMark marks synthetic-PGO cold terminators: os.Exit calls at

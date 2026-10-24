@@ -172,7 +172,7 @@ func logosArenaInfo(fn *ir.Func) logosArenaFnInfo {
 				info.hasDefer = true
 			}
 		case *ir.BranchStmt:
-			if n.Op() == ir.OGOTO {
+			if n.Op() == ir.OGOTO && (n.Label == nil || len(n.Label.Name) == 0 || n.Label.Name[0] != '.') {
 				info.hasGoto = true
 			}
 		}

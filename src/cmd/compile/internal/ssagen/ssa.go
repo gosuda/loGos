@@ -574,6 +574,7 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 	}
 	s.zeroResults()
 	s.paramsToHeap()
+	s.logosArenaFrameEnter()
 	s.stmtList(fn.Body)
 
 	// fallthrough to exit
@@ -1063,6 +1064,11 @@ type state struct {
 	// value representing address of where deferBits autotmp is stored
 	deferBitsAddr *ssa.Value
 	deferBitsTemp *ir.Name
+
+	arenaMarkChunk  *ssa.Value
+	arenaMarkNoscan *ssa.Value
+	arenaMarkScan   *ssa.Value
+	hasArenaSave    bool
 
 	// line number stack. The current line number is top of stack
 	line []src.XPos
@@ -2391,6 +2397,7 @@ func (s *state) exit() *ssa.Block {
 			s.popLine()
 		}
 	}
+	s.logosArenaFrameExit()
 
 	// Do actual return.
 	// These currently turn into self-copies (in many cases).
