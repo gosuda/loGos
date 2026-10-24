@@ -6,6 +6,10 @@
 
 package runtime
 
+import (
+	"internal/runtime/atomic"
+)
+
 // Background relocation workers.
 //
 // A dedicated goroutine set copies pages concurrently with mutators after
@@ -23,9 +27,21 @@ var zgcWorkerCount = 4
 // zgcWorkCh wakes relocation workers after registration.
 var zgcWorkCh chan struct{}
 
-// zgcInitWorkers creates the worker channel and parks the dedicated pool
-// while the world runs: spawning goroutines inside a pause is avoided.
+var zgcWorkersStarted atomic.Uint32
+
+func init() {
+	if logosGCMode == "zgc" {
+		zgcInitWorkers()
+	}
+}
+
+// zgcInitWorkers creates the worker channel and parks the dedicated pool.
+// Worker spawning is deferred until after procresize (via package init)
+// so runtime bootstrap (schedinit/gcinit) remains goroutine- and allocation-free.
 func zgcInitWorkers() {
+	if !zgcWorkersStarted.CompareAndSwap(0, 1) {
+		return
+	}
 	zgcWorkCh = make(chan struct{}, 16)
 	for range zgcWorkerCount {
 		go zgcRelocationWorker(zgcWorkCh)

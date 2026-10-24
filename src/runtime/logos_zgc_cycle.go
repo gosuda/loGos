@@ -34,7 +34,6 @@ var zgcRelocating atomic.Int32
 func zgcInit() {
 	zgcInitPageRegistry()
 	zgcInitSelect()
-	zgcInitWorkers()
 	zgcInitForeignRoots()
 	if ok, _ := zgcEnableHardwareTagging(); ok {
 		zgcConfigure(zgcEncodingHardware, zgcColorMark0)

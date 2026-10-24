@@ -52,6 +52,7 @@ var (
 	zgcPageStatesHead *zgcPageSpans
 	zgcStateFree      [128]*zgcPageSpans
 	zgcStateFreeN     int
+	zgcEmptyPageSpans zgcPageSpans
 )
 
 // zgcInitPageRegistry preallocates the page registry and a pool of page
@@ -59,6 +60,11 @@ var (
 // an allocation that trips the heap goal would start a collection and
 // deadlock against the stopped world.
 func zgcInitPageRegistry() {
+	lock(&zgcPageSpansLock)
+	defer unlock(&zgcPageSpansLock)
+	if zgcPageSpansMap != nil {
+		return
+	}
 	zgcPageSpansMap = make(map[*zgcPage]*zgcPageSpans, 128)
 	for i := range zgcStateFree {
 		// A 2 MB page overlaps at most 256 spans; the reservation
@@ -78,7 +84,14 @@ func zgcInitPageRegistry() {
 }
 
 func zgcPageState(pg *zgcPage) *zgcPageSpans {
+	if pg == nil {
+		return &zgcEmptyPageSpans
+	}
 	lock(&zgcPageSpansLock)
+	if zgcPageSpansMap == nil {
+		unlock(&zgcPageSpansLock)
+		return &zgcEmptyPageSpans
+	}
 	st := zgcPageSpansMap[pg]
 	if st == nil {
 		if zgcStateFreeN != 0 {
@@ -101,33 +114,38 @@ func zgcPageState(pg *zgcPage) *zgcPageSpans {
 }
 
 func zgcPageForget(pg *zgcPage) {
-	lock(&zgcPageSpansLock)
-	if st := zgcPageSpansMap[pg]; st != nil {
-		if st.prev != nil {
-			st.prev.next = st.next
-		} else {
-			zgcPageStatesHead = st.next
-		}
-		if st.next != nil {
-			st.next.prev = st.prev
-		}
-		st.next = nil
-		st.prev = nil
-		// Keep the pre-sized backing arrays; only the lengths and
-		// the cursor reset so the next pause reuses them. Under the
-		// entry mutex so a concurrent to-space bypass scan cannot
-		// tear the list.
-		lock(&st.mu)
-		st.spans = st.spans[:0]
-		st.toSpace = st.toSpace[:0]
-		st.cursor = 0
-		unlock(&st.mu)
-		if zgcStateFreeN < len(zgcStateFree) {
-			zgcStateFree[zgcStateFreeN] = st
-			zgcStateFreeN++
-		}
+	if pg == nil {
+		return
 	}
-	delete(zgcPageSpansMap, pg)
+	lock(&zgcPageSpansLock)
+	if zgcPageSpansMap != nil {
+		if st := zgcPageSpansMap[pg]; st != nil {
+			if st.prev != nil {
+				st.prev.next = st.next
+			} else {
+				zgcPageStatesHead = st.next
+			}
+			if st.next != nil {
+				st.next.prev = st.prev
+			}
+			st.next = nil
+			st.prev = nil
+			// Keep the pre-sized backing arrays; only the lengths and
+			// the cursor reset so the next pause reuses them. Under the
+			// entry mutex so a concurrent to-space bypass scan cannot
+			// tear the list.
+			lock(&st.mu)
+			st.spans = st.spans[:0]
+			st.toSpace = st.toSpace[:0]
+			st.cursor = 0
+			unlock(&st.mu)
+			if zgcStateFreeN < len(zgcStateFree) {
+				zgcStateFree[zgcStateFreeN] = st
+				zgcStateFreeN++
+			}
+		}
+		delete(zgcPageSpansMap, pg)
+	}
 	unlock(&zgcPageSpansLock)
 }
 
@@ -380,6 +398,9 @@ func zgcPublishToSpaceSpans(pg *zgcPage) {
 	}
 	assertWorldStopped()
 	st := zgcPageState(pg)
+	if st == nil || st == &zgcEmptyPageSpans {
+		return
+	}
 	for _, s := range st.toSpace {
 		if s == nil || s.state.get() != mSpanInUse {
 			continue
@@ -404,23 +425,25 @@ func zgcRetirePage(pg *zgcPage) bool {
 		return false
 	}
 	assertWorldStopped()
-	lock(&mheap_.lock)
 	st := zgcPageState(pg)
-	for _, s := range st.spans {
-		if s == nil {
-			continue
+	if st != nil && st != &zgcEmptyPageSpans {
+		lock(&mheap_.lock)
+		for _, s := range st.spans {
+			if s == nil {
+				continue
+			}
+			if s.allocCount != 0 {
+				unlock(&mheap_.lock)
+				throw("zgc: retiring a span with live allocations")
+			}
+			atomic.Store(&s.sweepgen, mheap_.sweepgen)
+			mheap_.freeSpanLocked(s, spanAllocHeap)
+			zgcUnquarantineSpan(s)
 		}
-		if s.allocCount != 0 {
-			unlock(&mheap_.lock)
-			throw("zgc: retiring a span with live allocations")
-		}
-		atomic.Store(&s.sweepgen, mheap_.sweepgen)
-		mheap_.freeSpanLocked(s, spanAllocHeap)
-		zgcUnquarantineSpan(s)
+		unlock(&mheap_.lock)
+		st.spans = nil
+		st.toSpace = nil
 	}
-	unlock(&mheap_.lock)
-	st.spans = nil
-	st.toSpace = nil
 	zgcPageForget(pg)
 	zgcIdentityForgetRange(pg)
 	zgcFreePage(pg)
