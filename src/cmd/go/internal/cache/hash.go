@@ -12,8 +12,9 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
+
+	"cmd/internal/objabi"
 )
 
 var debugHash = false // set when GODEBUG=gocachehash=1
@@ -43,19 +44,7 @@ type Hash struct {
 // execution. This allows bootstrapping to converge faster: dist builds
 // go_bootstrap without any experiments, so by stripping experiments
 // go_bootstrap and the final go binary will use the same salt.
-var hashSalt = []byte(stripExperiment(runtime.Version()))
-
-// stripExperiment strips any GOEXPERIMENT configuration from the Go
-// version string.
-func stripExperiment(version string) string {
-	if i := strings.Index(version, " X:"); i >= 0 {
-		return version[:i]
-	}
-	if i := strings.Index(version, "-X:"); i >= 0 {
-		return version[:i]
-	}
-	return version
-}
+var hashSalt = []byte(objabi.StripExperiment(runtime.Version()))
 
 // Subkey returns an action ID corresponding to mixing a parent
 // action ID with a string description of the subkey.
