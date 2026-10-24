@@ -94,13 +94,15 @@ func ScanNext(info *types2.Info, files []*syntax.File, src map[*syntax.File][]by
 
 // nextScan holds the state of one ScanNext run.
 type nextScan struct {
-	info    *types2.Info
-	errType types2.Type
-	src     []byte
-	starts  []int
-	edits   []NextEdit
-	tasks   []NextTask
-	skip    [][2]int
+	info           *types2.Info
+	errType        types2.Type
+	src            []byte
+	starts         []int
+	edits          []NextEdit
+	tasks          []NextTask
+	skip           [][2]int
+	addrTaken      map[types2.Object]bool
+	closureWritten map[types2.Object]bool
 }
 
 // nextCtx carries the enclosing function of one block walk. safeErr
@@ -125,6 +127,7 @@ func (s *nextScan) scanFile(f *syntax.File, data []byte, name string) NextFileRe
 	s.edits = nil
 	s.tasks = nil
 	s.skip = nil
+	s.initFileFacts(f)
 	for _, decl := range f.DeclList {
 		fn, ok := decl.(*syntax.FuncDecl)
 		if !ok || fn.Body == nil {
@@ -617,15 +620,14 @@ func (s *nextScan) returnsFit(rets []syntax.Expr, last *syntax.Name) bool {
 		return false
 	}
 	for _, r := range rets[:len(rets)-1] {
-		if !isZeroExpr(r) {
+		if !s.isZeroExpr(r) {
 			return false
 		}
 	}
 	return s.sameErr(rets[len(rets)-1], last)
 }
 
-// isZeroExpr reports whether e spells a zero value.
-func isZeroExpr(e syntax.Expr) bool {
+func (s *nextScan) isZeroExpr(e syntax.Expr) bool {
 	switch n := unwrapParen(e).(type) {
 	case *syntax.BasicLit:
 		switch n.Kind {
@@ -637,7 +639,16 @@ func isZeroExpr(e syntax.Expr) bool {
 			return n.Value == `""`
 		}
 	case *syntax.Name:
-		return n.Value == "nil" || n.Value == "false"
+		switch n.Value {
+		case "false":
+			want := types2.Universe.Lookup("false")
+			if _, ok := want.(*types2.Const); !ok {
+				return false
+			}
+			return s.nameObj(n) == want
+		case "nil":
+			return s.nameObj(n) == types2.Universe.Lookup("nil")
+		}
 	}
 	return false
 }

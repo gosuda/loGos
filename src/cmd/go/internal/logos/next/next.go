@@ -394,7 +394,13 @@ func walkNextSkipDir(path, moddir string) bool {
 		return false
 	}
 	dirname := filepath.Base(path)
-	return dirname == "vendor" || dirname == "testdata" || strings.HasPrefix(dirname, ".")
+	if dirname == "vendor" || dirname == "testdata" || strings.HasPrefix(dirname, ".") {
+		return true
+	}
+	if st, err := os.Stat(filepath.Join(path, "go.mod")); err == nil && !st.IsDir() {
+		return true
+	}
+	return false
 }
 
 // walkNextFileOK reports whether a file converts to loGo/s: a .go file
@@ -508,12 +514,14 @@ func (s *scanState) assignTasks() {
 
 // remap shifts a pre-conversion line past earlier edits.
 func remap(edits []wireEdit, line int) int {
+	orig := line
+	delta := 0
 	for _, e := range edits {
-		if e.EndLine < line {
-			line += newLines(e.Replacement) - (e.EndLine - e.StartLine + 1)
+		if e.EndLine < orig {
+			delta += newLines(e.Replacement) - (e.EndLine - e.StartLine + 1)
 		}
 	}
-	return line
+	return orig + delta
 }
 
 // newLines counts the lines of replacement text.

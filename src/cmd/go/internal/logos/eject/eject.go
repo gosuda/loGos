@@ -823,7 +823,56 @@ func rewriteMainGoMod(out string, plan *ejectPlan) {
 		ensureGoRequire(f, m.path, m.version)
 		setGoReplace(f, m.path, m.version, "./_logos_deps/"+m.path+"@"+m.version)
 	}
+	rebaseLocalReplaces(f, plan.main.dir, out, ejectedPaths(out, plan))
 	writeGoModFile(path, f)
+}
+
+func ejectedPaths(out string, plan *ejectPlan) map[string]string {
+	m := map[string]string{}
+	for _, dep := range plan.deps {
+		m[dep.path] = filepath.Join(out, "_logos_deps", dep.path+"@"+dep.version)
+	}
+	return m
+}
+
+func rebaseLocalReplaces(f *modfile.File, origDir, dstDir string, ejected map[string]string) {
+	absOrig, err := filepath.Abs(origDir)
+	if err != nil {
+		base.Fatalf("logos eject: %v", err)
+	}
+	absDst, err := filepath.Abs(dstDir)
+	if err != nil {
+		base.Fatalf("logos eject: %v", err)
+	}
+	type pending struct {
+		oldPath string
+		oldVers string
+		newPath string
+	}
+	var work []pending
+	for _, r := range slices.Clone(f.Replace) {
+		if _, ok := ejected[r.Old.Path]; ok {
+			continue
+		}
+		if r.New.Version != "" || r.New.Path == "" || filepath.IsAbs(r.New.Path) {
+			continue
+		}
+		target := filepath.Join(absOrig, filepath.FromSlash(r.New.Path))
+		if relOrig, err := filepath.Rel(absOrig, target); err == nil && relOrig != ".." && !strings.HasPrefix(relOrig, ".."+string(filepath.Separator)) {
+			dstTarget := filepath.Join(absDst, relOrig)
+			if fi, err := os.Stat(dstTarget); err == nil && fi.IsDir() {
+				target = dstTarget
+			}
+		}
+		rel, err := filepath.Rel(absDst, target)
+		if err != nil {
+			base.Fatalf("logos eject: %v", err)
+		}
+		work = append(work, pending{r.Old.Path, r.Old.Version, "./" + filepath.ToSlash(rel)})
+	}
+	for _, w := range work {
+		setGoReplace(f, w.oldPath, w.oldVers, w.newPath)
+	}
 }
 
 // addSupportRequire points one ejected go.mod at the support module
@@ -868,6 +917,7 @@ func rewriteDepGoMod(plan *ejectPlan, m *ejectModule, ejected map[string]string)
 	for _, o := range olds {
 		setGoReplace(f, o[0], o[1], relEjectTarget(dst, ejected[o[0]]))
 	}
+	rebaseLocalReplaces(f, m.dir, dst, ejected)
 	writeGoModFile(filepath.Join(dst, "go.mod"), f)
 }
 

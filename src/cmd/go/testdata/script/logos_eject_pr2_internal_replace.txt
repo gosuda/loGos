@@ -1,0 +1,63 @@
+# PR2: in-module Go-only replace ./sub is copied to the ejected output.
+# The ejected go.mod must reference the copied ./sub in the output tree,
+# not point back into the original disposable source directory.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+cd lapp
+logos run .
+stdout '^internal-sub-ok$'
+cp stdout $WORK/want-stdout.txt
+
+logos eject -o $WORK/out
+exists $WORK/out/main.go
+exists $WORK/out/go.mod
+exists $WORK/out/sub/go.mod
+exists $WORK/out/sub/sub.go
+
+# Removing the original source directory proves the ejected module is
+# self-contained and does not point back into the disposable source tree.
+cd ..
+exists lapp
+rm lapp
+! exists lapp
+
+cd $WORK/out
+go build ./...
+go run .
+cmp stdout $WORK/want-stdout.txt
+
+-- lapp/go.mod --
+module example.com/lapp
+
+go 1.27
+
+require example.com/sub v1.0.0
+
+replace example.com/sub v1.0.0 => ./sub
+
+-- lapp/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/sub"
+)
+
+func main() {
+	fmt.Println(sub.Msg())
+}
+
+-- lapp/sub/go.mod --
+module example.com/sub
+
+go 1.27
+
+-- lapp/sub/sub.go --
+package sub
+
+// Msg reports the internal helper string.
+func Msg() string {
+	return "internal-sub-ok"
+}
