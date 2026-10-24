@@ -1,0 +1,57 @@
+# PR2 U0Cj: platform-specific .lgo files must survive eject.
+# Eject on linux must still emit the windows variant; the output builds
+# on both GOOS values. Files with //go:build ignore stay excluded.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+cd plat
+logos run .
+stdout '^plat-ok$'
+logos eject -o out
+exists out/main.go
+exists out/plat_linux.go
+exists out/plat_windows.go
+! exists out/plat_ignore.go
+cd out
+go build ./...
+go run .
+stdout '^plat-ok$'
+env GOOS=windows
+go build ./...
+
+-- plat/go.mod --
+module example.com/plat
+
+go 1.27
+
+-- plat/main.lgo --
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println(Platform() + "-ok")
+}
+
+-- plat/plat_linux.lgo --
+package main
+
+func Platform() string {
+	return "plat"
+}
+
+-- plat/plat_windows.lgo --
+package main
+
+func Platform() string {
+	return "plat"
+}
+
+-- plat/plat_ignore.lgo --
+//go:build ignore
+
+package main
+
+func Ignored() string {
+	return "ignored"
+}

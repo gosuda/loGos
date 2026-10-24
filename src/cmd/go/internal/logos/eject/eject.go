@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"go/ast"
+	"go/build/constraint"
 	"go/format"
 	"go/parser"
 	"go/token"
@@ -524,19 +525,43 @@ func emitPackageGoFiles(p *load.Package, plan *ejectPlan, staging, dstRoot, modR
 		base.Fatalf("logos eject: package %s outside module", p.ImportPath)
 	}
 	names := slices.Clone(p.GoFiles)
+	names = append(names, p.CgoFiles...)
+	for _, name := range p.IgnoredGoFiles {
+		if strings.HasSuffix(logosStem(name), "_test") && !plan.testBuilt[p] {
+			continue
+		}
+		names = append(names, name)
+	}
 	if plan.testBuilt[p] {
 		names = append(names, p.TestGoFiles...)
 		names = append(names, p.XTestGoFiles...)
 	}
+	ignoredSet := make(map[string]bool, len(p.IgnoredGoFiles))
+	for _, name := range p.IgnoredGoFiles {
+		ignoredSet[name] = true
+	}
 	used := false
+	seen := make(map[string]bool, len(names))
 	for _, name := range names {
-		if !cfg.IsLogosFile(name) {
+		if seen[name] || !cfg.IsLogosFile(name) {
 			continue
 		}
+		seen[name] = true
 		stem := logosStem(name)
 		raw, err := os.ReadFile(filepath.Join(staging, filepath.FromSlash(p.ImportPath), stem+".go"))
 		if err != nil {
-			base.Fatalf("logos eject: missing ejected output for %s", filepath.Join(p.Dir, name))
+			if os.IsNotExist(err) && ignoredSet[name] {
+				srcData, readErr := os.ReadFile(filepath.Join(p.Dir, name))
+				if readErr != nil {
+					base.Fatalf("logos eject: missing ejected output for %s: %v", filepath.Join(p.Dir, name), readErr)
+				}
+				if isBuildIgnored(srcData) {
+					continue
+				}
+				raw = srcData
+			} else {
+				base.Fatalf("logos eject: missing ejected output for %s: %v", filepath.Join(p.Dir, name), err)
+			}
 		}
 		fixed, uses := rewriteEjectedGo(raw, name)
 		if uses {
@@ -551,6 +576,41 @@ func emitPackageGoFiles(p *load.Package, plan *ejectPlan, staging, dstRoot, modR
 		}
 	}
 	return used
+}
+
+// isBuildIgnored reports whether source declares an ignore build constraint
+// such as //go:build ignore or // +build ignore. It inspects only comments
+// before the package clause, so syntax in the file body never interferes.
+func isBuildIgnored(source []byte) bool {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", source, parser.PackageClauseOnly|parser.ParseComments)
+	if err != nil {
+		return false
+	}
+	expr, err := ownedHeaderExpr(f)
+	if err != nil || expr == nil {
+		return false
+	}
+	return hasIgnoreTag(expr)
+}
+
+// hasIgnoreTag reports whether the constraint expression requires the
+// special "ignore" build tag.
+func hasIgnoreTag(x constraint.Expr) bool {
+	if x == nil {
+		return false
+	}
+	switch e := x.(type) {
+	case *constraint.TagExpr:
+		return e.Tag == "ignore"
+	case *constraint.NotExpr:
+		return false
+	case *constraint.AndExpr:
+		return hasIgnoreTag(e.X) || hasIgnoreTag(e.Y)
+	case *constraint.OrExpr:
+		return hasIgnoreTag(e.X) && hasIgnoreTag(e.Y)
+	}
+	return false
 }
 
 // logosStem returns name without its loGo/s extension, keeping a _test
