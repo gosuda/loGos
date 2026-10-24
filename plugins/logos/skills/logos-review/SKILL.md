@@ -4,15 +4,15 @@ description: Review, audit, or check .lgo code or a loGo/s diff for rule violati
 license: BSD-3-Clause
 compatibility: Needs the logos command from github.com/gosuda/loGos on PATH.
 metadata:
-  version: "0.20.0"
-  milestone: "M20"
+  version: "0.22.0"
+  milestone: "M1"
 ---
 
 # Review loGo/s code
 
 Check `.lgo` code against the compiler rules. Each checklist item states the rule it checks. Report each finding with its rule ID, fix it, and end with a green build and test.
 
-Coverage: M1 error propagation, M2 closed unions, M3 options and nil flow, M4 interface properties, M5 const composites with CTFE, read-only placement, const views, zero-copy conversions, const maps and `logos/rt.Freeze`, M6 interpolation, address-of, defaults, spread, tuples, lambdas, chains, leading-dot, yield and scope defer, M12 capabilities. Not shipped: M7–M11, M13–M21+. Do not demand those forms.
+Coverage: M1 error propagation, M2 closed unions, M3 options and nil flow, M4 interface properties, M5 const composites with CTFE, read-only placement, const views, zero-copy conversions, const maps and `logos/rt.Freeze`, M6 interpolation, address-of, defaults, spread, tuples, lambdas, chains, leading-dot, yield and scope defer, M7 comptime, M8 structured concurrency, M9 lints, M11 static JSON, M12 capabilities.
 
 ## Procedure
 
@@ -79,6 +79,33 @@ Proven by `src/cmd/go/testdata/script/logos_cap_unsafe.txt` and `src/cmd/go/test
 
 25. Capabilities: `logos.toml` `[capabilities]` severities are `deny`, `warn`, or `allow`; every dependency that reaches a protected sink (reflect constructors, process spawn, socket creation, `unsafe`, cgo entry) is allowlisted or removed. Findings: `capabilities::unauthorized_unsafe`, `capabilities::unauthorized_exec`, `capabilities::unauthorized_reflect`, `capabilities::unauthorized_net`, `capabilities::unauthorized_cgo`.
 
+## Checklist (M8)
+
+Proven by `test/logos/run/group.lgo`, `test/logos/run/group_chan.lgo`, `test/logos/run/group_panic.lgo`, `test/logos/run/group_netpoll.lgo`, `src/logos/sync/sync_test.go`.
+
+26. Groups and concurrency: every goroutine in `.lgo` runs inside `go group`; child blocks return errors or use `?` and do not use bare `return`; child tasks do not block indefinitely on unmanaged channels; `Locked[T].WithLock` closures do not leak pointers or deadlock reentrantly; `Hot[T]` updates do not expose partial values. Findings: `concurrency::unsupervised_goroutine`, `correctness::return_in_group_child`, `correctness::child_outside_group`, `correctness::group_needs_error_result`, `concurrency::reentrant_withlock_deadlock`, `concurrency::concurrent_multiword_race`.
+
+## Checklist (M9)
+
+Proven by `src/cmd/go/testdata/script/logos_lint_config.txt`, `src/cmd/go/testdata/script/logos_lint_go.txt`, and `test/logos/lint/*.lgo`.
+
+27. Lints: code adheres to deny and forbid lint rules across correctness, concurrency, slop, complexity, perf, suspicious, and portability groups. Suppressions require explicit `//logos:allow(<rule>)` directives on the statement or declaration. Findings: `slop::err_chain_reset`, `slop::discarded_error`, `slop::todo_placeholder`, `complexity::cognitive_overflow`, `perf::large_backing_array_pin`, `perf::time_after_in_loop`, `correctness::arena_pointer_escape`, `correctness::infinite_recursion`, `correctness::typed_nil_return`, `correctness::unclosed_io_closer`, `correctness::unbounded_channel_op`, `correctness::defer_erases_errdefer_state`, `correctness::allow_forbidden_rule`, `suspicious::side_effect_before_sort`, `portability::serialized_unsized_int`, `pedantic::exhaustive_union_switch`.
+
+## Checklist (M7)
+
+Proven by `test/logos/run/const_if_nested.lgo`, `test/logos/codegen/const_if_dead.lgo`, `test/logos/run/const_for_const_if.lgo`, `test/logos/run/const_switch_order.lgo`, `test/logos/run/const_for_lines.lgo`, `src/internal/types/testdata/logos/const_if.lgo`, `src/internal/types/testdata/logos/const_switch.lgo`, `src/internal/types/testdata/logos/viewas.lgo`, and `src/cmd/go/testdata/script/logos_eject_const_for.txt`.
+
+28. Comptime: `const if` conditions must be constant; `const for` iterates over struct fields in declaration order via `comptime.Fields[T]()`; `val.[f]` accesses fields within an enclosing `const for`; `const switch T` cases match top-down without shadowing; `comptime.ViewAs[T]` requires a plain POD struct without padding, bools, or pointers; comptime generic instantiations must not form cycles. Findings: `comptime::not_constant`, `comptime::const_for_fields`, `comptime::const_for_projection`, `comptime::circular_instantiation`, `comptime::unreachable_case`, `comptime::viewas_not_pod`, `comptime::runtime_use`, `comptime::node_limit`.
+
+## Checklist (M11)
+
+Proven by `test/logos/run/json_marshal_test.lgo`, `test/logos/run/json_binary_test.lgo`, `test/logos/run/json_union_test.lgo`, `test/logos/run/json_generic_test.lgo`, `test/logos/run/json_callsite_test.lgo`, and `test/logos/codegen/json_static.lgo`.
+
+29. Generated static serialization: `MarshalJSON`, `UnmarshalJSON`, `MarshalBinary`, `UnmarshalBinary`, and `AppendBinary` are generated by the compiler for eligible struct types and must not be written by hand. Slices and non-nil pointer fields are verified against missing field errors and allocation bombs.
+30. Closed union JSON (`test/logos/run/json_union_test.lgo`): closed-union marshaling dispatches directly to the dynamic member static bytes. Unmarshaling attempts members in declaration order into fresh scratch values; exactly one successful decode assigns the target. Ambiguity (more than one member matches) or zero matches leaves the target value untouched and returns an error naming the union.
+31. Generic static JSON (`test/logos/run/json_generic_test.lgo`): comptime generic functions and generic static-JSON structs emit dedicated static helper sets per concrete type argument instantiation (`_logos_h<N>`). Identical type arguments reuse memoized helper sets without duplicate helper emission. Unnamed struct literals fall back cleanly to walk.
+32. Call-site static JSON (`test/logos/run/json_callsite_test.lgo`): `json.Marshal(v)`, `json.Marshal(&v)`, and `json.Marshal(any(v))` produce identical bytes to `v.MarshalJSON()` under default jsonv2. `json.NewEncoder(w).Encode(v)` adds only the trailing newline. Call sites are not rewritten in source.
+
 ## Diagnostics
 
 | Rule | Fix |
@@ -127,3 +154,33 @@ Proven by `src/cmd/go/testdata/script/logos_cap_unsafe.txt` and `src/cmd/go/test
 | `capabilities::unauthorized_reflect` | Allowlist the dependency under `reflect_allowlist`, or remove it. |
 | `capabilities::unauthorized_net` | Allowlist the dependency under `transitive_net_allowlist`, or remove it. |
 | `capabilities::unauthorized_cgo` | Allow cgo for the module with `[build] cgo = "allow"`, or remove the dependency. |
+| `comptime::not_constant` | Use a constant boolean expression in `const if`. |
+| `comptime::const_for_fields` | Range over `comptime.Fields[T]()` with a concrete struct type. |
+| `comptime::const_for_projection` | Project fields with `val.[f]` within an enclosing `const for`. |
+| `comptime::circular_instantiation` | Break recursive comptime generic type cycles. |
+| `comptime::unreachable_case` | Remove or reorder shadowed cases in `const switch`. |
+| `comptime::viewas_not_pod` | Use a plain POD struct without padding, bools, pointers, interfaces, slices, maps, or strings in `comptime.ViewAs`. |
+| `comptime::runtime_use` | Restrict `comptime` types and values to compile-time expressions. |
+| `comptime::node_limit` | Reduce comptime AST unrolling or raise `max_comptime_ast_nodes` in `logos.toml`. |
+| `correctness::return_in_group_child` | Remove return statement; use ? or expression outcome to yield an error to the group. |
+| `correctness::child_outside_group` | Move the child go block inside an enclosing go group statement. |
+| `correctness::group_needs_error_result` | Add an error return type to the function enclosing the go group statement. |
+| `concurrency::unsupervised_goroutine` | Move bare go f() statements into a go group block. |
+| `concurrency::reentrant_withlock_deadlock` | Do not call WithLock on the same Locked receiver inside its callback. |
+| `concurrency::concurrent_multiword_race` | Protect multi-word structures across goroutines with mutex or atomic pointer. |
+| `correctness::arena_pointer_escape` | Do not store arena-allocated pointers into heap-visible locations. |
+| `correctness::infinite_recursion` | Terminate recursive call chains with a base case. |
+| `correctness::typed_nil_return` | Return untyped nil instead of typed nil pointer to interface result. |
+| `correctness::unclosed_io_closer` | Close io.Closer resources with defer close. |
+| `correctness::unbounded_channel_op` | Bound channel operations or handle cancellation with select. |
+| `correctness::defer_erases_errdefer_state` | Do not overwrite error return values in defer ahead of errdefer. |
+| `correctness::allow_forbidden_rule` | Do not attach an allow directive to a forbidden rule. |
+| `slop::err_chain_reset` | Wrap errors with %w instead of formatting with %v or err.Error(). |
+| `slop::discarded_error` | Check or return error instead of ignoring it, or use ? in functions returning error. |
+| `slop::todo_placeholder` | Implement functionality or remove placeholder comments and panic stubs. |
+| `complexity::cognitive_overflow` | Decompose complex functions to stay within threshold limits. |
+| `perf::large_backing_array_pin` | Copy needed elements instead of slicing large backing arrays. |
+| `perf::time_after_in_loop` | Move timer outside loop or use time.NewTimer with proper reset and drain. |
+| `suspicious::side_effect_before_sort` | Avoid side-effect expressions in sort comparisons. |
+| `portability::serialized_unsized_int` | Use sized integers (int32, int64) in serialized binary layouts. |
+| `pedantic::exhaustive_union_switch` | Remove redundant default clause from exhaustive switch on closed union. |

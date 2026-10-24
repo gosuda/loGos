@@ -7,7 +7,7 @@ context:
   add_dirs: []
 execution:
   prompt: |
-    The scaffold created ./migrateme, a small Go module with go test ./... passing. Migrate it to loGo/s with the inventory, baseline, convert, fix, and verify steps: save the Go baseline first, rename all .go files to .lgo, rewrite convertible error checks to ?, and reach logos build ./... and logos test ./... exit 0 with the same tests passing.
+    The scaffold created ./migrateme, a small Go module with go test ./... passing. Migrate it to loGo/s with the inventory, baseline, convert, fix, and verify steps: save the Go baseline first, preview the conversion diff with logos next, apply automated file renames and ? rewrites with logos next --fix, and reach logos build ./... and logos test ./... exit 0 with the same tests passing.
   max_turns: 20
   timeout_seconds: 600
   allowed_tools: [Bash, Skill]
@@ -21,6 +21,6 @@ graders:
     min: 1
   - name: migrated-module-matches-baseline
     type: llm
-    criteria: A baseline go test ./... log exists from before conversion; no .go file remains with tests as _test.lgo; convertible if err != nil checks became ?; logos build ./... and logos test ./... exit 0 with the same tests passing as the baseline.
+    criteria: A baseline go test ./... log exists from before conversion; logos next output is inspected; logos next --fix applies renames and ? rewrites; no .go file remains with tests as _test.lgo; logos build ./... and logos test ./... exit 0 with the same tests passing as the baseline.
     focus: last_message
-expected_outcome: Migrated loGo/s module matching the Go baseline.
+expected_outcome: Migrated loGo/s module matching the Go baseline via logos next.

@@ -1,0 +1,25 @@
+schema_version: "1.1"
+name: group-fanout
+description: Fan out fallible work over a go group with a limit and reach green test.
+tags: [logos, concurrency]
+context:
+  add_dirs: []
+execution:
+  prompt: |
+    In a new subdirectory ./fanout of the working directory, create a loGo/s module with one package that fetches a list of files with a go group limited to 4 workers, joining a worker error into the result, with a _test.lgo test covering the failing-worker path. Run logos build ./... and logos test ./... . Both commands must exit 0.
+  max_turns: 15
+  timeout_seconds: 300
+  allowed_tools: [Bash, Skill]
+runs: 3
+graders:
+  - name: concurrency-skill-fired
+    type: tool_used
+    tool: Skill
+    arm: with-only
+    input_match: "logos:logos-concurrency"
+    min: 1
+  - name: group-limited-and-green
+    type: llm
+    criteria: The module uses a go group with a worker limit and propagates a worker error; logos build ./... and logos test ./... exit 0.
+    focus: last_message
+expected_outcome: Limited go group with propagated worker error, green test.
