@@ -28,4 +28,7 @@ var registry = []Rule{
 	unclosedIOCloser,
 	unboundedChannelOp,
 	printfMisuse,
+	copyLock,
+	structtagMalformed,
+	stringIntconv,
 }

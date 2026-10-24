@@ -1,0 +1,54 @@
+// errorcheck -0
+
+// suspicious::copy_lock on a Go package (LINT-RULES.md Sec 1.2): detects
+// copying values containing embedded or direct locks.
+
+package p
+
+import "sync"
+
+type State struct {
+	mu    sync.Mutex
+	count int
+}
+
+func (s State) BadRecv() int { // ERROR "\[suspicious::copy_lock\]"
+	return s.count
+}
+
+func (s *State) GoodRecv() int {
+	return s.count
+}
+
+func passByVal(s State) int { // ERROR "\[suspicious::copy_lock\]"
+	return s.count
+}
+
+func passByPtr(s *State) int {
+	return s.count
+}
+
+func copyAssign() {
+	var s1 State
+	var s2 State
+	s2 = s1 // ERROR "\[suspicious::copy_lock\]"
+	var s3 = s1 // ERROR "\[suspicious::copy_lock\]"
+	_ = &s2
+	_ = &s3
+}
+
+func copyReturn() State {
+	var s State
+	return s // ERROR "\[suspicious::copy_lock\]"
+}
+
+func cleanForms() {
+	ptr := &State{}
+	_ = ptr
+	passByPtr(ptr)
+}
+
+//logos:allow(suspicious::copy_lock)
+func allowedInGo(s State) int {
+	return s.count
+}
