@@ -10,7 +10,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #4 | M18 |  | planned |
 | #5 | M8, M20 | src/cmd/cgo/internal/testlogos/fastcall_test.go | tested |
 | #6 | M6 | test/logos/run/lambda.lgo; test/logos/run/chains.lgo (dblBlock, count with ?) | tested |
-| #7 | M3, M11 |  | planned |
+| #7 | M3, M11 | test/logos/run/json_unmarshal_test.lgo; src/internal/types/testdata/logos/nonnil_zero.lgo; src/internal/types/testdata/logos/map_index.lgo | tested |
 | #8 | M3 | test/logos/run/platform.lgo | tested |
 | #9 | M13 | (blocked: comptime clone pclntab naming pending) | blocked |
 | #10 | M9 | test/logos/lint/exhaustive_union_switch.lgo; src/cmd/go/testdata/script/logos_pedantic_lint.txt | tested |
@@ -126,7 +126,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #120 | M4 | test/logos/run/properties.lgo | tested |
 | #121 | M13 |  | planned |
 | #122 | M0 | src/cmd/go/testdata/script/logos_alias.txt | tested |
-| #123 | M6, M11 |  | planned |
+| #123 | M6, M11 | test/logos/run/json_unmarshal_test.lgo (TestDefaultsAppliedFirst) | tested |
 | #124 | M13 |  | planned |
 | #125 |M1| test/logos/redteam/attack_125_errdefer_join | tested |
 | #126 | M6 | src/cmd/compile/internal/logos/m6gaps_test.go (TestInterpBindBeforeSizing) | tested |
@@ -137,12 +137,12 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #131 | M4 | src/internal/types/testdata/logos/property_iface.lgo | tested |
 | #132 | M4 | test/logos/run/properties.lgo | tested |
 | #133 | M0 | test/logos/lint/alias_extension.lgo; src/cmd/go/testdata/script/logos_lint_alias_extension.txt | tested |
-| #134 | M13 |  | planned |
+| #134 | M13 | test/logos/codegen/recursive_stack.lgo; test/logos/codegen/recursive_stack.go; test/logos/codegen/inline_levels.lgo; src/cmd/compile/internal/inline/stackbuf_logos_test.go (TestLogosVariableMakeThreshold) | tested |
 | #135 |M1| test/logos/redteam/attack_135_lifo_order | tested |
 | #136 | M8 | test/logos/run/group_chan.lgo | tested |
-| #137 | M15 |  | planned |
+| #137 | M15 | test/logos/run/wasm_loop_preempt.lgo | tested |
 | #138 | M18 |  | planned |
-| #139 | M11 |  | planned |
+| #139 | M11 | test/logos/run/json_unmarshal_test.lgo (TestHostileArrayCostsOnArrival, TestLargeArrayDecodesIncrementally) | tested |
 | #140 | M5 | src/cmd/compile/internal/logos/constmap_test.go (TestConstmapBudgetIsOneMillion, TestConstmapProbeIsSingleProbe); src/logos/rt/constmap_proof_test.go (TestConstTableGetSingleProbe) | tested |
 | #141 | M4 | test/logos/run/properties.lgo | tested |
 | #142 | M6 | test/logos/run/chains.lgo (at-return closes) | tested |
