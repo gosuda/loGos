@@ -1,0 +1,48 @@
+// errorcheck
+
+// correctness::httpresponse on a Go package (LINT-RULES.md Sec 1.2): detects
+// body-close deferred before checking HTTP response error.
+
+package p
+
+import "net/http"
+
+func badGet() {
+	resp, err := http.Get("http://example.com")
+	defer resp.Body.Close() // ERROR "\[correctness::httpresponse\]"
+	if err != nil {
+		return
+	}
+	_ = resp
+}
+
+func goodGet() {
+	resp, err := http.Get("http://example.com")
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	_ = resp
+}
+
+func otherDefer() {
+	resp, err := http.Get("http://example.com")
+	defer cleanup()
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	_ = resp
+}
+
+func cleanup() {}
+
+//logos:allow(correctness::httpresponse)
+func allowedInGo() {
+	resp, err := http.Get("http://example.com")
+	defer resp.Body.Close()
+	if err != nil {
+		return
+	}
+	_ = resp
+}

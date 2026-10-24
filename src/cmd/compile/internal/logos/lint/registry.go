@@ -31,4 +31,7 @@ var registry = []Rule{
 	copyLock,
 	structtagMalformed,
 	stringIntconv,
+	selfAssignment,
+	deferInLoop,
+	httpResponse,
 }
