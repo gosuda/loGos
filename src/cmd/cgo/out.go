@@ -1729,7 +1729,7 @@ func _cgoCheckPointer(interface{}, interface{})
 
 //go:linkname _cgoCanonicalizeSlot runtime.cgoCanonicalizeSlot
 //go:noescape
-func _cgoCanonicalizeSlot(any, unsafe.Pointer)
+func _cgoCanonicalizeSlot(interface{}, unsafe.Pointer)
 
 //go:linkname _cgoCheckResult runtime.cgoCheckResult
 //go:noescape
