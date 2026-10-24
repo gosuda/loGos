@@ -63,7 +63,7 @@ func runContext(ctx context.Context, cmd *base.Command, args []string) {
 	argv := slices.Clone(cfg.BuildToolexec)
 	argv = append(argv, base.Tool("compile"))
 	argv = append(argv, toolArgs...)
-	compile := exec.Command(argv[0], argv[1:]...)
+	compile := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	compile.Dir = pkg.Dir
 	compile.Stdout = os.Stdout
 	compile.Stderr = os.Stderr

@@ -126,12 +126,10 @@ func (p *parser) peek() byte {
 }
 
 // next consumes one byte.
-func (p *parser) next() byte {
-	c := p.peek()
-	if c != 0 {
+func (p *parser) next() {
+	if p.peek() != 0 {
 		p.pos++
 	}
-	return c
 }
 
 // skipInlineWS skips spaces, tabs, and carriage returns (so CRLF line

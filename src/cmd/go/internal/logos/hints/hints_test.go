@@ -55,7 +55,7 @@ func loadFixture(t *testing.T, path string) fixture {
 // imports and returns its path.
 func importConfig(t *testing.T, dir string) string {
 	t.Helper()
-	cmd := exec.Command(testenv.GoToolPath(t), "list", "-export", "-deps",
+	cmd := exec.CommandContext(t.Context(), testenv.GoToolPath(t), "list", "-export", "-deps",
 		"-f", "{{if .Export}}packagefile {{.ImportPath}}={{.Export}}{{end}}", "logos/rt", "strconv")
 	cmd.Dir = dir
 	out, err := cmd.Output()
@@ -77,7 +77,7 @@ func compile(t *testing.T, f fixture, flags ...string) []byte {
 	dir := t.TempDir()
 	args := []string{"tool", "compile", "-p", "p", "-importcfg", importConfig(t, dir), "-o", filepath.Join(dir, "o.a")}
 	args = append(append(args, flags...), f.path)
-	cmd := exec.Command(testenv.GoToolPath(t), args...)
+	cmd := exec.CommandContext(t.Context(), testenv.GoToolPath(t), args...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Run(); err != nil {

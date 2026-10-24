@@ -175,7 +175,11 @@ func scanModule(ctx context.Context, moddir string) *scanState {
 	if err != nil {
 		base.Fatalf("logos next: %v", err)
 	}
-	defer os.RemoveAll(staging)
+	defer func() {
+		if err := os.RemoveAll(staging); err != nil {
+			base.Errorf("logos next: %v", err)
+		}
+	}()
 	sidecar := filepath.Join(staging, "next.jsonl")
 	moduleLoader := modload.NewLoader()
 	moduleLoader.InitWorkfile()
@@ -683,10 +687,10 @@ func hunks(w *fileWork) []string {
 	for _, m := range mergeSpans(olds) {
 		ns := remap(w.edits, m.s)
 		ne := ns + (m.e - m.s) + deltaLines(w.edits, m.s, m.e)
-		os := clamp(m.s-diffContext, 1, len(oldLines))
-		oe := clamp(m.e+diffContext, 1, len(oldLines))
-		ns2 := clamp(ns-diffContext, 1, len(newLines))
-		ne2 := clamp(ne+diffContext, 1, len(newLines))
+		os := clamp(m.s-diffContext, len(oldLines))
+		oe := clamp(m.e+diffContext, len(oldLines))
+		ns2 := clamp(ns-diffContext, len(newLines))
+		ne2 := clamp(ne+diffContext, len(newLines))
 		var b strings.Builder
 		fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", os, oe-os+1, ns2, ne2-ns2+1)
 		for _, op := range diffOps(oldLines[os-1:oe], newLines[ns2-1:ne2]) {
@@ -813,10 +817,10 @@ func mergeSpans(spans []lineSpan) []lineSpan {
 	return out
 }
 
-// clamp pins v into bounds.
-func clamp(v, lo, hi int) int {
-	if v < lo {
-		return lo
+// clamp pins v into [1, hi].
+func clamp(v, hi int) int {
+	if v < 1 {
+		return 1
 	}
 	if v > hi {
 		return hi

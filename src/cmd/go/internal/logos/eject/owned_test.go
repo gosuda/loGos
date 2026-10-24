@@ -132,7 +132,7 @@ func assertOwnedHelperCondTable(t *testing.T, dir, name string, tags []string, w
 		}
 		return expr.Eval(func(tag string) bool { return assign[tag] })
 	}
-	for bits := 0; bits < 1<<len(tags); bits++ {
+	for bits := range 1 << len(tags) {
 		assign := map[string]bool{}
 		for i, tag := range tags {
 			assign[tag] = bits&(1<<i) != 0
@@ -1054,7 +1054,7 @@ func TestEmitOwnedNilOr(t *testing.T) {
 }
 
 func TestEmitOwnedMissingUnselected(t *testing.T) {
-	setup := func(t *testing.T) (*ejectPlan, *load.Package, string, string) {
+	setup := func(t *testing.T) (*ejectPlan, string) {
 		modDir := t.TempDir()
 		out := t.TempDir()
 		owner := ownedTestMainPackage(modDir, "example.com/mod/sub", "sub")
@@ -1074,9 +1074,9 @@ func TestEmitOwnedMissingUnselected(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(outSub, "a.go"), []byte("package sub\n\nfunc A() int { return 1 }\n"), 0666); err != nil {
 			t.Fatal(err)
 		}
-		return ownedTestPlan(modDir, owner), owner, t.TempDir(), out
+		return ownedTestPlan(modDir, owner), out
 	}
-	emitOne := func(t *testing.T, plan *ejectPlan, staging, out string, decl logosowned.Declaration) error {
+	emitOne := func(t *testing.T, plan *ejectPlan, out string, decl logosowned.Declaration) error {
 		req := ownedTestRequest(t, "example.com/mod/sub", "sub", "package sub\n\nfunc Use() int { return 1 }\n", []logosowned.Declaration{decl})
 		// Use a fresh staging dir per case so sidecars do not mix.
 		dir := t.TempDir()
@@ -1085,26 +1085,26 @@ func TestEmitOwnedMissingUnselected(t *testing.T) {
 		return err
 	}
 	t.Run("missing file", func(t *testing.T) {
-		plan, _, staging, out := setup(t)
-		if err := emitOne(t, plan, staging, out, logosowned.Declaration{Owner: "example.com/mod/sub", File: "missing.go"}); err == nil {
+		plan, out := setup(t)
+		if err := emitOne(t, plan, out, logosowned.Declaration{Owner: "example.com/mod/sub", File: "missing.go"}); err == nil {
 			t.Fatalf("missing file accepted")
 		}
 	})
 	t.Run("unselected file", func(t *testing.T) {
-		plan, _, staging, out := setup(t)
-		if err := emitOne(t, plan, staging, out, logosowned.Declaration{Owner: "example.com/mod/sub", File: "other.go"}); err == nil {
+		plan, out := setup(t)
+		if err := emitOne(t, plan, out, logosowned.Declaration{Owner: "example.com/mod/sub", File: "other.go"}); err == nil {
 			t.Fatalf("unselected file accepted")
 		}
 	})
 	t.Run("ignored file", func(t *testing.T) {
-		plan, _, staging, out := setup(t)
-		if err := emitOne(t, plan, staging, out, logosowned.Declaration{Owner: "example.com/mod/sub", File: "ignored.go"}); err == nil {
+		plan, out := setup(t)
+		if err := emitOne(t, plan, out, logosowned.Declaration{Owner: "example.com/mod/sub", File: "ignored.go"}); err == nil {
 			t.Fatalf("ignored file accepted")
 		}
 	})
 	t.Run("generated cgo", func(t *testing.T) {
-		plan, _, staging, out := setup(t)
-		err := emitOne(t, plan, staging, out, logosowned.Declaration{Owner: "example.com/mod/sub", File: "gen_cgo.go"})
+		plan, out := setup(t)
+		err := emitOne(t, plan, out, logosowned.Declaration{Owner: "example.com/mod/sub", File: "gen_cgo.go"})
 		if err == nil {
 			t.Fatalf("generated cgo mapping gap silently excluded")
 		}
@@ -1113,13 +1113,13 @@ func TestEmitOwnedMissingUnselected(t *testing.T) {
 		}
 	})
 	t.Run("unknown owner", func(t *testing.T) {
-		plan, _, staging, out := setup(t)
-		if err := emitOne(t, plan, staging, out, logosowned.Declaration{Owner: "example.com/mod/unknown", File: "a.go"}); err == nil {
+		plan, out := setup(t)
+		if err := emitOne(t, plan, out, logosowned.Declaration{Owner: "example.com/mod/unknown", File: "a.go"}); err == nil {
 			t.Fatalf("unknown owner accepted")
 		}
 	})
 	t.Run("empty inventory", func(t *testing.T) {
-		plan, _, staging, out := setup(t)
+		plan, out := setup(t)
 		empty := &load.Package{
 			PackagePublic: load.PackagePublic{
 				ImportPath: "example.com/empty/pkg",
@@ -1129,7 +1129,7 @@ func TestEmitOwnedMissingUnselected(t *testing.T) {
 			},
 		}
 		plan.provenance["example.com/empty/pkg"] = []*load.Package{empty}
-		if err := emitOne(t, plan, staging, out, logosowned.Declaration{Owner: "example.com/empty/pkg", File: "a.go"}); err == nil {
+		if err := emitOne(t, plan, out, logosowned.Declaration{Owner: "example.com/empty/pkg", File: "a.go"}); err == nil {
 			t.Fatalf("empty inventory accepted (all-files scan forbidden)")
 		}
 	})

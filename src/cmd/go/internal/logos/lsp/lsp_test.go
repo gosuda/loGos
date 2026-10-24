@@ -85,7 +85,11 @@ func runFakeGopls() int {
 		fmt.Fprintln(os.Stderr, "fake gopls:", err, err2)
 		return 2
 	}
-	defer logFile.Close()
+	defer func() {
+		if err := logFile.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, "fake gopls closing log file:", err)
+		}
+	}()
 	rd, wr := newReader(os.Stdin), &writer{w: os.Stdout}
 	for {
 		m, err := rd.read()
@@ -142,13 +146,18 @@ func fakeHandle(wr *writer, script *fakeScript, m *message) error {
 	return nil
 }
 
-func holdForRelease(addr string) error {
-	c, err := net.DialTimeout("tcp", addr, waitLimit)
-	if err != nil {
-		return err
+func holdForRelease(addr string) (err error) {
+	d := &net.Dialer{Timeout: waitLimit}
+	c, dialErr := d.DialContext(context.Background(), "tcp", addr)
+	if dialErr != nil {
+		return dialErr
 	}
-	defer c.Close()
-	if err := c.SetDeadline(time.Now().Add(waitLimit)); err != nil {
+	defer func() {
+		if closeErr := c.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
+	if err = c.SetDeadline(time.Now().Add(waitLimit)); err != nil {
 		return err
 	}
 	var b [1]byte
@@ -213,20 +222,30 @@ func startProxy(t *testing.T, opts Options) *testClient {
 	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	c := &testClient{t: t, w: &writer{w: inW}, closeW: func() { inW.Close() }, done: make(chan struct{})}
+	c := &testClient{t: t, w: &writer{w: inW}, closeW: func() {
+		if err := inW.Close(); err != nil {
+			t.Errorf("closing client input pipe: %v", err)
+		}
+	}, done: make(chan struct{})}
 	c.cond = sync.NewCond(&c.mu)
 	stderr := new(syncBuffer)
 	opts.Stderr = stderr
 	ctx := t.Context()
 	go func() {
 		c.err = Serve(ctx, inR, outW, opts)
-		outW.Close()
+		if err := outW.Close(); err != nil {
+			t.Errorf("closing output pipe: %v", err)
+		}
 		close(c.done)
 	}()
 	go c.readLoop(newReader(outR))
 	t.Cleanup(func() {
-		inW.Close()
-		outR.Close()
+		if err := inW.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			t.Errorf("closing client input pipe: %v", err)
+		}
+		if err := outR.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			t.Errorf("closing proxy output pipe: %v", err)
+		}
 		select {
 		case <-c.done:
 		case <-time.After(waitLimit):
@@ -346,13 +365,13 @@ func (c *testClient) notify(method string, params any) {
 	}
 }
 
-// notification waits for a notification of method whose decoded params
-// satisfy accept, and returns them.
-func (c *testClient) notification(method string, accept func(map[string]any) bool) map[string]any {
+// notification waits for a publishDiagnostics notification whose decoded
+// params satisfy accept, and returns them.
+func (c *testClient) notification(accept func(map[string]any) bool) map[string]any {
 	c.t.Helper()
 	var found map[string]any
-	c.waitFor(method, func(m *message) bool {
-		if m.Method != method {
+	c.waitFor("textDocument/publishDiagnostics", func(m *message) bool {
+		if m.Method != "textDocument/publishDiagnostics" {
 			return false
 		}
 		v, err := decode(m.Params)
@@ -932,7 +951,7 @@ func TestProxyMergesDiagnostics(t *testing.T) {
 	)
 	f.open("a/a.lgo", 7)
 
-	params := f.client.notification("textDocument/publishDiagnostics", func(m map[string]any) bool {
+	params := f.client.notification(func(m map[string]any) bool {
 		items, _ := m["diagnostics"].([]any)
 		return m["uri"] == f.uri("a/a.lgo") && len(items) == 4
 	})
@@ -975,7 +994,7 @@ func TestProxyDiagnosticsFollowEdits(t *testing.T) {
 	f.comp.setDiagnostics(filepath.Dir(aPath),
 		compilerDiag(t, diagSpec{Path: aPath, Severity: "deny", Message: "first", Start: [2]int{1, 1}, End: [2]int{1, 8}}))
 	f.open("a/a.lgo", 1)
-	f.client.notification("textDocument/publishDiagnostics", func(m map[string]any) bool {
+	f.client.notification(func(m map[string]any) bool {
 		items, _ := m["diagnostics"].([]any)
 		return len(items) == 1
 	})
@@ -985,7 +1004,7 @@ func TestProxyDiagnosticsFollowEdits(t *testing.T) {
 		"contentChanges": []any{map[string]any{"text": aLgo + "\n"}},
 	})
 	f.client.call("textDocument/hover", positionParams(f.uri("a/a.lgo"), Position{}))
-	f.client.notification("textDocument/publishDiagnostics", func(m map[string]any) bool {
+	f.client.notification(func(m map[string]any) bool {
 		items, _ := m["diagnostics"].([]any)
 		v, _ := number(m["version"])
 		return len(items) == 0 && v == 2
@@ -1097,7 +1116,7 @@ func TestProxyClosesLoweredDocuments(t *testing.T) {
 	f.comp.setDiagnostics(filepath.Dir(aPath),
 		compilerDiag(t, diagSpec{Path: aPath, Severity: "deny", Message: "m", Start: [2]int{1, 1}, End: [2]int{1, 2}}))
 	f.open("a/a.lgo", 1)
-	f.client.notification("textDocument/publishDiagnostics", func(m map[string]any) bool {
+	f.client.notification(func(m map[string]any) bool {
 		items, _ := m["diagnostics"].([]any)
 		return len(items) == 1
 	})
@@ -1110,7 +1129,7 @@ func TestProxyClosesLoweredDocuments(t *testing.T) {
 	if td, _ := closed[0]["textDocument"].(map[string]any); td["uri"] != f.virtURI("a/a.lgo") {
 		t.Errorf("gopls closed %v, want the lowered document", td["uri"])
 	}
-	f.client.notification("textDocument/publishDiagnostics", func(m map[string]any) bool {
+	f.client.notification(func(m map[string]any) bool {
 		items, _ := m["diagnostics"].([]any)
 		return m["uri"] == f.uri("a/a.lgo") && len(items) == 0
 	})
@@ -1317,7 +1336,7 @@ func TestProxyMergesDiagnosticsOfGoDocuments(t *testing.T) {
 			Start: [2]int{3, 5}, End: [2]int{3, 6}}),
 	)
 	f.open("p/p.go", 4)
-	params := f.client.notification("textDocument/publishDiagnostics", func(m map[string]any) bool {
+	params := f.client.notification(func(m map[string]any) bool {
 		items, _ := m["diagnostics"].([]any)
 		return m["uri"] == f.uri("p/p.go") && len(items) == 2
 	})
@@ -1452,7 +1471,11 @@ func TestProxyCodeActionInflightEditDropsWholeAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("closing gate listener: %v", err)
+		}
+	}()
 	if err := ln.SetDeadline(time.Now().Add(waitLimit)); err != nil {
 		t.Fatalf("arming the gate accept: %v", err)
 	}
@@ -1490,7 +1513,11 @@ func TestProxyCodeActionInflightEditDropsWholeAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the held backend never dialed the gate: %v", err)
 	}
-	defer gate.Close()
+	defer func() {
+		if err := gate.Close(); err != nil {
+			t.Errorf("closing gate conn: %v", err)
+		}
+	}()
 	if err := gate.SetWriteDeadline(time.Now().Add(waitLimit)); err != nil {
 		t.Fatalf("arming the gate write: %v", err)
 	}

@@ -120,7 +120,7 @@ func (t *toolchain) newOverlay(buffers map[string][]byte) (*overlay, error) {
 }
 
 // release removes the overlay files.
-func (ov *overlay) release() { os.RemoveAll(ov.root) }
+func (ov *overlay) release() error { return os.RemoveAll(ov.root) }
 
 // source returns the source path a compiler path refers to: the path of
 // the buffer when file is one of the backing files, else file itself.
@@ -212,17 +212,21 @@ func gcflag(importPath string, flags ...string) (string, error) {
 }
 
 // Lower implements Compiler.
-func (t *toolchain) Lower(ctx context.Context, dir string, buffers map[string][]byte) (*Lowering, error) {
+func (t *toolchain) Lower(ctx context.Context, dir string, buffers map[string][]byte) (low *Lowering, err error) {
 	ov, err := t.newOverlay(buffers)
 	if err != nil {
 		return nil, err
 	}
-	defer ov.release()
+	defer func() {
+		if rerr := ov.release(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	pkgs, err := t.closure(ctx, dir, nil, ov)
 	if err != nil {
 		return nil, err
 	}
-	low := &Lowering{}
+	low = &Lowering{}
 	var targets []pkgInfo
 	for _, p := range pkgs {
 		if p.standard {
@@ -245,12 +249,16 @@ func (t *toolchain) Lower(ctx context.Context, dir string, buffers map[string][]
 // eject builds the packages of targets with the eject flag, so the
 // compiler writes their lowered files. A package that fails to compile
 // writes nothing; the caller finds out by its missing files.
-func (t *toolchain) eject(ctx context.Context, dir string, ov *overlay, targets []pkgInfo) error {
+func (t *toolchain) eject(ctx context.Context, dir string, ov *overlay, targets []pkgInfo) (err error) {
 	if len(targets) == 0 {
 		return nil
 	}
 	bin := filepath.Join(t.stage, "bin")
-	defer os.RemoveAll(bin)
+	defer func() {
+		if rerr := os.RemoveAll(bin); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	output, err := executableDirFlag(targets, bin)
 	if err != nil {
 		return err
@@ -336,17 +344,20 @@ func sourceText(path string, buffers map[string][]byte) ([]byte, error) {
 
 // Diagnose implements Compiler. It runs logos lint, which type-checks the
 // package and runs the compiler lints without building a binary.
-func (t *toolchain) Diagnose(ctx context.Context, dir string, buffers map[string][]byte) ([]Diagnostic, error) {
+func (t *toolchain) Diagnose(ctx context.Context, dir string, buffers map[string][]byte) (diags []Diagnostic, err error) {
 	ov, err := t.newOverlay(buffers)
 	if err != nil {
 		return nil, err
 	}
-	defer ov.release()
+	defer func() {
+		if rerr := ov.release(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	_, stderr, err := t.run(ctx, dir, "lint", "--json-diagnostics", "-overlay="+ov.json, ".")
 	if err != nil {
 		return nil, err
 	}
-	var diags []Diagnostic
 	for line := range bytes.SplitSeq(stderr, []byte("\n")) {
 		if d, ok := parseDiagnostic(line); ok {
 			d.File = ov.source(d.File)
@@ -363,12 +374,16 @@ func (t *toolchain) Diagnose(ctx context.Context, dir string, buffers map[string
 // runs directly: the export data of the package's imports comes from
 // logos list -export, and the sources are the package's own files, with
 // the text of unsaved buffers in place of the files on disk.
-func (t *toolchain) Hints(ctx context.Context, dir string, buffers map[string][]byte) (json.RawMessage, error) {
+func (t *toolchain) Hints(ctx context.Context, dir string, buffers map[string][]byte) (_ json.RawMessage, err error) {
 	ov, err := t.newOverlay(buffers)
 	if err != nil {
 		return nil, err
 	}
-	defer ov.release()
+	defer func() {
+		if rerr := ov.release(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	env, err := t.managedHintsEnv(ctx, dir)
 	if err != nil {
 		return nil, err
@@ -385,7 +400,11 @@ func (t *toolchain) Hints(ctx context.Context, dir string, buffers map[string][]
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(work)
+	defer func() {
+		if rerr := os.RemoveAll(work); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	return t.compileHints(ctx, work, env, pkgs[i], pkgs, buffers)
 }
 

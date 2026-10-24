@@ -49,7 +49,11 @@ func realWorkspace(t *testing.T) (root string, tc *toolchain) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { tc.Close() })
+	t.Cleanup(func() {
+		if err := tc.Close(); err != nil {
+			t.Errorf("cleaning up toolchain: %v", err)
+		}
+	})
 	return root, tc
 }
 
@@ -89,17 +93,17 @@ func TestToolchainLowersImportedLogosPackage(t *testing.T) {
 	}
 
 	orig := shift(findPos(t, aLgo, "ReadFile(path)?", 0), len("ReadFile("))
-	lowPos := pm.toLowered(orig, leading)
+	lowPos := pm.toLowered(orig)
 	if got := lineOf(out, lowPos.Line)[lowPos.Character:]; !strings.HasPrefix(got, "path)") {
 		t.Errorf("operand %v maps to lowered %v, which starts %q", orig, lowPos, got)
 	}
-	if back := pm.toOriginal(lowPos, leading); back != orig {
+	if back := pm.toOriginal(lowPos); back != orig {
 		t.Errorf("operand round trip %v -> %v -> %v", orig, lowPos, back)
 	}
 	q := findPos(t, aLgo, "?", 0)
 	end := findPos(t, aLgo, "return string(data)", 0)
-	lowEnd := pm.toLowered(end, leading)
-	if lines := lowEnd.Line - pm.toLowered(q, leading).Line; lines < 2 {
+	lowEnd := pm.toLowered(end)
+	if lines := lowEnd.Line - pm.toLowered(q).Line; lines < 2 {
 		t.Errorf("the ? statement expands to %d more lines in the lowered text, want at least 2", lines)
 	}
 

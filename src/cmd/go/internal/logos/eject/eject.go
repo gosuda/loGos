@@ -156,7 +156,11 @@ func ejectToDir(ctx context.Context, out string) {
 	if err != nil {
 		base.Fatalf("logos eject: %v", err)
 	}
-	defer os.RemoveAll(staging)
+	defer func() {
+		if err := os.RemoveAll(staging); err != nil {
+			base.Errorf("logos eject: %v", err)
+		}
+	}()
 	load.ArmLogosEject(staging)
 	defer load.DisarmLogosEject()
 	opts := load.PackageOpts{AutoVCS: true}

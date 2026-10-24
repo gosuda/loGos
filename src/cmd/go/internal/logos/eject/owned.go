@@ -526,7 +526,7 @@ func ownedResolveGroup(plan *ejectPlan, dir string, dests []*ownedDest) ([]*owne
 		var prodEffs []constraint.Expr
 		var testEffs []constraint.Expr
 		for _, v := range group {
-			eff, test, err := ownedEffectiveCondition(plan, v.req, v.owner)
+			eff, test, err := ownedEffectiveCondition(plan, v.req)
 			if err != nil {
 				return nil, err
 			}
@@ -580,7 +580,7 @@ func ownedResolveGroup(plan *ejectPlan, dir string, dests []*ownedDest) ([]*owne
 			continue
 		}
 		testOr := ownedOrExprs(testEffs)
-		if testOr != nil && prodCond != nil && testOr.String() == prodCond.String() {
+		if testOr != nil && testOr.String() == prodCond.String() {
 			continue
 		}
 		notProd := &constraint.NotExpr{X: prodCond}
@@ -600,7 +600,7 @@ func ownedResolveGroup(plan *ejectPlan, dir string, dests []*ownedDest) ([]*owne
 // files. It also reports whether any declaration is test-only, which
 // selects a _test.go output filename. Caller test status never makes
 // a dependency helper test-only.
-func ownedEffectiveCondition(plan *ejectPlan, req *logosowned.Request, helperOwner *load.Package) (constraint.Expr, bool, error) {
+func ownedEffectiveCondition(plan *ejectPlan, req *logosowned.Request) (constraint.Expr, bool, error) {
 	consumer, err := ownedHeaderExprOf(req.Source)
 	if err != nil {
 		return nil, false, fmt.Errorf("helper %s: %v", req.ID, err)
@@ -608,7 +608,7 @@ func ownedEffectiveCondition(plan *ejectPlan, req *logosowned.Request, helperOwn
 	conds := []constraint.Expr{consumer}
 	isTest := false
 	for _, decl := range req.Declarations {
-		cond, test, err := ownedDeclarationCondition(plan, decl.Owner, decl.File, helperOwner)
+		cond, test, err := ownedDeclarationCondition(plan, decl.Owner, decl.File)
 		if err != nil {
 			return nil, false, fmt.Errorf("helper %s declaration %s:%s: %v", req.ID, decl.Owner, decl.File, err)
 		}
@@ -627,12 +627,12 @@ func ownedEffectiveCondition(plan *ejectPlan, req *logosowned.Request, helperOwn
 // copy lookup). Original source is read for conditions. Missing
 // or unselected files, missing inventories, and generated cgo outputs
 // without a source mapping are explicit errors, never silent omissions.
-func ownedDeclarationCondition(plan *ejectPlan, declOwner, declFile string, helperOwner *load.Package) (constraint.Expr, bool, error) {
+func ownedDeclarationCondition(plan *ejectPlan, declOwner, declFile string) (constraint.Expr, bool, error) {
 	pkg := ownedFindDeclPackage(plan, declOwner)
 	if pkg == nil {
 		return nil, false, fmt.Errorf("declaration owner %q not in package plan", declOwner)
 	}
-	original, isTest, err := ownedSelectedFile(pkg, plan, declFile)
+	original, isTest, err := ownedSelectedFile(pkg, declFile)
 	if err != nil {
 		return nil, false, err
 	}
@@ -658,7 +658,7 @@ func ownedDeclarationCondition(plan *ejectPlan, declOwner, declFile string, help
 // ownedSelectedFile maps a declaration basename to its selected source
 // entry. It returns the original inventory name and whether the entry
 // is test-only.
-func ownedSelectedFile(pkg *load.Package, plan *ejectPlan, declFile string) (string, bool, error) {
+func ownedSelectedFile(pkg *load.Package, declFile string) (string, bool, error) {
 	if len(pkg.GoFiles) == 0 && len(pkg.CgoFiles) == 0 && len(pkg.TestGoFiles) == 0 && len(pkg.CompiledGoFiles) == 0 && len(pkg.IgnoredGoFiles) == 0 {
 		return "", false, fmt.Errorf("owner %q has no source inventory (no all-files scan)", pkg.ImportPath)
 	}

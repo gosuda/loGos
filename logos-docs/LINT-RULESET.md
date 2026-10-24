@@ -580,19 +580,35 @@ the minimal default-equivalent table.
 Repository Go tooling code (the compiler, driver, and internal build
 utilities) is checked by `golangci-lint` using `logos-docs/golangci.yml`.
 
-- **Current active configuration**: Uses standard default linters
-  (`default: standard`): `errcheck`, `govet`, `ineffassign`, `staticcheck`,
-  and `unused`.
-- **Proposed curated extensions**: The proposed target configuration adds
-  targeted tooling linters without importing unvetted profiles: `errorlint`,
-  `unconvert`, `unparam`, `noctx`, `intrange`, `misspell`, `copyloopvar`,
-  `gocheckcompilerdirectives`, `gochecknoinits`, `nolintlint`, and
-  `govet nilness`.
-- **Proposed target exclusions**: The proposed configuration records
-  explicit rationale for leaving noisy linters disabled: `shadow` (inliner
-  noise), `dupl`, `funlen`, `lll`, `QF1001` (De Morgan rewrites), and
-  `QF1008` (embedded field selectors). Neither current nor proposed
-  configurations include unverified dependency bans or depguard rules.
+- **Active configuration**: `default: none` with the curated set enabled:
+  `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `errorlint`
+  (`errorf: false`, `asserts: false`, `comparison: true`), `unconvert`,
+  `unparam`, `noctx`, `intrange`, `misspell` (US locale), `copyloopvar`,
+  `gocheckcompilerdirectives`, `gochecknoinits`, `nolintlint`
+  (`allow-unused: false`, `require-explanation: true`,
+  `require-specific: true`), and `govet` `nilness`. Staticcheck runs `all`
+  minus `ST1000`, `ST1003`, `ST1016`, `ST1020`, `ST1021`, `ST1022`,
+  `QF1001`, `QF1008`, and `SA5011`, so `SA2001`, `SA4006`, `SA4016`, and
+  `SA5007` stay on. `gochecknoinits` is excluded only for the five named
+  init files (`context.go`, `ownedconstant.go`, `wasmloader.go`,
+  `eject/eject.go`, `next/next.go`) by the path rule in the config.
+- **Invocation**: from `src/cmd` with the fork's `bin` first on `PATH`,
+  `golangci-lint run --config ../../logos-docs/golangci.yml ./go/internal/logos/...`
+  (new packages only). `logos lint` is a separate native surface over the
+  in-compiler registry; it does not invoke golangci-lint, and this config
+  does not route through `logos lint`.
+- **Scope**: every linter above is `.go` only. golangci-lint loads code
+  through `go/packages`, which sees only `.go` files, so no enabled linter
+  reports a `.lgo` position; the SSA/IR passes (`nilness`, `SA4006`,
+  `SA5007`, `unused`, `unparam`) are additionally blocked on `.lgo` until
+  the M9/M21 lowered-path vet mapper lands. `.lgo` diagnostics at original
+  positions come only from the native rules (for example
+  `slop::discarded_error` and its `test/logos/lint/` twins).
+- **Exclusions**: noisy linters stay disabled: `shadow` (false positives
+  on idiomatic short declarations), `dupl`, `funlen`, `lll`, `QF1001`
+  (De Morgan rewrites), and `QF1008` (embedded field selectors). Neither
+  the active nor any proposed configuration includes unverified dependency
+  bans or depguard rules.
 
 ## Verification plan
 
