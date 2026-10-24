@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !wasm || !logosgc.nongreentea
+
 package runtime
 
 // Test seam for M19-S2: elastic background marking, observed through the

@@ -200,6 +200,19 @@ const LogosRTPkg = "logos/rt"
 // call into it without naming it (M14-S1).
 const LogosSimdPkg = "simd/archsimd"
 
+// LogosJSONPkg is the support package of generated static-JSON methods
+// (M11). The compiler imports it only in files whose lowering generated
+// MarshalJSON or UnmarshalJSON, but the import is synthesized after cmd/go
+// built the import list, so every logos package carries it and unused
+// entries are harmless.
+const LogosJSONPkg = "logos/rt/json"
+
+// needsLogosJSON reports whether p needs the implicit logos/rt/json
+// import: every logos package, mirroring needsLogosRT.
+func needsLogosJSON(p *Package) bool {
+	return p.IsLogos()
+}
+
 // needsLogosSimd reports whether p needs the implicit simd/archsimd
 // import: every logos package gets it when the simd experiment is on
 // for amd64 or arm64, the only targets whose lowering calls archsimd

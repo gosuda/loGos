@@ -43,6 +43,8 @@ func logosGCInit(gogc int32, limit int64) (int32, int64) {
 	case "epsilon":
 		logosForceStopTheWorld()
 		return -1, math.MaxInt64
+	case "zgc":
+		zgcInit()
 	}
 	return gogc, limit
 }

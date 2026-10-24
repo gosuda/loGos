@@ -330,7 +330,7 @@ func (subst *subster) typ(typ Type) Type {
 
 	case *ConstView: // logos M5-S1 hook: substitute inside the element type.
 		if elem := subst.typ(t.Elem); elem != t.Elem {
-			return &ConstView{Elem: elem}
+			return &ConstView{Elem: elem, ConstMap: t.ConstMap}
 		}
 
 	case *Named:

@@ -58,7 +58,7 @@ recheck:
 		ctxt:     ctxt,
 		packages: make(map[string]*types2.Package),
 	}
-	logosMarkImporter(&importer, base.Logos) // logos M2-S7 hook: the import kind selects union handling.
+	logosMarkImporter(&importer, base.Logos, allLogos(noders) && !didLogos) // logos M2-S7 hook: the import kind selects union handling and overlay restoration.
 	conf := types2.Config{
 		Context:            ctxt,
 		GoVersion:          base.Flag.Lang,
@@ -82,12 +82,17 @@ recheck:
 		FileVersions:       make(map[*syntax.PosBase]string),
 		// expand as needed
 	}
+	logosConfigureComptime(&conf, info)           // logos M5-S2 hook: configure comptime step and node limits.
+	logosConfigureOwnedConstants(&conf, didLogos) // generated nodes alone receive fresh private-type references.
 	conf.Error = func(err error) {
 		terr := err.(types2.Error)
 		if logosDeferSoftWarn(terr) { // logos M6-S3 hook: warn-severity rules never fail, and the lint pass resolves them.
 			return
 		}
 		if logosReportNilDeref(&m, files, info, terr) { // logos M9-S2 hook: nil_deref_unproven carries autofix candidates.
+			return
+		}
+		if logosReportMisplacedTry(&m, files, info, terr) { // logos tryfix hook: misplaced_try carries a split-statement autofix candidate.
 			return
 		}
 		msg := terr.Msg

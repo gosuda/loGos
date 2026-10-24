@@ -121,13 +121,17 @@ type ejectModule struct {
 
 // ejectPlan splits the reachable packages into the main module, the
 // ejected loGo/s dependency modules, and the emission targets.
+// provenance retains every loaded package by import path for read-only
+// declaration provenance, including standard packages (never writable)
+// and test variants. Emission still uses main/deps/logos only.
 type ejectPlan struct {
-	main      *ejectModule
-	deps      []*ejectModule
-	depByPath map[string]*ejectModule
-	logos     []*load.Package
-	known     map[*load.Package]bool
-	testBuilt map[*load.Package]bool
+	main       *ejectModule
+	deps       []*ejectModule
+	depByPath  map[string]*ejectModule
+	logos      []*load.Package
+	known      map[*load.Package]bool
+	testBuilt  map[*load.Package]bool
+	provenance map[string][]*load.Package
 }
 
 // testBuild holds the test variant of one package for emission of its
@@ -204,12 +208,14 @@ func arrangeEjectPlan(pkgs []*load.Package) *ejectPlan {
 		base.Fatalf("logos eject: no main module (run inside a module)")
 	}
 	plan := &ejectPlan{
-		main:      &ejectModule{dir: filepath.Dir(gomod)},
-		depByPath: map[string]*ejectModule{},
-		known:     map[*load.Package]bool{},
-		testBuilt: map[*load.Package]bool{},
+		main:       &ejectModule{dir: filepath.Dir(gomod)},
+		depByPath:  map[string]*ejectModule{},
+		known:      map[*load.Package]bool{},
+		testBuilt:  map[*load.Package]bool{},
+		provenance: map[string][]*load.Package{},
 	}
 	for _, p := range load.PackageList(pkgs) {
+		plan.provenance[p.ImportPath] = append(plan.provenance[p.ImportPath], p)
 		plan.addPackage(p)
 	}
 	resortEjectPlan(plan)
@@ -324,6 +330,16 @@ func collectTestBuilds(moduleLoader *modload.Loader, ctx context.Context, opts l
 		mains = append(mains, t.main)
 	}
 	for _, p := range load.PackageList(mains) {
+		found := false
+		for _, q := range plan.provenance[p.ImportPath] {
+			if q == p {
+				found = true
+				break
+			}
+		}
+		if !found {
+			plan.provenance[p.ImportPath] = append(plan.provenance[p.ImportPath], p)
+		}
 		plan.addPackage(p)
 	}
 	resortEjectPlan(plan)
@@ -466,6 +482,14 @@ func writeEjectedTree(plan *ejectPlan, staging, out string) {
 				usedRT = true
 			}
 		}
+	}
+	// Owned helpers land after package copy, so generated files only ever
+	// appear in the output tree, and before go.mod rewriting, so modules
+	// pulled in only by an owned helper still get their require lines.
+	if usesOwned, err := emitOwnedHelpers(plan, staging, out, ejected); err != nil {
+		base.Fatalf("logos eject: %v", err)
+	} else if usesOwned {
+		usedRT = true
 	}
 	var rtDir string
 	if usedRT {

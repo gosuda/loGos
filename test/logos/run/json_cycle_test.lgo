@@ -1,0 +1,440 @@
+// run
+
+package jsoncycle
+
+// M11-R1/R2/R4 regression probes (SPEC Sec 12.1): cycles through static
+// and dynamic edges terminate with the reflective cycle error instead
+// of overflowing the stack. Before the traversal repair every cyclic
+// value below overflowed: each fallback field started a fresh
+// encoding/json state. Mirror types without methods take the reflective
+// path and serve as output and error oracles; only the "via *T" type
+// suffix differs, so cycle errors compare by prefix.
+//
+// Boundaries held, not probed here: interface-held dynamics of types
+// outside the root's table keep the honour branch and overflow exactly
+// as ejected code does (W1, W6). Those shapes need an unapproved global
+// registry and are documented in the lane status report.
+
+import (
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// Recursive links are optional: bare *T is non-nil in loGo/s. Pointer
+// options lower to Go pointers, preserving the reflective JSON oracle.
+type Chain struct {
+	Name string `json:"name"`
+	Next *Chain? `json:"next,omitempty"`
+}
+
+// Mirror types carry a disqualifying interface field so they stay
+// method-free: the oracle must take the reflective path, never a
+// generated twin. The field is skipped in output.
+type ChainMirror struct {
+	Name string `json:"name"`
+	Next *ChainMirror? `json:"next,omitempty"`
+	NoGen any `json:"-"`
+}
+
+func mirrorChain(c *Chain?) *ChainMirror? {
+	if c == nil {
+		return nil
+	}
+	out := &ChainMirror{Name: c.Name}
+	next := c.Next
+	if next != nil {
+		if next == c {
+			out.Next = out
+			return out
+		}
+		out.Next = mirrorChain(next)
+	}
+	return out
+}
+
+type Inner struct {
+	Name string `json:"name"`
+	Kids []any  `json:"kids,omitempty"`
+}
+
+type InnerMirror struct {
+	Name string `json:"name"`
+	Kids []any  `json:"kids,omitempty"`
+	NoGen any `json:"-"`
+}
+
+type Outer struct {
+	Title string `json:"title"`
+	In    Inner  `json:"in"`
+}
+
+type OuterMirror struct {
+	Title string `json:"title"`
+	In    InnerMirror `json:"in"`
+	NoGen any `json:"-"`
+}
+
+type Fork struct {
+	L *Chain `json:"l"`
+	R *Chain `json:"r"`
+}
+
+type ForkMirror struct {
+	L *ChainMirror `json:"l"`
+	R *ChainMirror `json:"r"`
+	NoGen any `json:"-"`
+}
+
+type Custom struct {
+	V int `json:"v"`
+}
+
+func (Custom) MarshalJSON() ([]byte, error) {
+	return []byte(`"custom"`), nil
+}
+
+type Holder struct {
+	C Custom `json:"c"`
+	N int    `json:"n"`
+}
+
+type Shout struct {
+	V int `json:"v"`
+}
+
+func (Shout) MarshalJSON() ([]byte, error) {
+	return []byte(`"shout"`), nil
+}
+
+type HolderAny struct {
+	Xs []any `json:"xs"`
+}
+
+func cyclePrefix() string {
+	return "json: unsupported value: encountered a cycle via "
+}
+
+func TestChainSelfCycleTerminates(t *testing.T) {
+	c := &Chain{Name: "a"}
+	c.Next = c
+	_, err := c.MarshalJSON()
+	if err == nil {
+		t.Fatal("self cycle encoded without an error")
+	}
+	if !strings.HasPrefix(err.Error(), cyclePrefix()) {
+		t.Fatalf("self cycle error = %q, want the reflective cycle prefix", err.Error())
+	}
+	if _, werr := json.Marshal(mirrorChain(c)); werr == nil || !strings.HasPrefix(werr.Error(), cyclePrefix()) {
+		t.Fatalf("oracle did not report a cycle: %v", werr)
+	}
+}
+
+func TestOptionalChainRoundTrip(t *testing.T) {
+	for _, input := range []string{
+		`{"name":"root"}`,
+		`{"name":"root","next":null}`,
+		`{"name":"root","next":{"name":"leaf","next":null}}`,
+	} {
+		var got Chain
+		if err := got.UnmarshalJSON([]byte(input)); err != nil {
+			t.Fatal(err)
+		}
+		var want ChainMirror
+		if err := json.Unmarshal([]byte(input), &want); err != nil {
+			t.Fatal(err)
+		}
+		encoded := must(got.MarshalJSON())
+		oracle := must(json.Marshal(want))
+		if string(encoded) != string(oracle) {
+			t.Fatalf("optional chain %s: generated %s, oracle %s", input, encoded, oracle)
+		}
+		var roundTrip Chain
+		if err := roundTrip.UnmarshalJSON(encoded); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, roundTrip) {
+			t.Fatalf("optional chain %s changed after round trip", input)
+		}
+	}
+}
+
+func TestNestedSliceCycleTerminates(t *testing.T) {
+	o := &Outer{Title: "t", In: Inner{Name: "i"}}
+	o.In.Kids = []any{o}
+	_, err := o.MarshalJSON()
+	if err == nil {
+		t.Fatal("nested slice cycle encoded without an error")
+	}
+	if !strings.HasPrefix(err.Error(), cyclePrefix()) {
+		t.Fatalf("nested cycle error = %q, want the reflective cycle prefix", err.Error())
+	}
+}
+
+func TestSharedTailIsNotACycle(t *testing.T) {
+	shared := &Chain{Name: "s"}
+	v := Fork{L: &Chain{Name: "l", Next: shared}, R: &Chain{Name: "r", Next: shared}}
+	got := must(v.MarshalJSON())
+	m := ForkMirror{L: &ChainMirror{Name: "l", Next: &ChainMirror{Name: "s"}}, R: &ChainMirror{Name: "r", Next: &ChainMirror{Name: "s"}}}
+	want := must(json.Marshal(m))
+	if string(got) != string(want) {
+		t.Fatalf("DAG encoded as %s, want %s", got, want)
+	}
+}
+
+func TestUserMethodKeepsPrecedence(t *testing.T) {
+	got := must(Holder{C: Custom{V: 3}, N: 4}.MarshalJSON())
+	if string(got) != `{"c":"custom","n":4}` {
+		t.Fatalf("user method lost precedence: %s", got)
+	}
+}
+
+func TestDynamicUserMethodKeepsPrecedence(t *testing.T) {
+	v := HolderAny{Xs: []any{Shout{V: 1}, "x", 2.0, true, nil}}
+	got := must(v.MarshalJSON())
+	want := must(json.Marshal(struct {
+		Xs []any `json:"xs"`
+	}{Xs: []any{Shout{V: 1}, "x", 2.0, true, nil}}))
+	if string(got) != string(want) {
+		t.Fatalf("dynamic user method lost precedence: %s, want %s", got, want)
+	}
+}
+
+func TestDeepChainHasNoCycle(t *testing.T) {
+	// Depth parity in both modes: the walk enforces the v2 10000-token
+	// nesting cap exactly like the reflective encoder, and v1 sets no
+	// cap in either. 1500 stays below the cycle-tracking threshold
+	// start; 9000 exercises lazy tracking; 20000 crosses the cap and
+	// must fail with the identical max-depth error on both sides.
+	for _, n := range []int{1500, 9000, 20000} {
+		head := buildChain(n)
+		got, gerr := head.MarshalJSON()
+		want, werr := json.Marshal(mirrorChain(head))
+		if (gerr == nil) != (werr == nil) {
+			t.Fatalf("deep chain of %d: generated error %v, oracle error %v", n, gerr, werr)
+		}
+		if gerr != nil {
+			if gerr.Error() != werr.Error() {
+				t.Fatalf("deep chain of %d: generated error %q, oracle error %q", n, gerr.Error(), werr.Error())
+			}
+			continue
+		}
+		if string(got) != string(want) {
+			t.Fatalf("deep chain of %d mismatches oracle at length %d vs %d", n, len(got), len(want))
+		}
+	}
+}
+
+func buildChain(n int) *Chain {
+	head := &Chain{Name: "n0"}
+	cur := head
+	for i := 1; i < n; i++ {
+		next := &Chain{Name: "n"}
+		cur.Next = next
+		cur = next
+	}
+	return head
+}
+
+func TestMixedParitySweep(t *testing.T) {
+	o := Outer{Title: "a<b>&", In: Inner{Name: "i", Kids: []any{"s", 1.5, true, nil, []int{1, 2}, map[string]int{"b": 2, "a": 1}}}}
+	got := must(o.MarshalJSON())
+	m := OuterMirror{Title: "a<b>&", In: InnerMirror{Name: "i", Kids: []any{"s", 1.5, true, nil, []int{1, 2}, map[string]int{"b": 2, "a": 1}}}}
+	want := must(json.Marshal(m))
+	if string(got) != string(want) {
+		t.Fatalf("mixed parity: %s, want %s", got, want)
+	}
+}
+
+// Embedded table-descent probes (M11 R4): a generated type reachable
+// only through an exported embedded field of a plain struct still joins
+// the root's table, so interface-held dynamics of it walk with shared
+// state. The walk promotes embedded fields exactly like the reflective
+// encoder; the table entry dispatches bare dynamics.
+type EmbLeaf struct {
+	Name string `json:"name"`
+	Kids []any  `json:"kids,omitempty"`
+}
+
+type EmbPlain struct {
+	*EmbLeaf
+	Tag string `json:"tag"`
+}
+
+type EmbRoot struct {
+	Title string `json:"title"`
+	P     EmbPlain `json:"p"`
+}
+
+type EmbLeafMirror struct {
+	Name string `json:"name"`
+	Kids []any  `json:"kids,omitempty"`
+	NoGen any `json:"-"`
+}
+
+type EmbPlainMirror struct {
+	*EmbLeafMirror
+	Tag string `json:"tag"`
+	NoGen any `json:"-"`
+}
+
+type EmbRootMirror struct {
+	Title string `json:"title"`
+	P     EmbPlainMirror `json:"p"`
+	NoGen any `json:"-"`
+}
+
+func TestEmbeddedTableDescentParity(t *testing.T) {
+	leaf := &EmbLeaf{Name: "l", Kids: []any{"x", 1.0}}
+	v := EmbRoot{Title: "t", P: EmbPlain{EmbLeaf: leaf, Tag: "g"}}
+	got := must(v.MarshalJSON())
+	m := EmbRootMirror{Title: "t", P: EmbPlainMirror{EmbLeafMirror: &EmbLeafMirror{Name: "l", Kids: []any{"x", 1.0}}, Tag: "g"}}
+	want := must(json.Marshal(m))
+	if string(got) != string(want) {
+		t.Fatalf("embedded parity: %s, want %s", got, want)
+	}
+}
+
+func TestEmbeddedTableDescentCycleTerminates(t *testing.T) {
+	leaf := &EmbLeaf{Name: "l"}
+	leaf.Kids = []any{leaf}
+	v := EmbRoot{Title: "t", P: EmbPlain{EmbLeaf: leaf}}
+	_, err := v.MarshalJSON()
+	if err == nil {
+		t.Fatal("embedded cycle encoded without an error")
+	}
+	if !strings.HasPrefix(err.Error(), cyclePrefix()) {
+		t.Fatalf("embedded cycle error = %q, want the reflective cycle prefix", err.Error())
+	}
+}
+
+type ZeroBox struct {
+	On bool `json:"on"`
+}
+
+func (*ZeroBox) IsZero() bool { return true }
+
+type OmitHolder struct {
+	P *ZeroBox? `json:"p,omitzero"`
+	Q int64    `json:"q"`
+}
+
+type OmitMirror struct {
+	P *ZeroBoxMirror? `json:"p,omitzero"`
+	Q int64          `json:"q"`
+	NoGen any `json:"-"`
+}
+
+type ZeroBoxMirror struct {
+	On bool `json:"on"`
+	NoGen any `json:"-"`
+}
+
+func (*ZeroBoxMirror) IsZero() bool { return true }
+
+func TestGeneratedPointerOmitZero(t *testing.T) {
+	vals := []OmitHolder{
+		{},
+		{P: &ZeroBox{}},
+		{P: &ZeroBox{On: true}, Q: 1},
+	}
+	for i, v := range vals {
+		got := must(v.MarshalJSON())
+		var m OmitMirror
+		p := v.P
+		if p != nil {
+			m.P = &ZeroBoxMirror{On: p.On}
+		}
+		m.Q = v.Q
+		want := must(json.Marshal(m))
+		if string(got) != string(want) {
+			t.Fatalf("case %d: generated %s, oracle %s", i, got, want)
+		}
+	}
+}
+
+var depthMethodCalls int
+
+type DepthCustom int
+
+func (DepthCustom) MarshalJSON() ([]byte, error) {
+	depthMethodCalls++
+	return []byte(`"custom<&>longer"`), nil
+}
+
+type DepthNode struct {
+	Omit string `json:"omit,omitempty"`
+	Custom DepthCustom `json:"custom"`
+	Next *DepthNode? `json:"next,omitempty"`
+}
+
+type DepthMirror struct {
+	Omit string `json:"omit,omitempty"`
+	Custom DepthCustom `json:"custom"`
+	Next *DepthMirror? `json:"next,omitempty"`
+	NoGen any `json:"-"`
+}
+
+func TestGeneratedDepthOffsetAndSideEffects(t *testing.T) {
+	for _, present := range []bool{false, true} {
+		head, mirror := buildDepthPair(present)
+		depthMethodCalls = 0
+		got, gerr := head.MarshalJSON()
+		gcalls := depthMethodCalls
+		depthMethodCalls = 0
+		want, werr := json.Marshal(mirror)
+		wcalls := depthMethodCalls
+		if gcalls != wcalls {
+			t.Fatalf("present=%v: generated called custom method %d times, oracle %d", present, gcalls, wcalls)
+		}
+		assertSameMarshalOutcome(t, present, marshalOutcome{got, gerr}, marshalOutcome{want, werr})
+	}
+}
+
+type marshalOutcome struct {
+	bytes []byte
+	err   error
+}
+
+func buildDepthPair(present bool) (*DepthNode, *DepthMirror) {
+	head := &DepthNode{}
+	mirror := &DepthMirror{}
+	n, m := head, mirror
+	for i := range 10002 {
+		if present {
+			n.Omit, m.Omit = "<&>prefix", "<&>prefix"
+		}
+		if i < 10001 {
+			next, mirrorNext := &DepthNode{}, &DepthMirror{}
+			n.Next, m.Next = next, mirrorNext
+			n, m = next, mirrorNext
+		}
+	}
+	return head, mirror
+}
+
+func assertSameMarshalOutcome(t *testing.T, present bool, got, want marshalOutcome) {
+	t.Helper()
+	if (got.err == nil) != (want.err == nil) || reflect.TypeOf(got.err) != reflect.TypeOf(want.err) {
+		t.Fatalf("present=%v: generated %T %v, oracle %T %v", present, got.err, got.err, want.err, want.err)
+	}
+	if got.err == nil {
+		if string(got.bytes) != string(want.bytes) {
+			t.Fatalf("present=%v: generated bytes differ", present)
+		}
+		return
+	}
+	gs, gok := got.err.(*json.SyntaxError)
+	ws, wok := want.err.(*json.SyntaxError)
+	if !gok || !wok || gs.Error() != ws.Error() || gs.Offset != ws.Offset {
+		t.Fatalf("present=%v: generated %#v, oracle %#v", present, got.err, want.err)
+	}
+}
+
+func must(b []byte, err error) []byte {
+	if err != nil {
+		panic(err)
+	}
+	return b
+}

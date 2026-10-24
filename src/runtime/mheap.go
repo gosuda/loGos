@@ -515,6 +515,9 @@ type mspan struct {
 	limit                 uintptr       // end of data in span
 	speciallock           mutex         // guards specials list and changes to pinnerBits
 	specials              *special      // linked list of special records sorted by offset.
+	logosNoReloc          bool          // finalizer or cleanup ever attached; excludes relocation until init; guarded by speciallock
+	logosPinned           bool          // an object of the span feeds an address hash; excludes relocation until init
+	logosFwd              uintptr       // address of the forwarding table of an evacuated span (nelems entries) while the world is stopped
 	userArenaChunkFree    addrRange     // interval for managing chunk allocation
 	largeType             *_type        // malloc header for large objects.
 	logosAge              uint8         // cycles survived, saturating at logosGenMatureAge (GOEXPERIMENT=logosgen)
@@ -1826,6 +1829,9 @@ func (span *mspan) init(base uintptr, npages uintptr) {
 	span.elemsize = 0
 	span.speciallock.key = 0
 	span.specials = nil
+	span.logosNoReloc = false
+	span.logosPinned = false
+	span.logosFwd = 0
 	span.logosAge = 0
 	span.needzero = 0
 	span.isLogosArenaChunk = false
@@ -2000,6 +2006,14 @@ func spanHasNoSpecials(s *mspan) {
 // (The add will fail only if a record with the same p and s->kind
 // already exists unless force is set to true.)
 func addspecial(p unsafe.Pointer, s *special, force bool) bool {
+	p = logosZgcAttachSpecial(p)
+	if s.kind == _KindSpecialFinalizer || s.kind == _KindSpecialCleanup {
+		// Backstop: the hoisted pre-lock copies in addCleanup and
+		// SetFinalizer do this first in preemptible context; a caller
+		// that reaches here unpublished in a clean context is rescued
+		// here, and an alien context fails fast.
+		p = zgcAttachEnsureCopy(p)
+	}
 	span := spanOfHeap(uintptr(p))
 	if span == nil {
 		throw("addspecial on invalid pointer")
@@ -2024,6 +2038,7 @@ func addspecial(p unsafe.Pointer, s *special, force bool) bool {
 		s.next = *iter
 		*iter = s
 		spanHasSpecials(span)
+		span.logosExcludeRelocation(s.kind)
 	}
 
 	unlock(&span.speciallock)
@@ -2038,6 +2053,10 @@ func addspecial(p unsafe.Pointer, s *special, force bool) bool {
 // Returns the record if the record existed, nil otherwise.
 // The caller must FixAlloc_Free the result.
 func removespecial(p unsafe.Pointer, kind uint8) *special {
+	// Canonicalize only: removal must find the existing record on the
+	// copy's span, never copy. Interior offset is preserved, so the
+	// splice-point search below compares like with like.
+	p = logosZgcAttachSpecial(p)
 	span := spanOfHeap(uintptr(p))
 	if span == nil {
 		throw("removespecial on invalid pointer")
@@ -2182,6 +2201,9 @@ func addCleanup(p unsafe.Pointer, c cleanupFn) uint64 {
 	s.cleanup = c
 	s.id = id
 
+	// Copy the target into to-space before taking locks: the refill the
+	// copy may need runs in preemptible context only.
+	p = zgcAttachEnsureCopy(p)
 	mp := acquirem()
 	addspecial(p, &s.special, true)
 	// This is responsible for maintaining the same

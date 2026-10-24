@@ -35,6 +35,7 @@ type DebugFlags struct {
 	InlRecursiveBudget    int    `help:"max inline cost inside recursive call-graph cycles at -O tiers (0 keeps the tier budget)" concurrent:"ok"`
 	LogosSynthPGO         string `help:"synthetic PGO level set by -O tiers: off, standard, or aggressive (empty disables emission)" concurrent:"ok"`
 	LogosSpecialize       int    `help:"enable clone specialization, set by -O tiers" concurrent:"ok"`
+	LogosLoopStride       int    `help:"wasm loop reschedule interval (0 keeps per-backedge checks)" concurrent:"ok"`
 	DumpPtrs              int    `help:"show Node pointers values in dump output"`
 	DwarfInl              int    `help:"print information about DWARF inlined function creation"`
 	EscapeMutationsCalls  int    `help:"print extra escape analysis diagnostics about mutations and calls" concurrent:"ok"`

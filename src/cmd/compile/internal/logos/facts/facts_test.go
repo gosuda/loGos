@@ -139,6 +139,8 @@ func TestDecodeRejects(t *testing.T) {
 		{"bad path trailing dot", head + "opt H P0.\n", "line 3"},
 		{"bad path leading dot", head + "opt H .P0\n", "line 3"},
 		{"bad path indexed E", head + "opt H E2\n", "line 3"},
+		{"bad path indexed D", head + "opt H D2\n", "line 3"},
+		{"bad path D with name", head + "opt H DName\n", "line 3"},
 		{"bad path negative", head + "opt H R-1\n", "line 3"},
 		{"bad flag unknown", head + "fn S Bogus\n", "line 3"},
 		{"bad flag MayYield", head + "fn S MayYield=2\n", "line 3"},
@@ -168,6 +170,70 @@ func TestDecodeRejects(t *testing.T) {
 				t.Fatalf("Decode(%q) error %q does not name %s", c.input, err, c.line)
 			}
 		})
+	}
+}
+
+func TestDPathRoundTrip(t *testing.T) {
+	fp := goobj.FingerprintType{3}
+	in := &facts.Facts{
+		Fingerprint: fp,
+		Opts: []facts.PathFact{
+			{Object: "(*S).Get", Path: "R0.D.FName"},
+			{Object: "H", Path: "P0.D.D"},
+			{Object: "H", Path: "P0.D.E"},
+		},
+		Consts: []facts.PathFact{
+			{Object: "C", Path: "R0.D.K"},
+		},
+	}
+	want := "logos-facts 1\n" +
+		"fingerprint 0300000000000000\n" +
+		"const C R0.D.K\n" +
+		"opt (*S).Get R0.D.FName\n" +
+		"opt H P0.D.D\n" +
+		"opt H P0.D.E\n"
+	if got := string(facts.Encode(fp, in)); got != want {
+		t.Fatalf("Encode mismatch:\n got %q\nwant %q", got, want)
+	}
+	back, err := facts.Decode([]byte(want))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	wantBack := &facts.Facts{
+		Fingerprint: fp,
+		Opts: []facts.PathFact{
+			{Object: "(*S).Get", Path: "R0.D.FName"},
+			{Object: "H", Path: "P0.D.D"},
+			{Object: "H", Path: "P0.D.E"},
+		},
+		Consts: []facts.PathFact{
+			{Object: "C", Path: "R0.D.K"},
+		},
+	}
+	if !reflect.DeepEqual(back, wantBack) {
+		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", back, wantBack)
+	}
+}
+
+func TestDPathQualifierVsContainer(t *testing.T) {
+	in := "logos-facts 1\nfingerprint 0001020304050607\n" +
+		"opt H R0.D\n" +
+		"opt H R0.E\n" +
+		"opt S.F R0.FD\n"
+	back, err := facts.Decode([]byte(in))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	want := []facts.PathFact{
+		{Object: "H", Path: "R0.D"},
+		{Object: "H", Path: "R0.E"},
+		{Object: "S.F", Path: "R0.FD"},
+	}
+	if !reflect.DeepEqual(back.Opts, want) {
+		t.Fatalf("Decode paths:\n got %+v\nwant %+v", back.Opts, want)
+	}
+	if out := string(facts.Encode(back.Fingerprint, back)); out != in {
+		t.Fatalf("re-Encode not canonical:\n got %q\nwant %q", out, in)
 	}
 }
 

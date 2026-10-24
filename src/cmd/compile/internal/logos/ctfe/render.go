@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 )
 
 // Expr renders v as a composite literal expression. Named same-package
@@ -42,11 +43,14 @@ type renderer struct {
 
 func (r *renderer) expr(v Value) (syntax.Expr, error) {
 	if v.isNil {
+		if v.typ == nil || v.typ.Kind == KUntypedNil {
+			return syntax.NewName(r.pos, "nil"), nil
+		}
 		t, err := r.typeExpr(v.typ)
 		if err != nil {
 			return nil, err
 		}
-		return &syntax.CompositeLit{Type: t, Rbrace: r.pos}, nil
+		return &syntax.CallExpr{Fun: t, ArgList: []syntax.Expr{syntax.NewName(r.pos, "nil")}}, nil
 	}
 	switch {
 	case v.ival != nil:
@@ -111,15 +115,26 @@ func (r *renderer) floatText(f float64) (string, bool) {
 		if f == 0 {
 			return "0.0", true
 		}
-		return strconv.FormatFloat(-f, 'g', -1, 64), true
+		s := strconv.FormatFloat(-f, 'g', -1, 64)
+		if !strings.ContainsAny(s, ".eE") {
+			s += ".0"
+		}
+		return s, true
 	}
-	return strconv.FormatFloat(f, 'g', -1, 64), false
+	s := strconv.FormatFloat(f, 'g', -1, 64)
+	if !strings.ContainsAny(s, ".eE") {
+		s += ".0"
+	}
+	return s, false
 }
 
 func (r *renderer) sliceLit(v Value) (syntax.Expr, error) {
 	t, err := r.typeExpr(v.typ)
 	if err != nil {
 		return nil, err
+	}
+	if v.SliceNeedsBacking() {
+		return r.backedSliceLit(v, t)
 	}
 	elems := make([]syntax.Expr, 0, len(sliceElems(v)))
 	for _, el := range sliceElems(v) {
@@ -130,6 +145,35 @@ func (r *renderer) sliceLit(v Value) (syntax.Expr, error) {
 		elems = append(elems, x)
 	}
 	return &syntax.CompositeLit{Type: t, ElemList: elems, Rbrace: r.pos}, nil
+}
+
+// backedSliceLit spells a slice with spare capacity or a nonzero lower
+// bound as a full backing literal plus a three-index slice, preserving
+// length, capacity, and tail values. A plain literal would silently
+// truncate the capacity to the length.
+func (r *renderer) backedSliceLit(v Value, t syntax.Expr) (syntax.Expr, error) {
+	backing, lo, length, cap_, ok := v.SliceHeader()
+	if !ok || lo < 0 || length < 0 || lo > cap_ || lo+length > cap_ || cap_ > len(backing) {
+		return nil, fmt.Errorf("cannot spell slice window in const evaluation")
+	}
+	elems := make([]syntax.Expr, 0, cap_-lo)
+	for _, el := range backing[lo:cap_] {
+		x, err := r.expr(el)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, x)
+	}
+	backingLit := &syntax.CompositeLit{Type: t, ElemList: elems, Rbrace: r.pos}
+	return &syntax.SliceExpr{
+		X:     backingLit,
+		Index: [3]syntax.Expr{r.sliceBound(0), r.sliceBound(length), r.sliceBound(cap_ - lo)},
+		Full:  true,
+	}, nil
+}
+
+func (r *renderer) sliceBound(n int) syntax.Expr {
+	return &syntax.BasicLit{Value: strconv.Itoa(n), Kind: syntax.IntLit}
 }
 
 func (r *renderer) arrayLit(v Value) (syntax.Expr, error) {

@@ -887,6 +887,9 @@ var depsRules = `
 	context, errors, reflect, unsafe
 	< logos/rt;
 
+	encoding/json, math, reflect, strconv, unicode, unicode/utf8, unsafe
+	< logos/rt/json;
+
 	sync, sync/atomic
 	< logos/sync;
 `

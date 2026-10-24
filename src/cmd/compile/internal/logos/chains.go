@@ -74,7 +74,6 @@ func (fl *fileLower) lowerChains() {
 			fl.lowerChainPkgDecl(decl)
 		}
 	}
-	fl.flushTypeImports()
 }
 
 // transparentWrappers records the generated option-wrapper function
@@ -999,20 +998,34 @@ type chainEmit struct {
 	outElem  string
 }
 
-// prepare builds closure texts and the materialized element spelling.
-// Each closure takes the element type its stage receives: the receiver
-// element type until a map, then the production of the latest map; the
-// materialized elements and the terminal closure see the final one.
+// prepare builds closure and operand texts and the materialized element spelling.
+// Every source operand is bound once in chain operation order. Each closure takes
+// the element type its stage receives: the receiver element type until a map,
+// then the production of the latest map; the materialized elements and the
+// terminal closure see the final one.
 func (ce *chainEmit) prepare() {
 	cg := ce.cg
 	elem := cg.spellType(cg.elemT)
 	for i, op := range ce.ops {
-		if op.lam != nil {
-			ce.closures = append(ce.closures, cg.closure(cg.prefix+fmt.Sprintf("_f%d", i), op, elem, ce.opResult(op)))
-		} else if op.arg != nil && takesFunc(op.method) {
-			// A non-lambda func value evaluates once, like any call
-			// argument; the loop then reuses the bound name.
-			ce.closures = append(ce.closures, cg.prefix+fmt.Sprintf("_f%d := %s", i, cg.fl.textOf(op.argSpan)))
+		switch op.method {
+		case "take":
+			ce.closures = append(ce.closures,
+				fmt.Sprintf("%s_tn%d := %s", cg.prefix, i, ce.argText(op)),
+				fmt.Sprintf("%s_tc%d := 0", cg.prefix, i),
+			)
+		case "drop":
+			ce.closures = append(ce.closures,
+				fmt.Sprintf("%s_d%d := %s", cg.prefix, i, ce.argText(op)),
+				fmt.Sprintf("%s_di%d := 0", cg.prefix, i),
+			)
+		default:
+			if op.lam != nil {
+				ce.closures = append(ce.closures, cg.closure(cg.prefix+fmt.Sprintf("_f%d", i), op, elem, ce.opResult(op)))
+			} else if op.arg != nil && takesFunc(op.method) {
+				// A non-lambda func value evaluates once, like any call
+				// argument; the loop then reuses the bound name.
+				ce.closures = append(ce.closures, cg.prefix+fmt.Sprintf("_f%d := %s", i, cg.fl.textOf(op.argSpan)))
+			}
 		}
 		if op.method == "map" {
 			elem = ce.opResult(op)
@@ -1022,6 +1035,8 @@ func (ce *chainEmit) prepare() {
 		ce.closures = append(ce.closures, cg.closure(cg.prefix+"_ft", ce.term, elem, ce.opResult(ce.term)))
 	} else if ce.term.arg != nil && takesFunc(ce.term.method) {
 		ce.closures = append(ce.closures, cg.prefix+"_ft := "+cg.fl.textOf(ce.term.argSpan))
+	} else if ce.term.method == "get" {
+		ce.closures = append(ce.closures, fmt.Sprintf("%s_i := %s", cg.prefix, ce.argText(ce.term)))
 	}
 	ce.outElem = elem
 }
@@ -1076,10 +1091,8 @@ func (ce *chainEmit) funcOf(op chainOp, closure string) string {
 	if op.lam != nil || (op.arg != nil && takesFunc(op.method)) {
 		return closure
 	}
-	// No callable: take, drop, and friends spell their scalar argument
-	// through argText. Reading the span here would drain its splices
-	// (textOf consumes what it composes) before argText runs, so this
-	// path returns empty; every caller discards it.
+	// No callable: take, drop, and get bind their scalar argument
+	// in prepare once in chain operation order.
 	return ""
 }
 
@@ -1294,14 +1307,6 @@ func (ce *chainEmit) loop() (prelude, body, epilogue []string) {
 	if ce.term.method == "count" {
 		prelude = append(prelude, p+"_c := 0")
 	}
-	for i, op := range ce.ops {
-		switch op.method {
-		case "take":
-			prelude = append(prelude, fmt.Sprintf("%s_tn%d := %s", p, i, ce.argText(op)))
-		case "drop":
-			prelude = append(prelude, fmt.Sprintf("%s_d%d := %s", p, i, ce.argText(op)), fmt.Sprintf("%s_di%d := 0", p, i))
-		}
-	}
 	cur := p + "_e"
 	loopHead := fmt.Sprintf("for _, %[1]s_e := range %[1]s_rcv {", p)
 	if !ce.needElem() {
@@ -1320,7 +1325,6 @@ func (ce *chainEmit) loop() (prelude, body, epilogue []string) {
 			body = append(body, ce.filterLines(p, fname, cur, i)...)
 		case "take":
 			body = append(body, fmt.Sprintf("%s_tc%d++", p, i))
-			prelude = append(prelude, fmt.Sprintf("%s_tc%d := 0", p, i))
 		case "drop":
 			body = append(body, fmt.Sprintf("if %[1]s_di%[2]d < %[1]s_d%[2]d { %[1]s_di%[2]d++; continue }", p, i))
 		case "map":
@@ -1593,9 +1597,7 @@ func (ce *chainEmit) epilogueIndex(p string) []string {
 	if ce.term.method == "last" {
 		return []string{fmt.Sprintf("if len(%[1]s_out) == 0 { return %[2]s%[3]s }; return %[4]s%[3]s", p, ce.noneText(p), ce.rsuf(), ce.someText(p, p+"_out[len("+p+"_out)-1]"))}
 	}
-	idx := ce.argText(ce.term)
 	return []string{
-		fmt.Sprintf("%[1]s_i := %[2]s", p, idx),
 		fmt.Sprintf("if %[1]s_i < 0 || %[1]s_i >= len(%[1]s_out) { return %[2]s%[3]s }; return %[4]s%[3]s", p, ce.noneText(p), ce.rsuf(), ce.someText(p, p+"_out["+p+"_i]")),
 	}
 }

@@ -6,6 +6,22 @@ package runtime
 
 import "unsafe"
 
+// LogosEnterFastCallForTest records a fast-call entry on the current M and
+// reports the observed slots, timestamp, and flag.
+func LogosEnterFastCallForTest(arg unsafe.Pointer, now int64) (slots [4]uintptr, stamp int64, flag bool) {
+	mp := getg().m
+	logosRecordFastCall(mp, arg, now)
+	return mp.fastCgoFrame, mp.fastCallEnterNano, mp.inFastCall
+}
+
+// LogosExitFastCallForTest clears a fast-call record on the current M and
+// reports the observed slots, timestamp, and flag.
+func LogosExitFastCallForTest() (slots [4]uintptr, stamp int64, flag bool) {
+	mp := getg().m
+	logosClearFastCall(mp)
+	return mp.fastCgoFrame, mp.fastCallEnterNano, mp.inFastCall
+}
+
 // LogosGrowsliceBufForTest calls growsliceBuf for elements of the dynamic
 // type of elem, using buf (bufLen elements, already holding newLen-num
 // elements) as the backing store, and reports the resulting slice header.

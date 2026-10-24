@@ -60,36 +60,25 @@ func (check *Checker) logosUnwrapConstFunc(decl syntax.Decl) syntax.Decl {
 	return decl
 }
 
-// logosConstKind classifies a const initializer.
-type logosConstKind int
-
-const (
-	logosConstOther logosConstKind = iota
-	logosConstComposite
-	logosConstCall
-	logosConstAlias
-	logosConstSelect
-	logosConstIndex
-	logosConstCoalesce
-)
-
-// logosClassifyInit reports how a const initializer evaluates.
-func logosClassifyInit(init syntax.Expr) logosConstKind {
-	switch syntax.Unparen(init).(type) {
-	case *syntax.CompositeLit:
-		return logosConstComposite
-	case *syntax.CallExpr:
-		return logosConstCall
-	case *syntax.Name:
-		return logosConstAlias
-	case *syntax.SelectorExpr:
-		return logosConstSelect
-	case *syntax.IndexExpr:
-		return logosConstIndex
-	case *syntax.CoalesceExpr:
-		return logosConstCoalesce
-	}
-	return logosConstOther
+func (check *Checker) logosConstNeedsEval(init syntax.Expr) bool {
+	needed := false
+	syntax.Inspect(init, func(n syntax.Node) bool {
+		if needed {
+			return false
+		}
+		switch n := n.(type) {
+		case *syntax.FuncLit:
+			return false
+		case *syntax.CompositeLit, *syntax.CallExpr, *syntax.SelectorExpr, *syntax.IndexExpr, *syntax.CoalesceExpr:
+			needed = true
+		case *syntax.Name:
+			if obj, ok := check.Info.Uses[n].(*Const); ok {
+				_, needed = check.logosRecorded(obj)
+			}
+		}
+		return !needed
+	})
+	return needed
 }
 
 // logosConstEval evaluates a const initializer that upstream cannot:
@@ -106,21 +95,18 @@ func (check *Checker) logosConstEval(obj *Const, init syntax.Expr, x *operand) b
 	if x.mode() == constant_ {
 		return false
 	}
-	switch logosClassifyInit(init) {
-	case logosConstAlias:
+	switch syntax.Unparen(init).(type) {
+	case *syntax.Name:
 		return check.logosConstAlias(obj, init)
-	case logosConstIndex:
-		// Map indexes yield V?, whose M3-S6 lowering keys off the
-		// read shape that literalization would erase; they stay
-		// with the ordinary "not constant" error.
+	case *syntax.IndexExpr:
 		if logosAsOption(x.typ()) != nil {
 			return false
 		}
-		return check.logosConstCompute(obj, init, x)
-	case logosConstComposite, logosConstCall, logosConstSelect, logosConstCoalesce:
-		return check.logosConstCompute(obj, init, x)
 	}
-	return false
+	if !check.logosConstNeedsEval(init) {
+		return false
+	}
+	return check.logosConstCompute(obj, init, x)
 }
 
 // logosConstUse reads a recorded const composite as a value operand,
@@ -168,6 +154,11 @@ func (check *Checker) logosConstAlias(obj *Const, init syntax.Expr) bool {
 func (check *Checker) logosConstCompute(obj *Const, init syntax.Expr, x *operand) bool {
 	if v, ok := check.logosMemo(init); ok {
 		return check.logosApplyMemo(obj, init, x, v)
+	}
+	if perr := check.logosPrescanImportedCalls(obj, init); perr != nil {
+		check.errorf(obj, InvalidConstInit, "%s %s", logosConstEvalRule, perr)
+		obj.typ = Typ[Invalid]
+		return true
 	}
 	host := &ctfeHost{check: check}
 	cfg := ctfe.Config{MaxSteps: check.conf.LogosCTFEMaxSteps, WordSize: check.logosWordSize()}
@@ -229,14 +220,18 @@ func (check *Checker) logosRecordComposite(obj *Const, init syntax.Expr, x *oper
 	} else {
 		obj.typ = x.typ()
 	}
-	if mt, ok := obj.typ.Underlying().(*Map); ok && v.Type().Kind == ctfe.KMap {
+	base := obj.typ
+	if cv := logosAsConstView(base); cv != nil {
+		base = cv.Elem
+	}
+	if mt, ok := base.Underlying().(*Map); ok && v.Type().Kind == ctfe.KMap {
 		// A const map is a const view of its map type (M5-S4, SPEC T-Sec9).
 		if !logosConstMapKeyOK(mt.Key()) {
 			check.errorf(obj, InvalidConstInit, "[comptime::constmap_key_type] const map key type %s cannot be hashed: use a string, number, bool, or a struct or array of them", mt.Key())
 			obj.typ = Typ[Invalid]
 			return true
 		}
-		obj.typ = &ConstView{Elem: obj.typ, ConstMap: true}
+		obj.typ = &ConstView{Elem: base, ConstMap: true}
 	}
 	check.logosRecord(obj, v)
 	return true

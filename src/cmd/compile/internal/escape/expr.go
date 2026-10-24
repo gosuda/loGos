@@ -102,6 +102,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 
 	case ir.OCONV, ir.OCONVNOP:
 		n := n.(*ir.ConvExpr)
+		k = e.foreignConversion(k, n)
 		if (ir.ShouldCheckPtr(e.curfn, 2) || ir.ShouldAsanCheckPtr(e.curfn)) && n.Type().IsUnsafePtr() && n.X.Type().IsPtr() {
 			// When -d=checkptr=2 or -asan is enabled,
 			// treat conversions to unsafe.Pointer as an
@@ -151,7 +152,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 
 	case ir.OMAKESLICE:
 		n := n.(*ir.MakeExpr)
-		e.spill(k, n)
+		e.logosArenaMake(k, n, e.spill(k, n)) // logos M18: caller-region returns.
 		e.discard(n.Len)
 		e.discard(n.Cap)
 	case ir.OMAKECHAN:
@@ -293,7 +294,7 @@ func (e *escape) unsafeValue(k hole, n ir.Node) {
 	case ir.OCONV, ir.OCONVNOP:
 		n := n.(*ir.ConvExpr)
 		if n.X.Type().IsUnsafePtr() {
-			e.expr(k, n.X)
+			e.expr(e.foreignConversion(k, n), n.X)
 		} else {
 			e.discard(n.X)
 		}

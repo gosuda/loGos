@@ -1072,6 +1072,7 @@ const (
 	OpAMD64LoweredGetCallerSP
 	OpAMD64LoweredNilCheck
 	OpAMD64LoweredWB
+	OpAMD64LoweredLogosArenaBump
 	OpAMD64LoweredHasCPUFeature
 	OpAMD64LoweredPanicBoundsRR
 	OpAMD64LoweredPanicBoundsRC
@@ -7006,6 +7007,7 @@ const (
 	OpStoreMasked64
 	OpMove
 	OpZero
+	OpLogosArenaBump
 	OpStoreWB
 	OpMoveWB
 	OpZeroWB
@@ -20125,6 +20127,24 @@ var opcodeTable = [...]opInfo{
 			clobbers: regMask{v1: 71776116913668096, v2: 0}, // X0 X1 X2 X3 X4 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 X31 K1 K2 K3 K4 K5 K6 K7
 			outputs: []outputInfo{
 				{0, regMask{v1: 2048, v2: 0}}, // R11
+			},
+		},
+	},
+	{
+		name:            "LoweredLogosArenaBump",
+		auxType:         auxInt64,
+		argLen:          2,
+		resultNotInArgs: true,
+		clobberFlags:    true,
+		needIntTemp:     true,
+		hasSideEffects:  true,
+		unsafePoint:     true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, regMask{v1: 49135, v2: 0}}, // AX CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R15
+			},
+			outputs: []outputInfo{
+				{0, regMask{v1: 49135, v2: 0}}, // AX CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R15
 			},
 		},
 	},
@@ -106858,6 +106878,14 @@ var opcodeTable = [...]opInfo{
 		auxType: auxTypSize,
 		argLen:  2,
 		generic: true,
+	},
+	{
+		name:           "LogosArenaBump",
+		auxType:        auxInt64,
+		argLen:         2,
+		hasSideEffects: true,
+		unsafePoint:    true,
+		generic:        true,
 	},
 	{
 		name:    "StoreWB",

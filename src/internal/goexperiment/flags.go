@@ -152,4 +152,7 @@ type Flags struct {
 	// LogosGen enables the generational card table of the Green Tea
 	// collector: minor cycles that skip mature spans (M19-S4).
 	LogosGen bool
+
+	// LogosGCMoving enables the moving collector modes immix and zgc (M19-S5).
+	LogosGCMoving bool
 }

@@ -55,6 +55,7 @@ func siteDisplay(pos syntax.Pos, base string, line uint) (string, uint) {
 // YieldStmt, ScopeDeferStmt, or InterpExpr) is an internal error.
 func Lower(pkg *types2.Package, info *types2.Info, files []*syntax.File, src map[*syntax.File][]byte) (bool, map[*syntax.File][]Edit) {
 	clearRodataPackage(pkg.Path()) // M5-S3: fresh read-only marks per compile.
+	clearOwnedConstants()
 	if f := EmitOptionFacts(pkg, info); f != nil {
 		facts.SetCurrent(f)
 	}
@@ -62,6 +63,9 @@ func Lower(pkg *types2.Package, info *types2.Info, files []*syntax.File, src map
 		facts.SetCurrent(f)
 	}
 	if f := EmitDefaultFacts(pkg, info, facts.Current()); f != nil { // M6-S3: struct field defaults.
+		facts.SetCurrent(f)
+	}
+	if f := EmitConstFnFacts(pkg, info, files, src, facts.Current()); f != nil { // constfn: closed sources before const markers erase.
 		facts.SetCurrent(f)
 	}
 	shared := &packageLower{info: info, tpkg: pkg, constMaps: collectConstMaps(files, info)}
@@ -91,13 +95,40 @@ func Lower(pkg *types2.Package, info *types2.Info, files []*syntax.File, src map
 	}
 	clear(interpKinds) // Kinds of originals a const for replaced are never consumed; drop them with the rest.
 	if !changed {
-		changed = infoHasConstView(info, files) // M5-S6: pure-info consts (rt.Freeze results) need a plain recheck.
+		changed = infoHasConstView(info, files) || hasSynthStaticMethods(pkg) // M5-S6: pure-info consts (rt.Freeze results) need a plain recheck.
 	}
 	base.ExitIfErrors() // M7-S3 hook: comptime diagnostics end lowering before survivors are rejected.
 	for _, file := range files {
 		rejectSurvivors(file)
 	}
 	return changed, edits
+}
+
+// hasSynthStaticMethods reports whether pkg holds a checker-synthesized
+// serializer method, which the lowering must replace with a generated
+// body.
+func hasSynthStaticMethods(pkg *types2.Package) bool {
+	scope := pkg.Scope()
+	for _, name := range scope.Names() {
+		tn, ok := scope.Lookup(name).(*types2.TypeName)
+		if !ok {
+			continue
+		}
+		named, ok := tn.Type().(*types2.Named)
+		if !ok {
+			continue
+		}
+		for i := range named.NumMethods() {
+			m := named.Method(i)
+			if m.Pos().IsKnown() {
+				continue
+			}
+			if m.Name() == "MarshalJSON" || m.Name() == "UnmarshalJSON" || m.Name() == "MarshalBinary" || m.Name() == "UnmarshalBinary" || m.Name() == "AppendBinary" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // packageLower carries the state shared by every file of one package.
@@ -107,30 +138,40 @@ type packageLower struct {
 	siteSeq   int
 	constMaps map[*types2.Const]*constMapGen // M5-S4: every const map of the package.
 	ctExp     *cfExpander                    // M7-S3: definitions, memo, and cycle stack across files.
+	// jsonHelpers pins one traversal-helper pair per spelled
+	// generated-side type (M11 R1), keyed by type spelling so files
+	// share helpers and repeated instantiations reuse one pair.
+	jsonHelpers map[string]*jsonHelperDef
+	// jsonHelperSeq mints helper and import-alias numbers.
+	jsonHelperSeq int
 }
 
 // fileLower carries the state of lowering one file.
 type fileLower struct {
-	pkg       *packageLower
-	file      *syntax.File
-	src       []byte
-	orig      int
-	start     []int
-	base      *syntax.PosBase
-	baseName  string
-	splices   []splice
-	regions   []*cfRegion
-	hosts     []*cfHost
-	moves     []*chainMove
-	changed   bool
-	needRT    bool
-	needSimd  bool
-	siteDecls []*syntax.VarDecl
+	pkg         *packageLower
+	file        *syntax.File
+	src         []byte
+	orig        int
+	start       []int
+	base        *syntax.PosBase
+	baseName    string
+	splices     []splice
+	regions     []*cfRegion
+	hosts       []*cfHost
+	moves       []*chainMove
+	changed     bool
+	needRT      bool
+	needSimd    bool
+	needJSON    bool
+	needBinary  bool
+	needReflect bool
+	siteDecls   []*syntax.VarDecl
 	// constDecls and constText hold the M5-S4 generated declarations of
 	// this file, as parsed nodes and as eject text.
 	constDecls []syntax.Decl
 	constText  string
 	names      map[*types2.Package]string
+	genImps    *genImports
 	// Option lowering state (M3): optMemo pins one lowering per shared
 	// `T?` type node, narrowDone pins rewritten narrowed reads,
 	// wrapSpan remembers original spans of synthetic wrapper tops for
@@ -455,7 +496,6 @@ func (fl *fileLower) lowerFile() {
 	fl.lowerViewAs()         // M7-S5 hook: comptime.ViewAs calls to the rt helper.
 	fl.lowerChains()         // M6-S7 hook: collection chains fused into loops.
 	fl.lowerSpreads()        // M6-S4 hook: `..src` spread elements.
-	fl.flushTypeImports()    // M6-S4 hook: imports for spelled elided spread literal types.
 	for _, decl := range fl.file.DeclList {
 		fn, ok := decl.(*syntax.FuncDecl)
 		if ok && fn.Body != nil {
@@ -464,15 +504,30 @@ func (fl *fileLower) lowerFile() {
 		}
 		scanForLiterals(fl, decl)
 	}
-	fl.endComptime()  // M7-S2/S3 hook: comptime import and erased-package imports, after pruning removed the dead branches.
-	fl.lowerSimd()    // M14-S1 hook: array operators and reductions to IIFEs.
-	fl.lowerTuples()  // M6-S5 hook: tuples to structs, pack/unpack.
-	fl.lowerLambdas() // M6-S6 hook: lambdas to function literals.
-	fl.lowerMakeLen() // M15-S2 hook: products in make lengths to MulLen; sets needRT before the import.
-	if fl.needRT || fl.needSimd {
+	fl.endComptime()     // M7-S2/S3 hook: comptime import and erased-package imports, after pruning removed the dead branches.
+	fl.lowerSimd()       // M14-S1 hook: array operators and reductions to IIFEs.
+	fl.lowerTuples()     // M6-S5 hook: tuples to structs, pack/unpack.
+	fl.lowerLambdas()    // M6-S6 hook: lambdas to function literals.
+	fl.lowerProperties() // M4-S2 hook: property accessors, selector lowering, prop facts.
+	fl.lowerMakeLen()    // M15-S2 hook: products in make lengths to MulLen; sets needRT before the import.
+
+	fl.lowerStaticJSON() // M11-S1/S2 hook: generated MarshalJSON and UnmarshalJSON; sets needRT and needJSON before the imports.
+	fl.flushTypeImports()
+	if fl.needRT || fl.needSimd || fl.needJSON || fl.needReflect || fl.needBinary {
 		var imps []syntax.Decl
 		if fl.needRT {
 			imps = append(imps, rtImport(fl.file.Pos()))
+		}
+		if fl.needJSON {
+			imps = append(imps, jsonImport(fl.file.Pos()))
+		}
+		if fl.needReflect {
+			imps = append(imps, reflectImport(fl.file.Pos()))
+		}
+		if fl.needBinary {
+			for _, imp := range fl.binaryImports(fl.file.Pos()) {
+				imps = append(imps, imp)
+			}
 		}
 		if fl.needSimd {
 			imps = append(imps, simdImport(fl.file.Pos()))
@@ -487,7 +542,6 @@ func (fl *fileLower) lowerFile() {
 	if fl.constText != "" {
 		fl.add(fl.orig, fl.orig, fl.constText)
 	}
-	fl.lowerProperties()     // M4-S2 hook: property accessors, selector lowering, prop facts.
 	fl.lowerStructDefaults() // M6-S3 hook: strip `= const`, fill composite literals.
 	fl.lowerAddrFresh()      // M6-S2 hook: `&expr` to new(expr).
 	fl.emitRodata()          // M5-S3 hook: read-only vars, after every pass that creates them.
@@ -495,6 +549,39 @@ func (fl *fileLower) lowerFile() {
 	fl.resolveChainMoves()   // M6-S7 hook: copies of moved chain operands, after every edit inside them.
 	fl.finalizeConstFor()
 	fl.remapRegions()
+}
+
+// genImports tracks synthesized and reused imports for one file being lowered.
+type genImports struct {
+	qual  map[string]string          // pkg path -> alias, monotone, never deleted
+	pkgs  map[string]*types2.Package // pkg path -> package object (if known)
+	used  map[string]bool            // every alias bound in this file, source and generated
+	order []string                   // pkg paths in allocation order
+}
+
+func (fl *fileLower) getGenImports() *genImports {
+	if fl.genImps != nil {
+		return fl.genImps
+	}
+	used := map[string]bool{
+		rtAlias:         true,
+		jsonAlias:       true,
+		logosSimdAlias:  true,
+		reflectAlias:    true,
+		interpConvPkg:   true,
+		interpUnsafePkg: true,
+	}
+	for _, name := range fl.importNames() {
+		if name != "" {
+			used[name] = true
+		}
+	}
+	fl.genImps = &genImports{
+		qual: make(map[string]string),
+		pkgs: make(map[string]*types2.Package),
+		used: used,
+	}
+	return fl.genImps
 }
 
 // addHeaderSplice adds the eject-text edit that spells the rt import and
@@ -520,6 +607,20 @@ func (fl *fileLower) addHeaderSplice() {
 	}
 	if fl.needRT {
 		fl.add(ins, ins, "\n\nimport "+rtAlias+" "+fmt.Sprintf("%q", rtImportPath))
+	}
+	if fl.needJSON {
+		fl.add(ins, ins, "\n\nimport "+jsonAlias+" "+fmt.Sprintf("%q", jsonImportPath))
+	}
+	if fl.needReflect {
+		fl.add(ins, ins, "\n\nimport "+reflectAlias+" "+`"reflect"`)
+	}
+	if fl.needBinary {
+		for _, item := range binaryImportTable {
+			if !strings.Contains(fl.constText, item.marker) {
+				continue
+			}
+			fl.add(ins, ins, "\n\nimport "+item.alias+" "+fmt.Sprintf("%q", item.path))
+		}
 	}
 	if fl.needSimd {
 		fl.add(ins, ins, "\n\nimport "+logosSimdAlias+" "+fmt.Sprintf("%q", logosSimdPath))

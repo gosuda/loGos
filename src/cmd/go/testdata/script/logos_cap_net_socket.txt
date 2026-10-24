@@ -1,0 +1,147 @@
+# M12-S2 net: direct syscall.Socket is a CapNet sink (PR3 PRRT_kwDOVOeymc6vVa8U).
+# An unallowlisted third-party package that calls syscall.Socket without
+# importing net or unsafe must fail under default transitive_net=deny.
+# RED: capabilitySinks lacks syscall.Socket, so the build succeeds and the
+# `!` expectation fails. No ambient network: the sink is linked, never run.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+mkdir $WORK/bin
+
+# Case A: dep reaches syscall.Socket -> deny.
+cd neta/main
+! logos build -o $WORK/bin/netsock$GOEXE ./cmd
+stderr 'ERROR \[capabilities::unauthorized_net\]: Transitive dependency ''example\.com/ndep'' reaches ''syscall\.Socket'''
+stderr 'example\.com/ndep\.Init\(\)'
+stderr 'transitive_net_allowlist'
+cd ../..
+
+# Case B: dep imports syscall but never calls Socket (deadcode) -> passes.
+cd netb/main
+logos build -o $WORK/bin/netsockb$GOEXE ./cmd
+exec $WORK/bin/netsockb$GOEXE
+stdout '^dead-ok$'
+cd ../..
+
+# Case C: allowlisted dep reaches syscall.Socket -> passes and runs.
+cd netc/main
+logos build -o $WORK/bin/netsockc$GOEXE ./cmd
+exec $WORK/bin/netsockc$GOEXE
+stdout '^net-ok$'
+cd ../..
+
+-- neta/main/go.mod --
+module example.com/nmain
+
+go 1.27
+
+require example.com/ndep v0.0.0
+
+replace example.com/ndep => ../ndep
+
+-- neta/main/cmd/main.go --
+package main
+
+import "example.com/ndep"
+
+func main() { ndep.Init() }
+
+-- neta/ndep/go.mod --
+module example.com/ndep
+
+go 1.27
+
+-- neta/ndep/ndep.go --
+package ndep
+
+import "syscall"
+
+func Init() {
+	fd, _ := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if fd >= 0 {
+		syscall.Close(fd)
+	}
+}
+
+-- netb/main/go.mod --
+module example.com/nmainb
+
+go 1.27
+
+require example.com/ndepb v0.0.0
+
+replace example.com/ndepb => ../ndepb
+
+-- netb/main/cmd/main.go --
+package main
+
+import "example.com/ndepb"
+
+func main() { ndepb.Hello() }
+
+-- netb/ndepb/go.mod --
+module example.com/ndepb
+
+go 1.27
+
+-- netb/ndepb/ndepb.go --
+package ndepb
+
+import (
+	"fmt"
+	"syscall"
+)
+
+var _ = syscall.AF_INET
+
+func Hello() { fmt.Println("dead-ok") }
+
+-- neta/main/logos.toml --
+[capabilities]
+transitive_net = "deny"
+
+-- netb/main/logos.toml --
+[capabilities]
+transitive_net = "deny"
+
+-- netc/main/go.mod --
+module example.com/nmainc
+
+go 1.27
+
+require example.com/ndepc v0.0.0
+
+replace example.com/ndepc => ../ndepc
+
+-- netc/main/logos.toml --
+[capabilities]
+transitive_net = "deny"
+transitive_net_allowlist = ["example.com/ndepc"]
+
+-- netc/main/cmd/main.go --
+package main
+
+import (
+	"fmt"
+	"example.com/ndepc"
+)
+
+func main() { fmt.Println(ndepc.Hello()) }
+
+-- netc/ndepc/go.mod --
+module example.com/ndepc
+
+go 1.27
+
+-- netc/ndepc/ndepc.go --
+package ndepc
+
+import "syscall"
+
+func Hello() string {
+	fd, _ := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if fd >= 0 {
+		syscall.Close(fd)
+	}
+	return "net-ok"
+}

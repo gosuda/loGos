@@ -25,12 +25,15 @@
 //	conforms <struct> <interface-package-path> <interface>
 //	comptime <object> <byte length>
 //	<source bytes>
+//	constfn <object> <byte length>
+//	<source bytes>
 //	default <type> <field> <byte length>
 //	<default expression source text>
 //
 // <object> is Name, Type.Field, (*Type).Method, or Type.Method; <path> is
 // dot-separated steps R<i> result, P<i> parameter, F<name> field, E element,
-// K map key, M<name> interface method, T<i> tuple element. Flags:
+// D dereference of one pointer or channel container, K map key, M<name>
+// interface method, T<i> tuple element. Flags:
 // ReturnsNonNil, AlwaysNilError, PureConst, ReceiverMutated,
 // ParamMutated=<hex mask>, MayYield=0|1.
 package facts
@@ -68,7 +71,10 @@ const (
 var versionLine = "logos-facts " + strconv.Itoa(Version)
 
 // PathFact is one opt or const record: the object position carrying an
-// option or const fact, and the dot-separated path to it.
+// option or const fact, and the dot-separated path to it. Each step
+// descends one position: R<i> result, P<i> parameter, F<name> field, E
+// option or view element (the ? qualifier), K map key, D one pointer or
+// channel container, M<name> interface method, T<i> tuple element.
 type PathFact struct {
 	Object string
 	Path   string
@@ -117,6 +123,15 @@ type ComptimeFact struct {
 	Source []byte
 }
 
+// ConstFuncFact is one constfn record: the closed source of an exported
+// receiverless non-generic const function. The source is a single
+// parseable Logos file carrying the function's same-package declaration
+// closure; a validated root `const func` body is the capability record.
+type ConstFuncFact struct {
+	Object string
+	Source []byte
+}
+
 // Facts is the decoded content of one __.LOGOS member.
 type Facts struct {
 	Fingerprint goobj.FingerprintType
@@ -126,6 +141,7 @@ type Facts struct {
 	Props       []PropFact
 	Conforms    []ConformsFact
 	Comptimes   []ComptimeFact
+	ConstFuncs  []ConstFuncFact
 	Defaults    []DefaultFact
 	// GoPackage marks a package compiled from .go sources. Such a package
 	// carries per-function backend facts such as MayYield and nothing
@@ -182,6 +198,11 @@ func Encode(fp goobj.FingerprintType, f *Facts) []byte {
 		for _, c := range f.Comptimes {
 			if c.Object != "" && len(c.Source) > 0 {
 				recs = append(recs, record{line: "comptime " + c.Object + " " + strconv.Itoa(len(c.Source)), body: c.Source})
+			}
+		}
+		for _, c := range f.ConstFuncs {
+			if c.Object != "" && len(c.Source) > 0 {
+				recs = append(recs, record{line: "constfn " + c.Object + " " + strconv.Itoa(len(c.Source)), body: c.Source})
 			}
 		}
 		if f.GoPackage {
@@ -464,6 +485,34 @@ func Decode(data []byte) (*Facts, error) {
 				d.line++
 			}
 			f.Comptimes = append(f.Comptimes, ComptimeFact{Object: fields[1], Source: src})
+		case strings.HasPrefix(line, "constfn "):
+			if len(fields) != 3 {
+				return nil, fmt.Errorf(`logos facts line %d: bad constfn record %q (want "constfn <object> <length>")`, ln, line)
+			}
+			if !validObject(fields[1]) {
+				return nil, fmt.Errorf("logos facts line %d: bad object %q", ln, fields[1])
+			}
+			n, aerr := strconv.Atoi(fields[2])
+			if aerr != nil || n <= 0 {
+				return nil, fmt.Errorf("logos facts line %d: bad constfn length %q", ln, fields[2])
+			}
+			if len(d.data)-d.off < n {
+				return nil, fmt.Errorf("logos facts line %d: truncated constfn body for %q (want %d bytes, have %d)", ln, fields[1], n, len(d.data)-d.off)
+			}
+			src := bytes.Clone(d.data[d.off : d.off+n])
+			d.off += n
+			d.line += bytes.Count(src, []byte{'\n'})
+			if d.off >= len(d.data) || d.data[d.off] != '\n' {
+				return nil, fmt.Errorf("logos facts line %d: want newline after constfn body", ln)
+			}
+			d.off++
+			d.line++
+			for _, c := range f.ConstFuncs {
+				if c.Object == fields[1] {
+					return nil, fmt.Errorf("logos facts line %d: duplicate constfn object %q", ln, fields[1])
+				}
+			}
+			f.ConstFuncs = append(f.ConstFuncs, ConstFuncFact{Object: fields[1], Source: src})
 		default:
 			kind := line
 			if k := strings.Fields(line); len(k) > 0 {
@@ -530,8 +579,8 @@ func isDigits(s string) bool {
 	return true
 }
 
-// validStep reports whether s is one path step: R<i>, P<i>, F<name>, E, K,
-// M<name>, or T<i>.
+// validStep reports whether s is one path step: R<i>, P<i>, F<name>, E, D,
+// K, M<name>, or T<i>.
 func validStep(s string) bool {
 	if s == "" {
 		return false
@@ -541,7 +590,7 @@ func validStep(s string) bool {
 		return isDigits(s[1:])
 	case 'F', 'M':
 		return isIdent(s[1:])
-	case 'E', 'K':
+	case 'D', 'E', 'K':
 		return len(s) == 1
 	}
 	return false

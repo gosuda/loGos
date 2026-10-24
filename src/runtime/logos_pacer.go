@@ -2,9 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !wasm || !logosgc.nongreentea
+
 package runtime
 
 import "internal/runtime/atomic"
+
+// logosFractionalGoal is the fractional utilization goal storage. The active
+// pacer shares the atomic implementation with the upstream controller: raises
+// publish it from any P while the scheduler loads it.
+type logosFractionalGoal = atomic.Float64
 
 // Elastic background marking (M19-S2, SPEC Sec 19, T-301.2). Under the
 // greentea collector the background mark utilization follows the PLAN curve

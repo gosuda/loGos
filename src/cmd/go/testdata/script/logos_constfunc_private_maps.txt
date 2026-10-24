@@ -1,0 +1,569 @@
+# M5-S4: private-owner const-map consumer coverage (SPEC T-Sec9).
+# Anchor: Tony Hoare, Richard Feynman
+#
+# Offline multi-module cases for both const-map lowerings with
+# owner-private construction:
+# 1. Small (5-key, switch path) single-owner map with a private struct key
+#    carrying unexported fields and a private value with unexported fields
+#    plus a nested named type, consumed through inference only.
+# 2. Big (12-key, perfect-hash path) single-owner map with a private array
+#    key over that struct and the same private value shape.
+# 3. Mixed-owner maps produced by a third package (keys from ownera, values
+#    from ownerb) in both small (5-key) and big (11-key) sizes.
+# All constructors called during CTFE are const funcs; no method runs
+# inside CTFE. Methods run only at runtime to prove nominal identity.
+# Query keys come from exported const-function constructors, so the
+# consumer never names a private type. Checks cover hit/miss through
+# const lookup wrappers, comma-ok and ?? at runtime, constant len with
+# array bounds, exact sorted key sequences via exported runtime key
+# accessors, and materialized-copy isolation.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+# 1. Consumer module evaluates imported const funcs at compile time.
+cd consumer
+logos run .
+cp stdout $WORK/want.txt
+stdout '^privmap-small-const: hit=40 miss=-1 mut=999 after=40 len=5$'
+stdout '^privmap-small-commaok: b=20,true d=40,true z=false$'
+stdout '^privmap-small-coalesce: hit=40 miss=20$'
+stdout '^privmap-small-method: label=b code=2 doubled=40 note=beta tally=2$'
+stdout '^privmap-small-order: 1a,2b,3c,4d,5e$'
+stdout '^privmap-small-copy: m1=40 const=20 hit-ok=true miss-ok=false$'
+stdout '^privmap-types: map\[own\.privateKey\]own\.privateVal map\[\[2\]own\.privateKey\]own\.privateVal$'
+stdout '^privmap-tally-type: ownerb\.Tally 2$'
+stdout '^privmap-big-const: hit=120 miss=-1 mut=999 after=120 len=12$'
+stdout '^privmap-big-commaok: k6=60,true k12=120,true miss=false$'
+stdout '^privmap-big-coalesce: hit=120 miss=60$'
+stdout '^privmap-big-method: hit=120 alt=240$'
+stdout '^privmap-big-order: 1a/1a,1a/1b,1a/2b,1a/9z,1b/9z,2a/1z,2b/1a,2b/2b,2b/3c,3a/1a,3c/1a,3c/3c$'
+stdout '^privmap-mixed-const: small-hit=40 small-miss=-1 small-mut=999 small-after=40 big-hit=140 big-miss=-1 big-mut=999 big-after=140$'
+stdout '^privmap-mixed-lens: 5 11$'
+stdout '^privmap-mixed-commaok: small-b=20,true big-g=70,true small-miss=false big-miss=false$'
+stdout '^privmap-mixed-coalesce: hit=140 miss=20$'
+stdout '^privmap-mixed-method: small-label=b small-doubled=40 small-note=mbeta big-label=g big-doubled=140 big-tally=7$'
+stdout '^privmap-mixed-order-small: 1a,2b,3c,4d,5e$'
+stdout '^privmap-mixed-order-big: 1a,2b,3c,4d,5e,6f,7g,8h,9i,10j,11k$'
+stdout '^privmap-mixed-copy: m1=40 const=20 hit-ok=true miss-ok=false$'
+stdout '^privmap-bounds: 5 12 5 11$'
+
+# 2. Eject consumer module to plain Go and verify parity.
+logos eject -o ../eject_out
+exists ../eject_out/main.go
+cd ../eject_out
+go run .
+cmp stdout $WORK/want.txt
+cd ../consumer
+cd ..
+
+-- lib/go.mod --
+module example.com/privmaplib
+
+go 1.27
+
+-- lib/own/own.lgo --
+package own
+
+// Single-owner private const maps: a 5-key struct-keyed map (switch
+// path) and a 12-key array-keyed map (perfect-hash path). Key and value
+// type names are package-private; only exported const constructors and
+// exported methods are visible outside this package.
+
+type privateKey struct {
+	code int
+	tag  string
+}
+
+func (k privateKey) Code() int {
+	return k.code
+}
+
+func (k privateKey) Label() string {
+	return k.tag
+}
+
+const func MakeKey(code int, tag string) privateKey {
+	return privateKey{code: code, tag: tag}
+}
+
+const func MakeArrKey(c1 int, t1 string, c2 int, t2 string) [2]privateKey {
+	return [2]privateKey{privateKey{code: c1, tag: t1}, privateKey{code: c2, tag: t2}}
+}
+
+type tallyCount int
+
+type privateVal struct {
+	weight int
+	note   string
+	tally  tallyCount
+}
+
+func (v privateVal) Weight() int {
+	return v.weight
+}
+
+func (v privateVal) Doubled() int {
+	return v.weight * 2
+}
+
+func (v privateVal) Note() string {
+	return v.note
+}
+
+func (v privateVal) Tally() int {
+	return int(v.tally)
+}
+
+const func MakeVal(weight int, note string, tally int) privateVal {
+	return privateVal{weight: weight, note: note, tally: tallyCount(tally)}
+}
+
+const func MakeSmall() map[privateKey]privateVal {
+	return map[privateKey]privateVal{
+		privateKey{code: 3, tag: "c"}: privateVal{weight: 30, note: "gamma", tally: tallyCount(3)},
+		privateKey{code: 1, tag: "a"}: privateVal{weight: 10, note: "alpha", tally: tallyCount(1)},
+		privateKey{code: 5, tag: "e"}: privateVal{weight: 50, note: "epsilon", tally: tallyCount(5)},
+		privateKey{code: 2, tag: "b"}: privateVal{weight: 20, note: "beta", tally: tallyCount(2)},
+		privateKey{code: 4, tag: "d"}: privateVal{weight: 40, note: "delta", tally: tallyCount(4)},
+	}
+}
+
+const func LookupSmall(m map[privateKey]privateVal, k privateKey) int {
+	entry, ok := m[k]
+	if ok {
+		return entry.weight * 2
+	}
+	return -1
+}
+
+const func TouchSmall(m map[privateKey]privateVal, k privateKey, w int) int {
+	m[k] = privateVal{weight: w, note: "touched", tally: tallyCount(99)}
+	entry, ok := m[k]
+	if ok {
+		return entry.weight
+	}
+	return 0
+}
+
+const func MakeBig() map[[2]privateKey]privateVal {
+	return map[[2]privateKey]privateVal{
+		[2]privateKey{privateKey{code: 2, tag: "b"}, privateKey{code: 3, tag: "c"}}: privateVal{weight: 30, note: "big-3", tally: tallyCount(3)},
+		[2]privateKey{privateKey{code: 3, tag: "c"}, privateKey{code: 1, tag: "a"}}: privateVal{weight: 10, note: "big-1", tally: tallyCount(1)},
+		[2]privateKey{privateKey{code: 3, tag: "c"}, privateKey{code: 3, tag: "c"}}: privateVal{weight: 50, note: "big-5", tally: tallyCount(5)},
+		[2]privateKey{privateKey{code: 1, tag: "a"}, privateKey{code: 2, tag: "b"}}: privateVal{weight: 20, note: "big-2", tally: tallyCount(2)},
+		[2]privateKey{privateKey{code: 1, tag: "a"}, privateKey{code: 1, tag: "a"}}: privateVal{weight: 40, note: "big-4", tally: tallyCount(4)},
+		[2]privateKey{privateKey{code: 1, tag: "b"}, privateKey{code: 9, tag: "z"}}: privateVal{weight: 70, note: "big-7", tally: tallyCount(7)},
+		[2]privateKey{privateKey{code: 2, tag: "b"}, privateKey{code: 1, tag: "a"}}: privateVal{weight: 60, note: "big-6", tally: tallyCount(6)},
+		[2]privateKey{privateKey{code: 2, tag: "a"}, privateKey{code: 1, tag: "z"}}: privateVal{weight: 90, note: "big-9", tally: tallyCount(9)},
+		[2]privateKey{privateKey{code: 1, tag: "a"}, privateKey{code: 9, tag: "z"}}: privateVal{weight: 80, note: "big-8", tally: tallyCount(8)},
+		[2]privateKey{privateKey{code: 1, tag: "a"}, privateKey{code: 1, tag: "b"}}: privateVal{weight: 110, note: "big-11", tally: tallyCount(11)},
+		[2]privateKey{privateKey{code: 3, tag: "a"}, privateKey{code: 1, tag: "a"}}: privateVal{weight: 100, note: "big-10", tally: tallyCount(10)},
+		[2]privateKey{privateKey{code: 2, tag: "b"}, privateKey{code: 2, tag: "b"}}: privateVal{weight: 120, note: "big-12", tally: tallyCount(12)},
+	}
+}
+
+const func LookupBig(m map[[2]privateKey]privateVal, k [2]privateKey) int {
+	entry, ok := m[k]
+	if ok {
+		return entry.weight * 2
+	}
+	return -1
+}
+
+const func TouchBig(m map[[2]privateKey]privateVal, k [2]privateKey, w int) int {
+	m[k] = privateVal{weight: w, note: "touched", tally: tallyCount(99)}
+	entry, ok := m[k]
+	if ok {
+		return entry.weight
+	}
+	return 0
+}
+
+-- lib/ownera/ownera.lgo --
+package ownera
+
+// Key owner for the mixed-owner maps. The name is exported so the third
+// package can spell the map type, but every field is unexported: keys
+// are built only through the const constructor below.
+
+type Key struct {
+	code int
+	tag  string
+}
+
+func (k Key) Code() int {
+	return k.code
+}
+
+func (k Key) Label() string {
+	return k.tag
+}
+
+const func MakeKey(code int, tag string) Key {
+	return Key{code: code, tag: tag}
+}
+
+-- lib/ownerb/ownerb.lgo --
+package ownerb
+
+// Value owner for the mixed-owner maps. The names are exported so the
+// third package can spell the map type, but every field is unexported,
+// including the nested named tally type: values are built only through
+// the const constructor below.
+
+type Tally int
+
+type Val struct {
+	weight int
+	note   string
+	tally  Tally
+}
+
+func (v Val) Weight() int {
+	return v.weight
+}
+
+func (v Val) Doubled() int {
+	return v.weight * 2
+}
+
+func (v Val) Note() string {
+	return v.note
+}
+
+func (v Val) Tally() int {
+	return int(v.tally)
+}
+
+const func MakeVal(weight int, note string, tally int) Val {
+	return Val{weight: weight, note: note, tally: Tally(tally)}
+}
+
+const func WeightOf(v Val) int {
+	return v.weight
+}
+
+const func DoubledOf(v Val) int {
+	return v.weight * 2
+}
+
+const func TallyOf(v Val) Tally {
+	return v.tally
+}
+
+-- lib/mix/mix.lgo --
+package mix
+
+import (
+	"example.com/privmaplib/ownera"
+	"example.com/privmaplib/ownerb"
+)
+
+// Mixed-owner const maps produced by a third package: keys owned by
+// ownera, values owned by ownerb. Both small (5-key, switch path) and
+// big (11-key, perfect-hash path) sizes. Package-level key/value consts
+// come from exported const constructors; the map literals below name
+// only those consts, never an unexported field.
+
+const (
+	KAlpha   = ownera.MakeKey(1, "a")
+	KBeta    = ownera.MakeKey(2, "b")
+	KGamma   = ownera.MakeKey(3, "c")
+	KDelta   = ownera.MakeKey(4, "d")
+	KEpsilon = ownera.MakeKey(5, "e")
+
+	VAlpha   = ownerb.MakeVal(10, "malpha", 1)
+	VBeta    = ownerb.MakeVal(20, "mbeta", 2)
+	VGamma   = ownerb.MakeVal(30, "mgamma", 3)
+	VDelta   = ownerb.MakeVal(40, "mdelta", 4)
+	VEpsilon = ownerb.MakeVal(50, "mepsilon", 5)
+
+	B1  = ownera.MakeKey(1, "a")
+	B2  = ownera.MakeKey(2, "b")
+	B3  = ownera.MakeKey(3, "c")
+	B4  = ownera.MakeKey(4, "d")
+	B5  = ownera.MakeKey(5, "e")
+	B6  = ownera.MakeKey(6, "f")
+	B7  = ownera.MakeKey(7, "g")
+	B8  = ownera.MakeKey(8, "h")
+	B9  = ownera.MakeKey(9, "i")
+	B10 = ownera.MakeKey(10, "j")
+	B11 = ownera.MakeKey(11, "k")
+
+	W1  = ownerb.MakeVal(10, "w1", 1)
+	W2  = ownerb.MakeVal(20, "w2", 2)
+	W3  = ownerb.MakeVal(30, "w3", 3)
+	W4  = ownerb.MakeVal(40, "w4", 4)
+	W5  = ownerb.MakeVal(50, "w5", 5)
+	W6  = ownerb.MakeVal(60, "w6", 6)
+	W7  = ownerb.MakeVal(70, "w7", 7)
+	W8  = ownerb.MakeVal(80, "w8", 8)
+	W9  = ownerb.MakeVal(90, "w9", 9)
+	W10 = ownerb.MakeVal(100, "w10", 10)
+	W11 = ownerb.MakeVal(110, "w11", 11)
+)
+
+const func MakeMixedSmall() map[ownera.Key]ownerb.Val {
+	return map[ownera.Key]ownerb.Val{
+		KGamma:   VGamma,
+		KAlpha:   VAlpha,
+		KEpsilon: VEpsilon,
+		KBeta:    VBeta,
+		KDelta:   VDelta,
+	}
+}
+
+const func MakeMixedBig() map[ownera.Key]ownerb.Val {
+	return map[ownera.Key]ownerb.Val{
+		B7:  W7,
+		B3:  W3,
+		B11: W11,
+		B1:  W1,
+		B9:  W9,
+		B5:  W5,
+		B2:  W2,
+		B10: W10,
+		B4:  W4,
+		B8:  W8,
+		B6:  W6,
+	}
+}
+
+const func LookupMixed(m map[ownera.Key]ownerb.Val, k ownera.Key) int {
+	entry, ok := m[k]
+	if ok {
+		return ownerb.DoubledOf(entry)
+	}
+	return -1
+}
+
+const func TouchMixed(m map[ownera.Key]ownerb.Val, k ownera.Key, w int) int {
+	m[k] = ownerb.MakeVal(w, "touched", 99)
+	entry, ok := m[k]
+	if ok {
+		return ownerb.WeightOf(entry)
+	}
+	return 0
+}
+
+const BetaTally = ownerb.TallyOf(VBeta)
+
+-- consumer/go.mod --
+module example.com/privmapconsumer
+
+go 1.27
+
+require example.com/privmaplib v0.0.0
+
+replace example.com/privmaplib => ../lib
+
+-- consumer/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/privmaplib/mix"
+	"example.com/privmaplib/own"
+	"example.com/privmaplib/ownera"
+)
+
+// Const initializers force compile-time evaluation of the imported const
+// funcs. Query keys come from exported const constructors; no private
+// type is ever named here.
+const (
+	SmallMap = own.MakeSmall()
+	BigMap   = own.MakeBig()
+
+	MixedSmallMap = mix.MakeMixedSmall()
+	MixedBigMap   = mix.MakeMixedBig()
+
+	BetaTally = mix.BetaTally
+
+	QSmallHit  = own.MakeKey(2, "b")
+	QSmallAlt  = own.MakeKey(4, "d")
+	QSmallMiss = own.MakeKey(9, "z")
+
+	QBigHit  = own.MakeArrKey(2, "b", 1, "a")
+	QBigAlt  = own.MakeArrKey(2, "b", 2, "b")
+	QBigMiss = own.MakeArrKey(9, "z", 9, "z")
+
+	QMixSmallHit  = ownera.MakeKey(2, "b")
+	QMixSmallAlt  = ownera.MakeKey(4, "d")
+	QMixSmallMiss = ownera.MakeKey(9, "z")
+	QMixBigHit    = ownera.MakeKey(7, "g")
+	QMixBigMiss   = ownera.MakeKey(99, "zz")
+
+	HitSmall   = own.LookupSmall(SmallMap, QSmallHit)
+	MissSmall  = own.LookupSmall(SmallMap, QSmallMiss)
+	MutSmall   = own.TouchSmall(SmallMap, QSmallHit, 999)
+	AfterSmall = own.LookupSmall(SmallMap, QSmallHit)
+	SmallLen   = len(SmallMap)
+
+	HitBig   = own.LookupBig(BigMap, QBigHit)
+	MissBig  = own.LookupBig(BigMap, QBigMiss)
+	MutBig   = own.TouchBig(BigMap, QBigHit, 999)
+	AfterBig = own.LookupBig(BigMap, QBigHit)
+	BigLen   = len(BigMap)
+
+	HitMixSmall   = mix.LookupMixed(MixedSmallMap, QMixSmallHit)
+	MissMixSmall  = mix.LookupMixed(MixedSmallMap, QMixSmallMiss)
+	MutMixSmall   = mix.TouchMixed(MixedSmallMap, QMixSmallHit, 999)
+	AfterMixSmall = mix.LookupMixed(MixedSmallMap, QMixSmallHit)
+	MixSmallLen   = len(MixedSmallMap)
+
+	HitMixBig   = mix.LookupMixed(MixedBigMap, QMixBigHit)
+	MissMixBig  = mix.LookupMixed(MixedBigMap, QMixBigMiss)
+	MutMixBig   = mix.TouchMixed(MixedBigMap, QMixBigHit, 999)
+	AfterMixBig = mix.LookupMixed(MixedBigMap, QMixBigHit)
+	MixBigLen   = len(MixedBigMap)
+)
+
+// Constant array bounds prove compile-time integer constant semantics
+// for each const-map length.
+type (
+	SmallBound    [SmallLen]byte
+	BigBound      [BigLen]byte
+	MixSmallBound [MixSmallLen]byte
+	MixBigBound   [MixBigLen]byte
+)
+
+func checkSmallConst() {
+	fmt.Printf("privmap-small-const: hit=%d miss=%d mut=%d after=%d len=%d\n",
+		HitSmall, MissSmall, MutSmall, AfterSmall, SmallLen)
+}
+
+func checkSmallRuntime() {
+	aHit, okHit := SmallMap[QSmallHit]
+	aAlt, okAlt := SmallMap[QSmallAlt]
+	_, okMiss := SmallMap[QSmallMiss]
+	fmt.Printf("privmap-small-commaok: b=%d,%t d=%d,%t z=%t\n",
+		aHit.Weight(), okHit, aAlt.Weight(), okAlt, okMiss)
+
+	coalHit, _ := SmallMap[QSmallAlt]
+	coalMiss := SmallMap[QSmallMiss] ?? aHit
+	fmt.Printf("privmap-small-coalesce: hit=%d miss=%d\n",
+		coalHit.Weight(), coalMiss.Weight())
+
+	fmt.Printf("privmap-small-method: label=%s code=%d doubled=%d note=%s tally=%d\n",
+		QSmallHit.Label(), QSmallHit.Code(), aHit.Doubled(), aHit.Note(), aHit.Tally())
+
+	order := ""
+	for k := range SmallMap {
+		if order != "" {
+			order += ","
+		}
+		order += fmt.Sprintf("%d%s", k.Code(), k.Label())
+	}
+	fmt.Printf("privmap-small-order: %s\n", order)
+
+	m1 := SmallMap
+	m1[QSmallHit] = aAlt
+	m1[QSmallMiss] = aAlt
+	still, okStill := SmallMap[QSmallHit]
+	_, okGone := SmallMap[QSmallMiss]
+	copyHit, _ := m1[QSmallHit]
+	fmt.Printf("privmap-small-copy: m1=%d const=%d hit-ok=%t miss-ok=%t\n",
+		copyHit.Weight(), still.Weight(), okStill, okGone)
+
+	fmt.Printf("privmap-types: %T %T\n", SmallMap, BigMap)
+	fmt.Printf("privmap-tally-type: %T %d\n", BetaTally, BetaTally)
+}
+
+func checkBigConst() {
+	fmt.Printf("privmap-big-const: hit=%d miss=%d mut=%d after=%d len=%d\n",
+		HitBig, MissBig, MutBig, AfterBig, BigLen)
+}
+
+func checkBigRuntime() {
+	bHit, okHit := BigMap[QBigHit]
+	bAlt, okAlt := BigMap[QBigAlt]
+	_, okMiss := BigMap[QBigMiss]
+	fmt.Printf("privmap-big-commaok: k6=%d,%t k12=%d,%t miss=%t\n",
+		bHit.Weight(), okHit, bAlt.Weight(), okAlt, okMiss)
+
+	coalHit := BigMap[QBigAlt] ?? bHit
+	coalMiss := BigMap[QBigMiss] ?? bHit
+	fmt.Printf("privmap-big-coalesce: hit=%d miss=%d\n",
+		coalHit.Weight(), coalMiss.Weight())
+
+	fmt.Printf("privmap-big-method: hit=%d alt=%d\n",
+		bHit.Doubled(), bAlt.Doubled())
+
+	order := ""
+	for k := range BigMap {
+		if order != "" {
+			order += ","
+		}
+		order += fmt.Sprintf("%d%s/%d%s", k[0].Code(), k[0].Label(), k[1].Code(), k[1].Label())
+	}
+	fmt.Printf("privmap-big-order: %s\n", order)
+}
+
+func checkMixedConst() {
+	fmt.Printf("privmap-mixed-const: small-hit=%d small-miss=%d small-mut=%d small-after=%d big-hit=%d big-miss=%d big-mut=%d big-after=%d\n",
+		HitMixSmall, MissMixSmall, MutMixSmall, AfterMixSmall,
+		HitMixBig, MissMixBig, MutMixBig, AfterMixBig)
+	fmt.Printf("privmap-mixed-lens: %d %d\n", MixSmallLen, MixBigLen)
+}
+
+func checkMixedRuntime() {
+	sHit, okSHit := MixedSmallMap[QMixSmallHit]
+	sAlt, _ := MixedSmallMap[QMixSmallAlt]
+	_, okSMiss := MixedSmallMap[QMixSmallMiss]
+	bHit, okBHit := MixedBigMap[QMixBigHit]
+	_, okBMiss := MixedBigMap[QMixBigMiss]
+	fmt.Printf("privmap-mixed-commaok: small-b=%d,%t big-g=%d,%t small-miss=%t big-miss=%t\n",
+		sHit.Weight(), okSHit, bHit.Weight(), okBHit, okSMiss, okBMiss)
+
+	coalMiss := MixedBigMap[QMixBigMiss] ?? sHit
+	coalHit, _ := MixedBigMap[QMixBigHit]
+	fmt.Printf("privmap-mixed-coalesce: hit=%d miss=%d\n",
+		coalHit.Doubled(), coalMiss.Weight())
+
+	fmt.Printf("privmap-mixed-method: small-label=%s small-doubled=%d small-note=%s big-label=%s big-doubled=%d big-tally=%d\n",
+		QMixSmallHit.Label(), sHit.Doubled(), sHit.Note(), QMixBigHit.Label(), bHit.Doubled(), bHit.Tally())
+
+	smallOrder := ""
+	for k := range MixedSmallMap {
+		if smallOrder != "" {
+			smallOrder += ","
+		}
+		smallOrder += fmt.Sprintf("%d%s", k.Code(), k.Label())
+	}
+	fmt.Printf("privmap-mixed-order-small: %s\n", smallOrder)
+
+	bigOrder := ""
+	for k := range MixedBigMap {
+		if bigOrder != "" {
+			bigOrder += ","
+		}
+		bigOrder += fmt.Sprintf("%d%s", k.Code(), k.Label())
+	}
+	fmt.Printf("privmap-mixed-order-big: %s\n", bigOrder)
+
+	m1 := MixedSmallMap
+	m1[QMixSmallHit] = sAlt
+	m1[QMixSmallMiss] = sAlt
+	still, okStill := MixedSmallMap[QMixSmallHit]
+	_, okGone := MixedSmallMap[QMixSmallMiss]
+	copyHit, _ := m1[QMixSmallHit]
+	fmt.Printf("privmap-mixed-copy: m1=%d const=%d hit-ok=%t miss-ok=%t\n",
+		copyHit.Weight(), still.Weight(), okStill, okGone)
+}
+
+func checkBounds() {
+	fmt.Printf("privmap-bounds: %d %d %d %d\n",
+		len(SmallBound{}), len(BigBound{}), len(MixSmallBound{}), len(MixBigBound{}))
+}
+
+func main() {
+	checkSmallConst()
+	checkSmallRuntime()
+	checkBigConst()
+	checkBigRuntime()
+	checkMixedConst()
+	checkMixedRuntime()
+	checkBounds()
+}

@@ -163,6 +163,8 @@ func insertLoopReschedChecks(f *Func) {
 	}
 
 	// Rewrite backedges to include reschedule checks.
+	stride := logosLoopStride(f)
+	counters := logosLoopCounters(f, tofixBackedges, stride)
 	for _, emc := range tofixBackedges {
 		e := emc.e
 		headerMemPhi := emc.m
@@ -217,17 +219,24 @@ func insertLoopReschedChecks(f *Func) {
 		// goto header
 
 		cfgtypes := &f.Config.Types
-		pt := cfgtypes.Uintptr
-		g := test.NewValue1(bb.Pos, OpGetG, pt, mem0)
-		sp := test.NewValue0(bb.Pos, OpSP, pt)
-		cmpOp := OpLess64U
-		if pt.Size() == 4 {
-			cmpOp = OpLess32U
+		// The counted guard replaces this control below; build the
+		// upstream check for every edge that keeps it, including
+		// edges the counter cannot count (see logosLoopCounters and
+		// logosHeaderDominates).
+		ctr0 := counters[h]
+		useStride := ctr0 != nil && logosHeaderDominates(idom, h, bb)
+		if !useStride {
+			pt := cfgtypes.Uintptr
+			g := test.NewValue1(bb.Pos, OpGetG, pt, mem0)
+			sp := test.NewValue0(bb.Pos, OpSP, pt)
+			cmpOp := OpLess64U
+			if pt.Size() == 4 {
+				cmpOp = OpLess32U
+			}
+			limaddr := test.NewValue1I(bb.Pos, OpOffPtr, pt, 2*pt.Size(), g)
+			lim := test.NewValue2(bb.Pos, OpLoad, pt, limaddr, mem0)
+			test.SetControl(test.NewValue2(bb.Pos, cmpOp, cfgtypes.Bool, sp, lim))
 		}
-		limaddr := test.NewValue1I(bb.Pos, OpOffPtr, pt, 2*pt.Size(), g)
-		lim := test.NewValue2(bb.Pos, OpLoad, pt, limaddr, mem0)
-		cmp := test.NewValue2(bb.Pos, cmpOp, cfgtypes.Bool, sp, lim)
-		test.SetControl(cmp)
 
 		// if true, goto sched
 		test.AddEdgeTo(sched)
@@ -260,6 +269,9 @@ func insertLoopReschedChecks(f *Func) {
 			if v.Op == OpPhi && v != headerMemPhi {
 				v.AddArg(v.Args[i])
 			}
+		}
+		if useStride {
+			logosLoopStrideGate(f, ctr0, test, sched, i)
 		}
 	}
 

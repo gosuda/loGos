@@ -239,8 +239,8 @@ func TestInlayUnknownFile(t *testing.T) {
 	}
 }
 
-// TestHoverLoweredSites checks the hover of `?`, `const switch T`, and
-// `$"..."`: the lowered code of the site (SPEC Sec 21.3).
+// TestHoverLoweredSites checks the hover of `?`, `const for`, `const switch T`,
+// and `$"..."`: the lowered code of the site (SPEC Sec 21.3).
 func TestHoverLoweredSites(t *testing.T) {
 	f := compilerFixture(t, "sites.lgo")
 	r, _ := compileHints(t, f)
@@ -251,6 +251,7 @@ func TestHoverLoweredSites(t *testing.T) {
 		inCode []string
 	}{
 		{"try", startOf(t, f.src, "?\n\t_ = n"), "`?`", []string{"get()", "!= nil", "return"}},
+		{"const for", startOf(t, f.src, "const for"), "`const for`", []string{`out = append(out, "Name")`}},
 		{"const switch", startOf(t, f.src, "const switch"), "`const switch`", []string{"switch"}},
 		{"interpolation", startOf(t, f.src, `$"user {name}!"`), "`$\"...\"`", []string{"make([]byte, 0, 6+len("}},
 	} {

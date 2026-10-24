@@ -99,6 +99,19 @@ func TestScopeDeferOpenCoded(t *testing.T) {
 	}
 }
 
+// TestScopeReturnMultiResultEject pins the eject twin of a multi-result
+// return under a scope defer: each result mark spans the whole source
+// expression, so `return pair()` keeps its call parentheses in the
+// ejected text (`a, b = pair()`) and stays valid Go, matching the tree
+// the native lowering prints.
+func TestScopeReturnMultiResultEject(t *testing.T) {
+	src := "package main\n\nimport \"log/slog\"\n\nfunc note(s string) { slog.Info(s) }\n\nfunc pair() (int, int) { return 1, 2 }\n\nfunc f() (a, b int) {\n\t{\n\t\tscope defer note(\"cleanup\")\n\t\treturn pair()\n\t}\n\treturn\n}\n"
+	out := lowerSnippetSrc(t, "scopemultiret.lgo", src)
+	if !strings.Contains(out, "a, b = pair()") {
+		t.Errorf("ejected text lost the call parentheses:\n%s", out)
+	}
+}
+
 // TestChainSumPairwise proves SPEC #67 (M6 half): the sum terminal
 // lowers to a fixed pairwise recursion over halves, with no multiply
 // operator anywhere, so no implicit FMA contraction can apply. The

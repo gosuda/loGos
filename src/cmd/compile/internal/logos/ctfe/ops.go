@@ -94,6 +94,10 @@ func (e *evaluator) evalLit(lit *syntax.BasicLit) (Value, error) {
 		s := lit.Value
 		if strings.HasPrefix(s, "`") {
 			s = s[1 : len(s)-1]
+			// Go discards carriage returns in raw literals; the
+			// scanner preserves them, so normalize here. The
+			// interpreted branch keeps CRLF via Unquote.
+			s = strings.ReplaceAll(s, "\r", "")
 		} else {
 			u, err := strconv.Unquote(s)
 			if err != nil {
@@ -449,37 +453,99 @@ func (e *evaluator) shift(op syntax.Operator, x, y Value, pos syntax.Pos) (Value
 	if y.ival.Sign() < 0 {
 		return Value{}, e.fail(pos, "negative shift count in const evaluation")
 	}
+	// Shift keeps the left operand independent of the count type: Go
+	// never coerces the LHS to the count's type. A constant count
+	// (typed or not) keeps a constant shift, so an untyped LHS stays
+	// untyped and `1 << uint8(8)` is the untyped constant 256. Only a
+	// non-constant typed count defaults the LHS, to its default type
+	// (the type it would assume if the shift were replaced by the LHS
+	// alone), never to the count type.
+	xk, yk := kindOf(x), kindOf(y)
 	t := x.typ
-	if isUntyped(kindOf(x)) && isUntyped(kindOf(y)) {
-		t = UntypedInt()
-	} else if isUntyped(kindOf(x)) {
-		var err error
-		x, err = e.coerceUntyped(x, y.typ, pos)
-		if err != nil {
-			return Value{}, err
+	if isUntyped(xk) {
+		switch {
+		case isUntyped(yk):
+			t = UntypedInt()
+		case y.constant:
+			t = x.typ
+		default:
+			t = defaulted(x).typ
 		}
-		t = y.typ
 	}
+	cst := x.constant && y.constant
 	n := y.ival
-	if !n.IsUint64() {
-		// Huge counts shift everything out; model as zero/one-fill.
+	if !n.IsUint64() || n.Uint64() > uint64(^uint(0)) {
+		// Huge counts shift everything out; model as zero/sign-fill.
 		if op == syntax.Shl {
-			return e.finishInt(new(big.Int), t, x.constant && y.constant, pos)
+			if x.ival.Sign() == 0 {
+				return e.finishInt(new(big.Int), t, cst, pos)
+			}
+			if !isUntyped(t.Kind) {
+				if cst {
+					return Value{}, e.fail(pos, "constant shift result overflows %s in const evaluation", typeName(t))
+				}
+				return e.finishInt(new(big.Int), t, cst, pos)
+			}
+			return Value{}, &Error{Code: CodeTooLarge, Detail: fmt.Sprintf("shift result over %d byte limit", e.cfg.MaxValueBytes), Pos: pos}
 		}
-		if isSigned(t.Kind) && x.ival.Sign() < 0 {
-			return e.finishInt(new(big.Int).SetInt64(-1), t, x.constant && y.constant, pos)
+		if (isSigned(t.Kind) || isUntyped(t.Kind)) && x.ival.Sign() < 0 {
+			return e.finishInt(big.NewInt(-1), t, cst, pos)
 		}
-		return e.finishInt(new(big.Int), t, x.constant && y.constant, pos)
+		return e.finishInt(new(big.Int), t, cst, pos)
 	}
-	r := new(big.Int)
+	n64 := n.Uint64()
 	if op == syntax.Shl {
-		r.Lsh(x.ival, uint(n.Uint64()))
-	} else if isSigned(t.Kind) {
-		r.Rsh(x.ival, uint(n.Uint64()))
-	} else {
-		r.Rsh(unsigned(x.ival, t, e.cfg.WordSize), uint(n.Uint64()))
+		if x.ival.Sign() == 0 {
+			return e.finishInt(new(big.Int), t, cst, pos)
+		}
+		if !isUntyped(t.Kind) {
+			if w := intWidth(t.Kind, e.cfg.WordSize); w > 0 && n64 >= uint64(w) {
+				if cst {
+					return Value{}, e.fail(pos, "constant shift result overflows %s in const evaluation", typeName(t))
+				}
+				return e.finishInt(new(big.Int), t, cst, pos)
+			}
+		} else if e.cfg.MaxValueBytes > 0 {
+			limit := uint64(e.cfg.MaxValueBytes)
+			xBits := uint64(x.ival.BitLen())
+			sum := xBits + n64
+			if sum < n64 {
+				return Value{}, &Error{
+					Code:   CodeTooLarge,
+					Detail: fmt.Sprintf("shift result over %d byte limit", e.cfg.MaxValueBytes),
+					Pos:    pos,
+				}
+			}
+			bytes := sum / 8
+			if sum%8 != 0 {
+				bytes++
+			}
+			if bytes > limit {
+				return Value{}, &Error{
+					Code:   CodeTooLarge,
+					Detail: fmt.Sprintf("shift result over %d byte limit", e.cfg.MaxValueBytes),
+					Pos:    pos,
+				}
+			}
+		}
+		return e.finishInt(new(big.Int).Lsh(x.ival, uint(n64)), t, cst, pos)
 	}
-	return e.finishInt(r, t, x.constant && y.constant, pos)
+	if !isUntyped(t.Kind) {
+		// A wrapped value shifted by its whole width or more leaves
+		// only the sign fill for negative signed values, else zero.
+		if w := intWidth(t.Kind, e.cfg.WordSize); w > 0 && n64 >= uint64(w) {
+			if isSigned(t.Kind) && x.ival.Sign() < 0 {
+				return e.finishInt(big.NewInt(-1), t, cst, pos)
+			}
+			return e.finishInt(new(big.Int), t, cst, pos)
+		}
+	}
+	if isSigned(t.Kind) || isUntyped(t.Kind) {
+		// Arithmetic shift: big.Int.Rsh implements arithmetic right shift
+		// on both signed typed ints and untyped constants.
+		return e.finishInt(new(big.Int).Rsh(x.ival, uint(n64)), t, cst, pos)
+	}
+	return e.finishInt(new(big.Int).Rsh(unsigned(x.ival, t, e.cfg.WordSize), uint(n64)), t, cst, pos)
 }
 
 // unsigned reinterprets a wrapped value's bits as unsigned for logical
@@ -550,6 +616,9 @@ func xFloat(v Value) *big.Rat {
 	if v.fval != nil {
 		return v.fval
 	}
+	if v.ival != nil {
+		return new(big.Rat).SetInt(v.ival)
+	}
 	if v.typ != nil && v.typ.Kind == KFloat32 {
 		return new(big.Rat).SetFloat64(float64(float32(v.f64)))
 	}
@@ -559,15 +628,35 @@ func xFloat(v Value) *big.Rat {
 // yFloat mirrors xFloat for the second operand.
 func yFloat(v Value) *big.Rat { return xFloat(v) }
 
+// ratOf returns the exact rational value of a numeric constant: ints as
+// integers, floats as their literal rationals. Callers ensure both
+// operands are constant.
+func ratOf(v Value) *big.Rat {
+	if v.fval != nil {
+		return v.fval
+	}
+	if v.ival != nil {
+		return new(big.Rat).SetInt(v.ival)
+	}
+	return new(big.Rat).SetFloat64(v.f64)
+}
+
 func toFloat64(v Value, t *Type) float64 {
 	if v.fval != nil {
 		f, _ := v.fval.Float64()
-		if t.Kind == KFloat32 {
+		if t != nil && t.Kind == KFloat32 {
 			return float64(float32(f))
 		}
 		return f
 	}
-	if t.Kind == KFloat32 {
+	if v.ival != nil {
+		f, _ := new(big.Rat).SetInt(v.ival).Float64()
+		if t != nil && t.Kind == KFloat32 {
+			return float64(float32(f))
+		}
+		return f
+	}
+	if t != nil && t.Kind == KFloat32 {
 		return float64(float32(v.f64))
 	}
 	return v.f64
@@ -640,6 +729,12 @@ func (e *evaluator) compare(op syntax.Operator, x, y Value, pos syntax.Pos) (Val
 			c = xFloat(fx).Cmp(yFloat(fy))
 		} else {
 			ax, ay := toFloat64(fx, t), toFloat64(fy, t)
+			// Unordered (either NaN) is false for every ordered
+			// comparison; without this, c stays 0 and <=/>=
+			// wrongly report true for NaN.
+			if math.IsNaN(ax) || math.IsNaN(ay) {
+				return Value{typ: UntypedBool(), constant: false, bval: false}, nil
+			}
 			switch {
 			case ax < ay:
 				c = -1
@@ -684,7 +779,39 @@ func (e *evaluator) equal(x, y Value, pos syntax.Pos) (bool, error) {
 	switch {
 	case isInteger(kindOf(x)) && isInteger(kindOf(y)):
 		return x.ival.Cmp(y.ival) == 0, nil
-	case isFloat(kindOf(x)) && isFloat(kindOf(y)):
+	case isNumeric(kindOf(x)) && isNumeric(kindOf(y)) && (isFloat(kindOf(x)) || isFloat(kindOf(y))):
+		// Mixed int/float equality: coerce like ordered comparisons.
+		// When exactly one side is an untyped constant, Go converts
+		// it to the typed side's type first, so float64(0.1) == 0.1
+		// compares the rounded values (true). Coercion errors
+		// propagate; there is no fallback comparison.
+		// Both-untyped constants compare as exact rationals so
+		// distinct literals (1 vs 1.000...01, 0.1 vs 0.100...01)
+		// stay unequal; variable operands use IEEE 754 (NaN != self).
+		if isUntyped(kindOf(x)) != isUntyped(kindOf(y)) {
+			cx, cy, _, err := e.numPair(x, y, pos)
+			if err != nil {
+				return false, err
+			}
+			x, y = cx, cy
+		}
+		if x.constant && y.constant {
+			return ratOf(x).Cmp(ratOf(y)) == 0, nil
+		}
+		if isInteger(kindOf(x)) && !isFloat(kindOf(x)) {
+			xf, yf, t, err := e.numPair(x, y, pos)
+			if err != nil {
+				return false, err
+			}
+			return toFloat64(xf, t) == toFloat64(yf, t), nil
+		}
+		if isInteger(kindOf(y)) && !isFloat(kindOf(y)) {
+			xf, yf, t, err := e.numPair(x, y, pos)
+			if err != nil {
+				return false, err
+			}
+			return toFloat64(xf, t) == toFloat64(yf, t), nil
+		}
 		return x.Float64() == y.Float64(), nil
 	case isStringLike(kindOf(x)) && isStringLike(kindOf(y)):
 		return x.sval == y.sval, nil

@@ -21,8 +21,12 @@ exec $WORK/guse$GOEXE
 stdout '^port=0 host=!$'
 cd ..
 
-# Case 3: the compiler archive carries the default records.
-go tool compile -p example.com/lmod/cfg -o $WORK/cfg.a lmod/cfg/cfg.lgo
+# Case 3: the compiler archive carries the default records. The archive
+# comes from the normal build pipeline: raw go tool compile cannot
+# resolve the serializer imports a defaults-bearing struct now needs.
+cd lmod
+logos build -buildmode=archive -o $WORK/cfg.a ./cfg
+cd ..
 go run gmod/dumpfacts.go $WORK/cfg.a
 stdout '^default Cfg Host 11$'
 stdout '^default Cfg Port 4$'

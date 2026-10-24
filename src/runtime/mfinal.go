@@ -453,11 +453,15 @@ func SetFinalizer(obj any, finalizer any) {
 		return
 	}
 
+	// Canonicalize before offset math: under colors a stale or colored
+	// word resolves through the forwarding table and is unmasked first.
+	cdata := logosZgcAttachSpecial(e.data)
+
 	// find the containing object
-	base, span, _ := findObject(uintptr(e.data), 0, 0)
+	base, span := zgcAttachResolve(cdata)
 
 	if base == 0 {
-		if isGoPointerWithoutSpan(e.data) {
+		if isGoPointerWithoutSpan(cdata) {
 			return
 		}
 		throw("runtime.SetFinalizer: pointer not in allocated block")
@@ -468,7 +472,7 @@ func SetFinalizer(obj any, finalizer any) {
 		base += gc.MallocHeaderSize
 	}
 
-	if uintptr(e.data) != base {
+	if uintptr(cdata) != base {
 		// As an implementation detail we allow to set finalizers for an inner byte
 		// of an object if it could come from tiny alloc (see mallocgc for details).
 		if ot.Elem == nil || ot.Elem.Pointers() || ot.Elem.Size_ >= maxTinySize {
@@ -481,7 +485,7 @@ func SetFinalizer(obj any, finalizer any) {
 	if ftyp == nil {
 		// switch to system stack and remove finalizer
 		systemstack(func() {
-			removefinalizer(e.data)
+			removefinalizer(cdata)
 
 			if debug.checkfinalizers != 0 {
 				clearFinalizerContext(uintptr(e.data))
@@ -535,6 +539,10 @@ okarg:
 	createfing()
 
 	callerpc := sys.GetCallerPC()
+	// Copy the target into to-space while preemptible: addfinalizer runs
+	// on g0 inside systemstack, where the refill the copy may need must
+	// not run.
+	e.data = zgcAttachEnsureCopy(e.data)
 	systemstack(func() {
 		if !addfinalizer(e.data, (*funcval)(f.data), nret, fint, ot) {
 			throw("runtime.SetFinalizer: finalizer already set")

@@ -1,0 +1,137 @@
+# M11-R1/R2/R4: eject a module whose static JSON shares traversal state
+# within each package. main.Root nests its own Kids back to itself
+# (same-package cycle); dep Node cycles internally the same way. A dep
+# Node held by value and a dep Shout with a user MarshalJSON cover
+# acyclic cross-package use and honour precedence. Foreign generated
+# methods stay honour: no table crosses the package boundary. Native
+# and ejected output must match byte for byte, including both cycle
+# errors, and the tree must stay vet- and gofmt-clean.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+cd m
+
+# logos runs the module before eject.
+logos run .
+stdout '^flat: \{"title":"t","n":\{"name":"n"\},"s":"shout"\}$'
+stdout '^self: json: unsupported value: encountered a cycle via \*cycle\.Node$'
+stdout '^root: json: unsupported value: encountered a cycle via \*main\.Root$'
+stdout '^honour: \{"xs":\["shout"\]\}$'
+cp stdout $WORK/eject-stdout.txt
+
+# Eject the main module.
+logos eject -o out
+exists out/main.go
+exists out/go.mod
+exists out/_logos_deps/rt/go.mod
+exists out/_logos_deps/rt/json/walk.go
+exists out/_logos_deps/rt/json/walkfields.go
+exists out/_logos_deps/example.com/dep@v0.0.0/cycle/cycle.go
+
+# The ejected tree runs under plain go with identical output.
+cd out
+go run .
+cmp stdout $WORK/eject-stdout.txt
+cd ..
+
+# The ejected tree is vet- and gofmt-clean.
+cd out
+go vet ./...
+exec $GOROOT/bin/gofmt -l .
+! stdout .
+cd ..
+
+-- m/go.mod --
+module example.com/jsoncycle
+
+go 1.27
+
+require example.com/dep v0.0.0
+
+replace example.com/dep v0.0.0 => ../dep
+
+-- m/main.lgo --
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"example.com/dep/cycle"
+)
+
+// Root holds a foreign Node by value for acyclic cross-package use and
+// nests its own Kids for a same-package cycle: helpers and the Gen
+// table live in this package and share this root's Walk.
+type Root struct {
+	Title string     `json:"title"`
+	N     cycle.Node `json:"n"`
+	S     cycle.Shout `json:"s"`
+	Kids  []any      `json:"kids,omitempty"`
+}
+
+func printErr(label string, err error) {
+	if err == nil {
+		fmt.Println(label, "no error")
+		return
+	}
+	fmt.Println(label, err.Error())
+}
+
+func main() {
+	r := Root{Title: "t", N: cycle.Node{Name: "n"}, S: cycle.Shout{V: 1}}
+	buf, err := r.MarshalJSON()
+	if err != nil {
+		fmt.Println("flat error:", err)
+		return
+	}
+	fmt.Println("flat:", string(buf))
+
+	n := &cycle.Node{Name: "c"}
+	n.Next = n
+	_, err = n.MarshalJSON()
+	printErr("self:", err)
+
+	rr := &Root{Title: "x"}
+	rr.Kids = []any{rr}
+	_, err = rr.MarshalJSON()
+	printErr("root:", err)
+
+	h := struct {
+		Xs []any `json:"xs"`
+	}{Xs: []any{cycle.Shout{V: 2}}}
+	buf, err = json.Marshal(h)
+	if err != nil {
+		fmt.Println("honour error:", err)
+		return
+	}
+	fmt.Println("honour:", string(buf))
+}
+
+-- dep/go.mod --
+module example.com/dep
+
+go 1.27
+
+-- dep/cycle/cycle.lgo --
+package cycle
+
+// Node is a generated-side struct in its own package: its helpers and
+// table live here and share the caller's Walk. Foreign importers
+// honour it through a fresh encoding.
+type Node struct {
+	Name string `json:"name"`
+	Next *Node  `json:"next,omitempty"`
+	Kids []any  `json:"kids,omitempty"`
+}
+
+// Shout keeps a genuine user override: generated callers must honour
+// it through a fresh encoding, never walk it.
+type Shout struct {
+	V int `json:"v"`
+}
+
+func (Shout) MarshalJSON() ([]byte, error) {
+	return []byte(`"shout"`), nil
+}

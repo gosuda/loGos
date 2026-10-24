@@ -58,6 +58,7 @@ type wasmFunc struct {
 type wasmFuncType struct {
 	Params  []byte
 	Results []byte
+	cont    bool // loGos hook: a continuation type (stackswitch_logos.go)
 }
 
 func readWasmImport(ldr *loader.Loader, s loader.Sym) obj.WasmImport {
@@ -151,6 +152,7 @@ func asmb2(ctxt *ld.Link, ldr *loader.Loader) {
 		// 1 if the stack needs to be unwound.
 		{Params: []byte{I32}, Results: []byte{I32}},
 	}
+	types = logosStackSwitchTypes(ldr, types) // loGos hook: stack switching.
 
 	// collect host imports (functions that get imported from the WebAssembly host, usually JavaScript)
 	// we store the import index of each imported function, so the R_WASMIMPORT relocation
@@ -250,6 +252,7 @@ func asmb2(ctxt *ld.Link, ldr *loader.Loader) {
 	writeFunctionSec(ctxt, fns)
 	writeTableSec(ctxt, fns)
 	writeMemorySec(ctxt, ldr)
+	logosWriteTagSec(ctxt) // loGos hook: stack switching.
 	writeGlobalSec(ctxt)
 	writeExportSec(ctxt, ldr, len(hostImports))
 	writeElementSec(ctxt, uint64(len(hostImports)), uint64(len(fns)))
@@ -263,7 +266,7 @@ func asmb2(ctxt *ld.Link, ldr *loader.Loader) {
 
 func lookupType(sig *wasmFuncType, types *[]*wasmFuncType) uint32 {
 	for i, t := range *types {
-		if bytes.Equal(sig.Params, t.Params) && bytes.Equal(sig.Results, t.Results) {
+		if !t.cont && bytes.Equal(sig.Params, t.Params) && bytes.Equal(sig.Results, t.Results) { // loGos hook: t.cont.
 			return uint32(i)
 		}
 	}
@@ -300,6 +303,10 @@ func writeTypeSec(ctxt *ld.Link, types []*wasmFuncType) {
 	writeUleb128(ctxt.Out, uint64(len(types)))
 
 	for _, t := range types {
+		if t.cont { // loGos hook: stack switching.
+			logosWriteContType(ctxt)
+			continue
+		}
 		ctxt.Out.WriteByte(0x60) // functype
 		writeUleb128(ctxt.Out, uint64(len(t.Params)))
 		for _, v := range t.Params {
@@ -354,10 +361,11 @@ func writeTableSec(ctxt *ld.Link, fns []*wasmFunc) {
 	sizeOffset := writeSecHeader(ctxt, sectionTable)
 
 	numElements := uint64(funcValueOffset + len(fns))
-	writeUleb128(ctxt.Out, 1)           // number of tables
-	ctxt.Out.WriteByte(0x70)            // type: anyfunc
-	ctxt.Out.WriteByte(0x00)            // no max
-	writeUleb128(ctxt.Out, numElements) // min
+	writeUleb128(ctxt.Out, 1+logosContTables()) // number of tables, loGos hook: stack switching.
+	ctxt.Out.WriteByte(0x70)                    // type: anyfunc
+	ctxt.Out.WriteByte(0x00)                    // no max
+	writeUleb128(ctxt.Out, numElements)         // min
+	logosWriteContTable(ctxt)                   // loGos hook: stack switching.
 
 	writeSecSize(ctxt, sizeOffset)
 }

@@ -262,6 +262,12 @@ func gcUsesSpanInlineMarkBits(size uintptr) bool {
 // tryDeferToSpanScan tries to queue p on the span it points to, if it
 // points to a small object span (gcUsesSpanQueue size).
 func tryDeferToSpanScan(p uintptr, gcw *gcWork) bool {
+	if zgcCycleEnabled() {
+		var ok bool
+		if p, ok = zgcRemapScanWord(p); !ok {
+			return false
+		}
+	}
 	if useCheckmark {
 		return false
 	}

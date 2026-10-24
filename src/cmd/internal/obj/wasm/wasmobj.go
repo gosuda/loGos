@@ -94,6 +94,7 @@ var Register = map[string]int16{
 	"V14": REG_V14,
 	"V15": REG_V15,
 
+	"MYSP": REG_MYSP, // loGos hook: stack switching (stackswitch_logos.go)
 	"PC_B": REG_PC_B,
 }
 
@@ -229,6 +230,7 @@ func preprocess(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 		p = appendp(p, ASet, regAddr(REG_SP))
 		p.Spadj = int32(framesize)
 	}
+	ss := newStackSwitch(ctxt, s) // loGos hook: stack switching.
 
 	// If the framesize is 0, then imply nosplit because it's a specially
 	// generated function.
@@ -328,7 +330,7 @@ func preprocess(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 		// more often to avoid bloat of the BrTable instruction.
 		// The "base != prevBase" condition detects inlined instructions. They are an
 		// implicit call, so entering and leaving this section affects the stack trace.
-		if p.As == ACALLNORESUME || p.As == obj.ANOP || p.As == ANop || p.Spadj != 0 || base != prevBase {
+		if p.As == ACALLNORESUME || p.As == ACALLCONT || p.As == obj.ANOP || p.As == ANop || p.Spadj != 0 || base != prevBase { // loGos hook: ACALLCONT.
 			pc++
 			if p.To.Sym == sigpanic {
 				// The panic stack trace expects the PC at the call of sigpanic,
@@ -347,6 +349,7 @@ func preprocess(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 
 	if needMoreStack {
 		p := pMorestack
+		p = ss.restartLoop(p, appendp) // loGos hook: stack switching.
 
 		if framesize <= abi.StackSmall {
 			// small stack: SP <= stackguard
@@ -397,6 +400,7 @@ func preprocess(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 			p.To = obj.Addr{Type: obj.TYPE_MEM, Name: obj.NAME_EXTERN, Sym: morestackNoCtxt}
 		}
 		p = appendp(p, AEnd)
+		p = ss.restartEnd(p, appendp) // loGos hook: stack switching.
 	}
 
 	// record the branches targeting the entry loop and the unwind exit,
@@ -457,7 +461,7 @@ func preprocess(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 
 			p = appendp(p, AReturn)
 
-		case obj.ACALL, ACALLNORESUME:
+		case obj.ACALL, ACALLNORESUME, ACALLCONT: // loGos hook: ACALLCONT.
 			call := *p
 			p.As = obj.ANOP
 
@@ -517,6 +521,8 @@ func preprocess(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 				p = appendp(p, AIf)
 				p = appendp(p, obj.AUNDEF)
 				p = appendp(p, AEnd)
+			} else if ss.isRestart(&call) { // loGos hook: stack switching.
+				p = ss.restartBranch(p, appendp)
 			} else {
 				// unwinding WebAssembly stack to switch goroutine, return 1
 				p = appendp(p, ABrIf)
@@ -712,6 +718,8 @@ func preprocess(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 
 	{
 		p := s.Func().Text
+		ss.planTarget(numResumePoints, len(unwindExitBranches), appendp) // loGos hook: stack switching.
+		p = ss.outerLoop(p, appendp)
 		if len(unwindExitBranches) > 0 {
 			p = appendp(p, ABlock) // unwindExit, used to return 1 when unwinding the stack
 			for _, b := range unwindExitBranches {
@@ -741,7 +749,8 @@ func preprocess(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 		}
 		p = appendp(p, obj.AUNDEF)
 		if len(unwindExitBranches) > 0 {
-			p = appendp(p, AEnd) // end of unwindExit
+			p = appendp(p, AEnd)           // end of unwindExit
+			p = ss.targetCheck(p, appendp) // loGos hook: stack switching.
 			p = appendp(p, AI32Const, constAddr(1))
 		}
 	}
@@ -1104,8 +1113,12 @@ func assemble(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 	switch s.Name {
 	case "_rt0_wasm_js", "_rt0_wasm_wasip1", "_rt0_wasm_wasip1_lib",
 		"wasm_export_run", "wasm_export_resume", "wasm_export_getsp",
-		"wasm_pc_f_loop", "runtime.wasmDiv", "runtime.wasmTruncS", "runtime.wasmTruncU", "memeqbody":
+		"wasm_pc_f_loop", "runtime.wasmDiv", "runtime.wasmTruncS", "runtime.wasmTruncU", "memeqbody",
+		"wasm_cont_entry": // loGos hook: stack switching.
 		varDecls = []*varDecl{}
+		useAssemblyRegMap()
+	case "wasm_cont_run": // loGos hook: stack switching, R0 is the continuation slot.
+		varDecls = []*varDecl{{count: 1, typ: i32}}
 		useAssemblyRegMap()
 	case "wasm_pc_f_loop_export":
 		varDecls = []*varDecl{{count: 2, typ: i32}}
@@ -1152,7 +1165,7 @@ func assemble(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 		}
 
 		regs := []int16{REG_SP}
-		for reg := int16(REG_R0); reg <= REG_V15; reg++ {
+		for reg := int16(REG_R0); reg <= REG_MYSP; reg++ { // loGos hook: REG_MYSP.
 			if regUsed[reg-MINREG] {
 				regs = append(regs, reg)
 			}
@@ -1263,6 +1276,10 @@ func assemble(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 			// ignore
 			continue
 
+		case ATableGet, ATableSet, ATableGrow, ATableSize, ARefNullCont, ARefIsNull, ARefFunc, AContNew, ASuspend, AResume, ABlock: // loGos hook: stack switching.
+			if encodeStackSwitch(ctxt, s, w, p) {
+				continue
+			}
 		case AV128Const:
 			writeOpcode(w, AV128Const)
 			// Despite what the spec implies, this is the format of a 128-bit constant.
@@ -1473,6 +1490,8 @@ func regType(reg int16) valueType {
 		return f64
 	case reg >= REG_V0 && reg <= REG_V15:
 		return v128
+	case reg == REG_MYSP: // loGos hook: stack switching.
+		return i32
 	default:
 		panic("invalid register")
 	}

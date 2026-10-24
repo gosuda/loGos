@@ -27,4 +27,5 @@ var registry = []Rule{
 	aliasExtension,
 	unclosedIOCloser,
 	unboundedChannelOp,
+	printfMisuse,
 }

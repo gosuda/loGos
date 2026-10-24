@@ -46,6 +46,7 @@ var capabilitySinks = map[string]CapabilityKind{
 	"os.StartProcess":          CapExec,
 	"os.startProcess":          CapExec,
 	"net.sysSocket":            CapNet,
+	"syscall.Socket":           CapNet,
 	"runtime.cgocall":          CapCgo,
 	"runtime.logosCgocallFast": CapCgo,
 }

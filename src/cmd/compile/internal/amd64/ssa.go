@@ -1387,6 +1387,63 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		// AuxInt encodes how many buffer entries we need.
 		p.To.Sym = ir.Syms.GCWriteBarrier[v.AuxInt-1]
 
+	case ssa.OpAMD64LoweredLogosArenaBump:
+		chunk := v.Args[0].Reg()
+		res := v.Reg()
+		tmp := v.RegTmp()
+		rnd := v.AuxInt
+		opregreg(s, x86.ATESTQ, chunk, chunk)
+		fail := s.Prog(x86.AJEQ)
+		fail.To.Type = obj.TYPE_BRANCH
+		p := s.Prog(x86.AMOVQ)
+		p.From.Type = obj.TYPE_MEM
+		p.From.Reg = chunk
+		p.From.Offset = 16
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = tmp
+		p = s.Prog(x86.ALEAQ)
+		p.From.Type = obj.TYPE_MEM
+		p.From.Reg = tmp
+		p.From.Offset = 7
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = tmp
+		p = s.Prog(x86.AANDQ)
+		p.From.Type = obj.TYPE_CONST
+		p.From.Offset = -8
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = tmp
+		p = s.Prog(x86.AMOVQ)
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = tmp
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = res
+		p = s.Prog(x86.ALEAQ)
+		p.From.Type = obj.TYPE_MEM
+		p.From.Reg = tmp
+		p.From.Offset = rnd
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = tmp
+		p = s.Prog(x86.ACMPQ)
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = tmp
+		p.To.Type = obj.TYPE_MEM
+		p.To.Reg = chunk
+		p.To.Offset = 24
+		over := s.Prog(x86.AJHI)
+		over.To.Type = obj.TYPE_BRANCH
+		p = s.Prog(x86.AMOVQ)
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = tmp
+		p.To.Type = obj.TYPE_MEM
+		p.To.Reg = chunk
+		p.To.Offset = 16
+		done := s.Prog(obj.AJMP)
+		done.To.Type = obj.TYPE_BRANCH
+		fail.To.SetTarget(s.Pc())
+		over.To.SetTarget(s.Pc())
+		opregreg(s, x86.AXORL, res, res)
+		done.To.SetTarget(s.Pc())
+
 	case ssa.OpAMD64LoweredPanicBoundsRR, ssa.OpAMD64LoweredPanicBoundsRC, ssa.OpAMD64LoweredPanicBoundsCR, ssa.OpAMD64LoweredPanicBoundsCC:
 		// Compute the constant we put in the PCData entry for this call.
 		code, signed := ssa.BoundsKind(v.AuxInt).Code()

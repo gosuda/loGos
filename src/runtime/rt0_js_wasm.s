@@ -41,6 +41,16 @@ TEXT wasm_export_run(SB),NOSPLIT,$0
 // wasm_export_resume gets called from JavaScript. It resumes the execution of Go code until it needs to wait for
 // an event.
 TEXT wasm_export_resume(SB),NOSPLIT,$0
+#ifdef GOWASM_stackswitch
+	// loGos M16-S1: resume the continuation that paused; it enters
+	// handleEvent itself (runtime·pause in asm_wasm.s).
+	I32Const $runtime·wasmContNext(SB)
+	I32Const $runtime·wasmContPaused(SB)
+	I64Load $0
+	I64Store $0
+	Call wasm_pc_f_loop(SB)
+	Return
+#endif
 	I32Const $0
 	Call runtime·handleEvent(SB)
 	Drop

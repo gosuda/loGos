@@ -349,8 +349,10 @@ type gcControllerState struct {
 	//
 	// It is atomic because the logos elastic pacer (logos_pacer.go) raises
 	// it during the cycle, from revise on any P, while the scheduler and
-	// the fractional worker read it.
-	fractionalUtilizationGoal atomic.Float64
+	// the fractional worker read it. The active build shares the atomic
+	// implementation through logosFractionalGoal; the inactive wasm build
+	// stores it as plain memory while the world is stopped.
+	fractionalUtilizationGoal logosFractionalGoal
 
 	// logosElastic is the elastic background marking state (logos_pacer.go).
 	logosElastic logosElasticState

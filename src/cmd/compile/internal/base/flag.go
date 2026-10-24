@@ -218,6 +218,7 @@ func ParseFlags() {
 	if Flag.Std && objabi.LookupPkgSpecial(Ctxt.Pkgpath).Runtime {
 		Flag.CompilingRuntime = true
 	}
+	logosCheckFlags()
 
 	Ctxt.Std = Flag.Std
 
@@ -315,7 +316,7 @@ func ParseFlags() {
 		usage()
 	}
 
-	if Flag.GoVersion != "" && Flag.GoVersion != runtime.Version() {
+	if Flag.GoVersion != "" && objabi.StripExperiment(Flag.GoVersion) != objabi.StripExperiment(runtime.Version()) {
 		fmt.Printf("compile: version %q does not match go tool version %q\n", runtime.Version(), Flag.GoVersion)
 		Exit(2)
 	}

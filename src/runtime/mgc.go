@@ -173,7 +173,7 @@ const (
 //
 //go:linkname heapObjectsCanMove
 func heapObjectsCanMove() bool {
-	return false
+	return logosHeapObjectsCanMove()
 }
 
 func gcinit() {
@@ -915,6 +915,12 @@ func gcStart(trigger gcTrigger) {
 	gcMarkTinyAllocs()
 	logosGenMarkCards()
 
+	// The zgc hook finishes in-flight relocation, rewrites every
+	// reachable slot, releases completed pages, flips the good color,
+	// and snapshots the stacks before marking begins. The world is
+	// stopped.
+	zgcGCStartHook()
+
 	// At this point all Ps have enabled the write
 	// barrier, thus maintaining the no white to
 	// black invariant. Enable mutator assists to
@@ -1397,6 +1403,12 @@ func gcMarkTermination(stw worldStop) {
 		// before continuing.
 	})
 
+	// The zgc hook opens the relocation phase: it retires the previous
+	// generation, selects and registers pages, fixes the roots into the
+	// relocation set, flips the good color, and starts the background
+	// workers. No object copying happens in the pause.
+	zgcMarkTerminationHook()
+
 	var stwSwept bool
 	systemstack(func() {
 		work.heap2 = work.bytesMarked
@@ -1407,6 +1419,7 @@ func gcMarkTermination(stw worldStop) {
 			checkFinalizersAndCleanups()
 		}
 		logosGenEndCycle()
+		logosMovingMarkTermination()
 
 		// marking is complete so we can turn the write barrier off
 		setGCPhase(_GCoff)

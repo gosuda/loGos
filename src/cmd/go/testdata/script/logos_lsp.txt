@@ -22,6 +22,7 @@ stdout '^ok definition of a loGo/s symbol from a Go file lands in the .lgo file$
 stdout '^ok definition of a Go symbol from a loGo/s file lands in the .go file$'
 stdout '^ok definition inside a \? statement maps back to the .lgo parameter$'
 stdout '^ok hover inside a \? statement$'
+stdout '^ok compiler inlay hint appears in \.lgo file$'
 stdout '^ok compiler diagnostic reaches publishDiagnostics at the .lgo position$'
 stdout '^ok requests on a loGo/s file that does not compile answer null$'
 stdout '^ok diagnostics clear after the repair$'
@@ -312,6 +313,16 @@ func main() {
 	must(bytes.Contains(hover, []byte("ReadFile")), "hover inside the ? statement answered %s", hover)
 	fmt.Println("ok hover inside a ? statement")
 
+	inlay := s.call("textDocument/inlayHint", map[string]any{
+		"textDocument": doc(aPath),
+		"range": map[string]any{
+			"start": map[string]any{"line": 0, "character": 0},
+			"end":   map[string]any{"line": 100, "character": 0},
+		},
+	})
+	must(bytes.Contains(inlay, []byte("/* narrowed: *User */")), "inlayHint on .lgo answered %s", inlay)
+	fmt.Println("ok compiler inlay hint appears in .lgo file")
+
 	broken := strings.Replace(aText, "return string(data), nil", "return undefinedName, nil", 1)
 	since := s.mark()
 	s.notify("textDocument/didChange", map[string]any{
@@ -384,9 +395,18 @@ package a
 
 import "os"
 
+type User struct{ Name string }
+
 func Read(path string) (string, error) {
 	data := os.ReadFile(path)?
 	return string(data), nil
+}
+
+func Narrow(u *User?) string {
+	if u != nil {
+		return u.Name
+	}
+	return ""
 }
 -- ws/lmod/c/c.lgo --
 package c

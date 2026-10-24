@@ -196,6 +196,7 @@ func (check *Checker) initVar(lhs *Var, x *operand, context string) {
 			typ = Default(typ)
 		}
 		lhs.typ = typ
+		check.logosConstInferVar(lhs) // logos M5-S1 hook: inferred locals copy out of views.
 		if check.logosInheritPlatform(lhs, x) { // logos M3-S5 hook.
 			return
 		}

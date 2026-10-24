@@ -113,6 +113,7 @@ func makechan(t *chantype, size int) *hchan {
 	c.elemsize = uint16(elem.Size_)
 	c.elemtype = elem
 	c.dataqsiz = uint(size)
+	logosPinChan(c, mem, elem)
 	if b := getg().bubble; b != nil {
 		c.bubble = b
 	}

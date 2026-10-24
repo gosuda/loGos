@@ -1,0 +1,342 @@
+# M5-S2: imported const func step limits and purity rules (T-201, T-102).
+# Caller max_ctfe_steps bounds imported recursive const funcs; purity rejects
+# forbidden I/O and mutable package/imported globals; ordinary imported non-const
+# functions remain strictly rejected at compile time.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+# 1. Purity rejects forbidden I/O in const func.
+cd impure_io
+! logos build ./...
+stderr '\[correctness::const_func_impure\] I/O: call to println in const func'
+cd ..
+
+# 2. Purity rejects reading mutable package variable in const func.
+cd impure_read_var
+! logos build ./...
+stderr '\[correctness::const_func_impure\] read of package variable LocalCounter in const func'
+cd ..
+
+# 3. Purity rejects writing mutable package variable in const func.
+cd impure_write_var
+! logos build ./...
+stderr '\[correctness::const_func_impure\] write to package variable TargetVar in const func'
+cd ..
+
+# 4. Purity rejects reading imported mutable variable in const func.
+cd impure_read_imp
+! logos build ./...
+stderr '\[correctness::const_func_impure\] read of imported variable ExportedCounter in const func'
+cd ..
+
+# 5. Ordinary imported non-const function rejected in const initializer.
+cd reject_plain
+! logos build ./...
+stderr '\[correctness::const_eval\] call to imported function example\.com/reclib\.PlainAdd in const func'
+cd ..
+
+# 6. Ordinary imported non-const function rejected when called inside const func body.
+cd reject_plain_body
+! logos build ./...
+stderr '\[correctness::const_func_impure\] call to imported function reclib\.PlainAdd in const func'
+cd ..
+
+# 7. Caller max_ctfe_steps limits imported recursion (Rec(1000) under limit 100).
+cd caller_limit
+! logos build ./...
+stderr '\[comptime::ctfe_step_limit\] evaluation exceeds the step limit'
+cd ..
+
+# 8. Evaluation within caller max_ctfe_steps succeeds and runs (Rec(5) under limit 100).
+cd caller_ok
+logos run .
+stdout '^under-limit: 5$'
+cd ..
+
+# 9. Caller max_ctfe_steps limits same-package recursion.
+cd same_pkg_limit
+! logos build ./...
+stderr '\[comptime::ctfe_step_limit\]'
+cd ..
+
+# 10. Caller max_ctfe_steps limits recursion in comptime generic copy.
+cd copy_limit
+! logos build ./...
+stderr '\[comptime::ctfe_step_limit\]'
+cd ..
+
+-- reclib/go.mod --
+module example.com/reclib
+
+go 1.27
+
+-- reclib/rec.lgo --
+package reclib
+
+import "comptime"
+
+// ExportedCounter is an exported mutable package variable.
+var ExportedCounter int = 7
+
+// Rec is a pure recursive const function.
+const func Rec(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return 1 + Rec(n-1)
+}
+
+// PlainAdd is an ordinary non-const exported function.
+func PlainAdd(a, b int) int {
+	return a + b
+}
+
+// GenericSteps is a comptime generic whose copy evaluates Rec(1000).
+// reclib has no logos.toml, so its definition check runs under the
+// default step budget and succeeds; the caller-limit copy check in the
+// importing package must enforce the selected limit.
+func GenericSteps[T any]() int {
+	const for _, f := range comptime.Fields[T]() {
+		const Limit = Rec(1000)
+		return Limit + f.Index
+	}
+	return 0
+}
+
+-- caller_limit/go.mod --
+module example.com/callerlimit
+
+go 1.27
+
+require example.com/reclib v0.0.0
+
+replace example.com/reclib => ../reclib
+
+-- caller_limit/logos.toml --
+[lints.thresholds]
+max_ctfe_steps = 100
+
+-- caller_limit/main.lgo --
+package main
+
+import "example.com/reclib"
+
+// Rec(1000) under caller max_ctfe_steps = 100 exceeds the step limit.
+const Exceeded = reclib.Rec(1000)
+
+func main() {
+	println(Exceeded)
+}
+
+-- caller_ok/go.mod --
+module example.com/callerok
+
+go 1.27
+
+require example.com/reclib v0.0.0
+
+replace example.com/reclib => ../reclib
+
+-- caller_ok/logos.toml --
+[lints.thresholds]
+max_ctfe_steps = 100
+
+-- caller_ok/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/reclib"
+)
+
+// Rec(5) executes within caller max_ctfe_steps = 100.
+const Under = reclib.Rec(5)
+
+func main() {
+	fmt.Println("under-limit:", Under)
+}
+
+-- impure_io/go.mod --
+module example.com/impureio
+
+go 1.27
+
+-- impure_io/main.lgo --
+package main
+
+const func BadIO(x int) int {
+	println("forbidden-io")
+	return x
+}
+
+const V = BadIO(1)
+
+func main() {
+	println(V)
+}
+
+-- impure_read_var/go.mod --
+module example.com/impurereadvar
+
+go 1.27
+
+-- impure_read_var/main.lgo --
+package main
+
+var LocalCounter int = 10
+
+const func ReadLocal() int {
+	return LocalCounter
+}
+
+const V = ReadLocal()
+
+func main() {
+	println(V)
+}
+
+-- impure_write_var/go.mod --
+module example.com/impurewritevar
+
+go 1.27
+
+-- impure_write_var/main.lgo --
+package main
+
+var TargetVar int = 0
+
+const func WriteLocal(x int) int {
+	TargetVar = x
+	return x
+}
+
+const V = WriteLocal(5)
+
+func main() {
+	println(V)
+}
+
+-- impure_read_imp/go.mod --
+module example.com/impurereadimp
+
+go 1.27
+
+require example.com/reclib v0.0.0
+
+replace example.com/reclib => ../reclib
+
+-- impure_read_imp/main.lgo --
+package main
+
+import "example.com/reclib"
+
+const func ReadImported() int {
+	return reclib.ExportedCounter
+}
+
+const V = ReadImported()
+
+func main() {
+	println(V)
+}
+
+-- reject_plain/go.mod --
+module example.com/rejectplain
+
+go 1.27
+
+require example.com/reclib v0.0.0
+
+replace example.com/reclib => ../reclib
+
+-- reject_plain/main.lgo --
+package main
+
+import "example.com/reclib"
+
+// PlainAdd is not a const func: compile-time evaluation must reject it.
+const BadInit = reclib.PlainAdd(3, 4)
+
+func main() {
+	println(BadInit)
+}
+
+-- reject_plain_body/go.mod --
+module example.com/rejectplainbody
+
+go 1.27
+
+require example.com/reclib v0.0.0
+
+replace example.com/reclib => ../reclib
+
+-- reject_plain_body/main.lgo --
+package main
+
+import "example.com/reclib"
+
+const func CallPlain() int {
+	return reclib.PlainAdd(1, 2)
+}
+
+const BadBody = CallPlain()
+
+func main() {
+	println(BadBody)
+}
+
+-- same_pkg_limit/go.mod --
+module example.com/samepkglimit
+
+go 1.27
+
+-- same_pkg_limit/logos.toml --
+[lints.thresholds]
+max_ctfe_steps = 100
+
+-- same_pkg_limit/main.lgo --
+package main
+
+const func SameRec(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return 1 + SameRec(n-1)
+}
+
+const Exceeded = SameRec(1000)
+
+func main() {
+	println(Exceeded)
+}
+
+-- copy_limit/go.mod --
+module example.com/copylimit
+
+go 1.27
+
+require example.com/reclib v0.0.0
+
+replace example.com/reclib => ../reclib
+
+-- copy_limit/logos.toml --
+[lints.thresholds]
+max_ctfe_steps = 100
+
+-- copy_limit/main.lgo --
+package main
+
+import "example.com/reclib"
+
+type Row struct {
+	X int
+}
+
+// GenericSteps is defined in reclib (default step budget, definition
+// succeeds); instantiating it here forces the caller's copy checker to
+// evaluate Rec(1000) under the selected max_ctfe_steps = 100.
+func main() {
+	println(reclib.GenericSteps[Row]())
+}

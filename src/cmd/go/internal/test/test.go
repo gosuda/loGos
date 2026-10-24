@@ -1675,6 +1675,7 @@ func (r *runTestActor) Act(b *work.Builder, ctx context.Context, a *work.Action)
 		env := slices.Clip(cfg.OrigEnv)
 		env = base.AppendPATH(env)
 		env = base.AppendPWD(env, cmd.Dir)
+		env = logosAppendTestEnv(env)
 		cmd.Env = env
 		if addToEnv != "" {
 			cmd.Env = append(cmd.Env, addToEnv)

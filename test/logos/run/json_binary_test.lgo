@@ -1,0 +1,228 @@
+// run
+
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"math"
+	"os"
+	"reflect"
+	"runtime"
+	"strings"
+)
+
+ type BinaryInner struct {
+	Flag bool `json:"flag"`
+}
+
+type BinaryRecord struct {
+	I int64 `json:"i"`
+	F32 float32 `json:"f32"`
+	F64 float64 `json:"f64"`
+	OK bool `json:"ok"`
+	Text string `json:"text"`
+	Raw []byte `json:"raw"`
+	Nums []int64 `json:"nums"`
+	Pair [2]uint16 `json:"pair"`
+	Labels map[string]int32 `json:"labels"`
+	Inner BinaryInner `json:"inner"`
+	Maybe int64? `json:"maybe"`
+}
+
+ type BinarySized struct {
+	Items []uint64 `json:"items"`
+}
+
+type BinaryEvery struct {
+	B bool `json:"b"`
+	I int `json:"i"`
+	I8 int8 `json:"i8"`
+	I16 int16 `json:"i16"`
+	I32 int32 `json:"i32"`
+	I64 int64 `json:"i64"`
+	U uint `json:"u"`
+	U8 uint8 `json:"u8"`
+	U16 uint16 `json:"u16"`
+	U32 uint32 `json:"u32"`
+	U64 uint64 `json:"u64"`
+	Uptr uintptr `json:"uptr"`
+	F32 float32 `json:"f32"`
+	F64 float64 `json:"f64"`
+	Named BinaryNamed `json:"named"`
+	Text string `json:"text"`
+	PS *string? `json:"ps"`
+	PI *int64? `json:"pi"`
+	Opt int64? `json:"opt"`
+	Req *BinaryInner `json:"req"`
+	Strings []string `json:"strings"`
+	Ints []int16 `json:"ints"`
+	Bools []bool `json:"bools"`
+	Bytes []byte `json:"bytes"`
+	Arr [2]int32 `json:"arr"`
+	Map map[string]int64 `json:"map"`
+}
+
+type BinaryNamed int32
+
+func check(ok bool, message string) error {
+	if !ok {
+		return fmt.Errorf("%s", message)
+	}
+	return nil
+}
+
+func roundTrip(v BinaryRecord) error {
+	encoded, err := v.MarshalBinary()
+	if err != nil { return err }
+	var got BinaryRecord
+	if err := got.UnmarshalBinary(encoded); err != nil { return err }
+	if !reflect.DeepEqual(got, v) { return fmt.Errorf("binary round trip changed value: %#v != %#v", got, v) }
+	return nil
+}
+
+func ptrString(v string) *string { return &v }
+
+func ptrInt64(v int64) *int64 { return &v }
+
+func roundTripEvery(v BinaryEvery) error {
+	encoded, err := v.MarshalBinary()
+	if err != nil { return err }
+	got := BinaryEvery{Req: &BinaryInner{}}
+	if err := got.UnmarshalBinary(encoded); err != nil { return err }
+	if !reflect.DeepEqual(got, v) { return fmt.Errorf("every-field round trip changed value") }
+	return nil
+}
+
+func layout() error {
+	var six int64? = 6
+	v := BinaryRecord{I: 0x0102030405060708, F32: 1.5, F64: -2.25, OK: true, Text: "x", Raw: []byte{0xaa}, Nums: []int64{3}, Pair: [2]uint16{4, 5}, Labels: map[string]int32{"z": 9, "a": 7}, Inner: BinaryInner{Flag: true}, Maybe: six}
+	got, err := v.MarshalBinary()
+	if err != nil { return err }
+	want := []byte{1}
+	want = binary.LittleEndian.AppendUint64(want, uint64(v.I))
+	want = binary.LittleEndian.AppendUint32(want, math.Float32bits(v.F32))
+	want = binary.LittleEndian.AppendUint64(want, math.Float64bits(v.F64))
+	want = append(want, 1, 1, 'x', 1, 0xaa, 1)
+	want = binary.LittleEndian.AppendUint64(want, 3)
+	want = append(want, 2)
+	want = binary.LittleEndian.AppendUint64(want, 4)
+	want = binary.LittleEndian.AppendUint64(want, 5)
+	want = append(want, 2, 1, 'a')
+	want = binary.LittleEndian.AppendUint64(want, 7)
+	want = append(want, 1, 'z')
+	want = binary.LittleEndian.AppendUint64(want, 9)
+	want = append(want, 1, 1)
+	want = binary.LittleEndian.AppendUint64(want, 6)
+	if !bytes.Equal(got, want) { return fmt.Errorf("layout bytes %x, want %x", got, want) }
+	return nil
+}
+
+func malformed(name string, src []byte, field string, offset string) error {
+	var got BinaryRecord
+	err := got.UnmarshalBinary(src)
+	if err == nil { return fmt.Errorf("%s: malformed input accepted", name) }
+	if !strings.Contains(err.Error(), field) || !strings.Contains(err.Error(), offset) { return fmt.Errorf("%s: error %w lacks field/offset", name, err) }
+	return nil
+}
+
+func violations() error {
+	var one int64? = 1
+	v := BinaryRecord{I: 1, Raw: []byte{}, Nums: []int64{}, Labels: map[string]int32{}, Maybe: one}
+	good, err := v.MarshalBinary()
+	if err != nil { return err }
+	if err := malformed("wrong version", append([]byte{2}, good[1:]...), "$version", "offset 0"); err != nil { return err }
+	if err := malformed("truncated scalar", good[:2], ".I", "offset 1"); err != nil { return err }
+	presence := append([]byte(nil), good...)
+	presenceOffset := len(good) - 9
+	presence[presenceOffset] = 2
+	if err := malformed("bad presence", presence, ".Maybe", fmt.Sprintf("offset %d", presenceOffset)); err != nil { return err }
+	if err := malformed("trailing", append(good, 0), "$trailing", "offset"); err != nil { return err }
+	return nil
+}
+
+func countBoundaries() error {
+	for _, tc := range []struct{ count uint64; payload int; wantError bool }{{1, 8, false}, {2, 16, false}, {3, 16, true}} {
+		src := []byte{1, byte(tc.count)}
+		for i := 0; i < tc.payload; i++ { src = append(src, byte(i)) }
+		var got BinarySized
+		err := got.UnmarshalBinary(src)
+		if (err != nil) != tc.wantError { return fmt.Errorf("count %d: error %w", tc.count, err) }
+		if err == nil && uint64(len(got.Items)) != tc.count { return fmt.Errorf("count %d decoded %d items", tc.count, len(got.Items)) }
+		if err != nil && (!strings.Contains(err.Error(), ".Items") || !strings.Contains(err.Error(), "offset")) { return fmt.Errorf("count %d error lacks field/offset: %w", tc.count, err) }
+	}
+	return nil
+}
+
+func allocationBomb() error {
+	src := []byte{1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x20, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	var got BinarySized
+	err := got.UnmarshalBinary(src)
+	runtime.ReadMemStats(&after)
+	if err == nil { return fmt.Errorf("2^40 count accepted") }
+	if !strings.Contains(err.Error(), ".Items") || !strings.Contains(err.Error(), "offset") { return fmt.Errorf("bomb error lacks field/offset: %w", err) }
+	if after.TotalAlloc-before.TotalAlloc >= 1<<20 { return fmt.Errorf("bomb allocated %d bytes", after.TotalAlloc-before.TotalAlloc) }
+	return nil
+}
+
+func roundTripSized(v BinarySized) error {
+	encoded, err := v.MarshalBinary()
+	if err != nil { return err }
+	var got BinarySized
+	if err := got.UnmarshalBinary(encoded); err != nil { return err }
+	if !reflect.DeepEqual(got, v) { return fmt.Errorf("sized slice round trip changed value") }
+	return nil
+}
+
+func run() error {
+	inner := BinaryInner{Flag: true}
+	if err := roundTrip(BinaryRecord{Raw: []byte{}, Nums: []int64{}, Labels: map[string]int32{}, Inner: inner}); err != nil { return err }
+	var innerCopy BinaryInner
+	innerBytes, err := inner.MarshalBinary()
+	if err != nil { return err }
+	if err := innerCopy.UnmarshalBinary(innerBytes); err != nil { return err }
+	if !reflect.DeepEqual(inner, innerCopy) { return fmt.Errorf("nested struct round trip changed value") }
+	var fourteen int64? = 14
+	var seven int64? = 7
+	every := BinaryEvery{B: true, I: -1, I8: -2, I16: -3, I32: -4, I64: -5, U: 6, U8: 7, U16: 8, U32: 9, U64: 10, Uptr: 11, F32: 1.25, F64: -2.5, Named: 12, Text: "all", PS: ptrString("ptr"), PI: ptrInt64(13), Opt: fourteen, Req: &inner, Strings: []string{"s"}, Ints: []int16{-2, 3}, Bools: []bool{true, false}, Bytes: []byte{1, 2}, Arr: [2]int32{15, 16}, Map: map[string]int64{"k": 17}}
+	if err := roundTripEvery(every); err != nil { return err }
+	sized := BinarySized{Items: []uint64{1, 2, 3}}
+	if err := roundTripSized(sized); err != nil { return err }
+	values := []BinaryRecord{
+		{Raw: []byte{}, Nums: []int64{}, Labels: map[string]int32{}},
+		{I: -12, F32: 0.5, F64: -2.5, Text: "", Raw: []byte{}, Nums: []int64{}, Pair: [2]uint16{0, 65535}, Labels: map[string]int32{}},
+		{I: 42, F32: -3.25, F64: math.Inf(1), OK: true, Text: "hello", Raw: []byte{0, 1, 255}, Nums: []int64{-1, 0, 9}, Pair: [2]uint16{8, 13}, Labels: map[string]int32{"b": 2, "a": 1}, Inner: BinaryInner{Flag: true}, Maybe: seven},
+	}
+	for _, v := range values { if err := roundTrip(v); err != nil { return err } }
+	first, err := values[1].AppendBinary([]byte{0xee})
+	if err != nil { return err }
+	chained, err := values[2].AppendBinary(first)
+	if err != nil { return err }
+	firstBytes, err := values[1].MarshalBinary()
+	if err != nil { return err }
+	secondBytes, err := values[2].MarshalBinary()
+	if err != nil { return err }
+	wantChain := append([]byte{0xee}, firstBytes...)
+	wantChain = append(wantChain, secondBytes...)
+	if !bytes.Equal(chained, wantChain) { return fmt.Errorf("AppendBinary chain bytes %x, want %x", chained, wantChain) }
+	if err := layout(); err != nil { return err }
+	return runViolations()
+}
+
+func runViolations() error {
+	if err := violations(); err != nil { return err }
+	if err := countBoundaries(); err != nil { return err }
+	return allocationBomb()
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Println("binary:", err)
+		os.Exit(1)
+	}
+	fmt.Println("binary encoding: PASS")
+}

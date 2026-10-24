@@ -103,7 +103,6 @@ func (fl *fileLower) lowerOptions() {
 		fl.lowerOptNode(n)
 		return true
 	})
-	fl.flushTypeImports()
 }
 
 // lowerOptNode handles one node of the option walk: statements with
@@ -631,6 +630,78 @@ func (fl *fileLower) lowerTypeExpr(e syntax.Expr) syntax.Expr {
 	}
 }
 
+// spellLoweredBoth spells t for the two roots. A bridge hit returns the
+// adapter's ready-built native type node plus eject spelling; otherwise
+// native is the historical spelling reparsed at pos and eject is that
+// same spelling. Callers must use native directly in the native tree and
+// eject for add() text, in the single source-order walk with no second
+// pass. The bridge records its own native/eject imports and sidecar
+// requests; no synthQualifier is recorded here on a bridge hit. needRT
+// accounting stays at each wrapper site as today (one bool,
+// deduplicated). Linearizability: one inline spelling per root from the
+// same checked type; wrappers are idempotent on revisit, so no outbox or
+// second delivery path is needed.
+func (fl *fileLower) spellLoweredBoth(t types2.Type, pos syntax.Pos) (native syntax.Expr, eject string, ok bool) {
+	if ownedTypeBridge != nil {
+		if n, e, ok := ownedTypeBridge(fl, t, pos); ok {
+			return n, e, true
+		}
+	}
+	s, ok := fl.spellLowered(t)
+	if !ok {
+		return nil, "", false
+	}
+	n, ok := typeExprAt(s, pos)
+	if !ok {
+		return nil, "", false
+	}
+	return n, s, true
+}
+
+// selectAccessBare builds the `?.` access for a bare receiver: the native
+// access expression and the eject suffix spelling, separately. It selects
+// directly on recv.
+func (fl *fileLower) selectAccessBare(recv syntax.Expr, e *syntax.OptSelectExpr) (syntax.Expr, string) {
+	pos := e.Pos()
+	return fl.selectAccessCommon(e, selOf(pos, recv, e.Sel.Value), "."+e.Sel.Value)
+}
+
+// selectAccessPresent builds the `?.` access for a presence-bearing
+// receiver: the native access expression and the eject suffix spelling,
+// separately. It selects through `.Value`.
+func (fl *fileLower) selectAccessPresent(recv syntax.Expr, e *syntax.OptSelectExpr) (syntax.Expr, string) {
+	pos := e.Pos()
+	return fl.selectAccessCommon(e, selOf(pos, selOf(pos, recv, "Value"), e.Sel.Value), ".Value."+e.Sel.Value)
+}
+
+// selectAccessCommon resolves the `?.` access for the selection e from
+// the caller's default native access and eject suffix. Exported members
+// (the only kind source can name on a private type) take the historical
+// path. An unexported member of another package takes the bridge path:
+// the adapter returns the ready-built native access over its exact
+// registered nodes plus the eject suffix, never source spelling in the
+// native tree. A missing registration is a compiler diagnostic at the use
+// site, never a guessed access. Causal consistency: the access shape
+// follows the receiver the wrapper already lowered, and the single-pass
+// walk stays idempotent.
+func (fl *fileLower) selectAccessCommon(e *syntax.OptSelectExpr, defNative syntax.Expr, defEject string) (syntax.Expr, string) {
+	pos := e.Pos()
+	ot := fl.coeType(e.X)
+	if ot != nil {
+		if obj, _, _ := types2.LookupFieldOrMethod(ot.Elem, true, fl.pkg.tpkg, e.Sel.Value); obj != nil {
+			if pkg := obj.Pkg(); pkg != nil && pkg != fl.pkg.tpkg && !obj.Exported() {
+				if ownedFieldBridge != nil {
+					if nacc, esuf, ok := ownedFieldBridge(fl, e, defNative, defEject); ok {
+						return nacc, esuf
+					}
+				}
+				base.Fatalf("logos: cannot access unexported selection %s of %s at %s without a registered private view", e.Sel.Value, ot.Elem, pos.String())
+			}
+		}
+	}
+	return defNative, defEject
+}
+
 // spellLowered renders the checked type t as lowered Go source in this
 // file: nested options become the named support instantiation when
 // wrapped (bare payloads spell their element), anonymous composites
@@ -961,24 +1032,22 @@ func (fl *fileLower) wrapKnown(v syntax.Expr, rec, target types2.Type) syntax.Ex
 		return v
 	}
 	pos := v.Pos()
-	tText, ok := fl.spellLowered(target)
+	nativeTop, ejectTop, ok := fl.spellLoweredBoth(target, pos)
 	if !ok {
 		base.Fatalf("logos: cannot spell type %s of the option wrap at %s", target, pos.String())
 	}
 	if zero {
 		n := syntax.Unparen(v).(*syntax.Name)
 		off := fl.off(n.Pos())
-		fl.add(off, off+3, tText+"{}")
-		typ, ok := typeExprAt(tText, pos)
-		if !ok {
-			base.Fatalf("logos: cannot respell type %q of the option wrap at %s", tText, pos.String())
-		}
+		fl.add(off, off+3, ejectTop+"{}")
+		typ := nativeTop
 		out := at(&syntax.CompositeLit{Type: typ, Rbrace: pos}, pos)
 		fl.wrapSpan[out] = span{start: off, end: off + 3}
 		fl.wrapOwner[out] = fl.nextWrapID()
 		return out
 	}
-	texts := []string{tText}
+	nativeNodes := []syntax.Expr{nativeTop}
+	ejectTexts := []string{ejectTop}
 	for cur := target; ; {
 		elem := fl.asOption(cur).Elem
 		if types2.Identical(rec, elem) {
@@ -988,11 +1057,12 @@ func (fl *fileLower) wrapKnown(v syntax.Expr, rec, target types2.Type) syntax.Ex
 		if inner == nil || keepMapRead(inner.Elem) {
 			break
 		}
-		t, ok := fl.spellLowered(elem)
+		nt, et, ok := fl.spellLoweredBoth(elem, pos)
 		if !ok {
 			base.Fatalf("logos: cannot spell type %s of the option wrap at %s", elem, pos.String())
 		}
-		texts = append(texts, t)
+		nativeNodes = append(nativeNodes, nt)
+		ejectTexts = append(ejectTexts, et)
 		cur = elem
 	}
 	vs := fl.wrapSpanOf(v)
@@ -1012,16 +1082,13 @@ func (fl *fileLower) wrapKnown(v syntax.Expr, rec, target types2.Type) syntax.Ex
 	// outer layers would interleave with an enclosing wrapper's head at
 	// a shared offset, while a single span composes by position.
 	fused := text
-	for i := len(texts) - 1; i >= 0; i-- {
-		fused = texts[i] + "{Value: " + fused + ", Present: true}"
+	for i := len(ejectTexts) - 1; i >= 0; i-- {
+		fused = ejectTexts[i] + "{Value: " + fused + ", Present: true}"
 	}
 	fl.add(vs.start, vs.end, fused)
 	native := v
-	for i := len(texts) - 1; i >= 0; i-- {
-		typ, ok := typeExprAt(texts[i], pos)
-		if !ok {
-			base.Fatalf("logos: cannot respell type %q of the option wrap at %s", texts[i], pos.String())
-		}
+	for i := len(nativeNodes) - 1; i >= 0; i-- {
+		typ := nativeNodes[i]
 		native = at(&syntax.CompositeLit{
 			Type: typ,
 			ElemList: []syntax.Expr{
@@ -1203,13 +1270,9 @@ func (fl *fileLower) lowerCoalesce(e *syntax.CoalesceExpr) syntax.Expr {
 	}
 	pos := e.Pos()
 	id := fl.nextWrapID()
-	etext, ok := fl.spellLowered(opt.Elem)
+	resultType, etext, ok := fl.spellLoweredBoth(opt.Elem, pos)
 	if !ok {
 		base.Fatalf("logos: cannot spell type %s of the ?? expression at %s", opt.Elem, pos.String())
-	}
-	resultType, ok := typeExprAt(etext, pos)
-	if !ok {
-		base.Fatalf("logos: cannot respell type %q of the ?? expression at %s", etext, pos.String())
 	}
 	signature := at(&syntax.FuncType{
 		ParamList:  []*syntax.Field{},
@@ -1353,13 +1416,16 @@ func (fl *fileLower) lowerOptSelect(e *syntax.OptSelectExpr) syntax.Expr {
 		return e
 	}
 	// The head goes first so nested receiver heads follow it at a
-	// shared offset.
+	// shared offset. Consistency: native tree and eject text are the two
+	// consumers of one linearizable source-order walk; the wrapper is
+	// idempotent on revisit, so no outbox or second pass is needed.
 	xStart := fl.off(fl.optLeftmost(e.X))
-	rText, ok := fl.spellLowered(ro)
+	nativeR, ejectR, ok := fl.spellLoweredBoth(ro, pos)
 	if !ok {
 		base.Fatalf("logos: cannot spell type %s of the ?. expression at %s", ro, pos.String())
 	}
-	fl.addOwned(id, xStart, xStart, "func() "+rText+" { if "+optTemp+" := ")
+	rText := ejectR
+	fl.addOwned(id, xStart, xStart, "func() "+ejectR+" { if "+optTemp+" := ")
 	nx := fl.lowerOptReceiver(e.X)
 	bareRecv := keepMapRead(ox.Elem)
 	accessRec := ro.Elem
@@ -1369,11 +1435,12 @@ func (fl *fileLower) lowerOptSelect(e *syntax.OptSelectExpr) syntax.Expr {
 		}
 	}
 	recv := nameOf(pos, optTemp)
-	acc := selOf(pos, recv, e.Sel.Value)
-	accSuffix := "." + e.Sel.Value
-	if !bareRecv {
-		acc = selOf(pos, selOf(pos, recv, "Value"), e.Sel.Value)
-		accSuffix = ".Value." + e.Sel.Value
+	var acc syntax.Expr
+	var accSuffix string
+	if bareRecv {
+		acc, accSuffix = fl.selectAccessBare(recv, e)
+	} else {
+		acc, accSuffix = fl.selectAccessPresent(recv, e)
 	}
 	some, someHead, someTail := fl.wrapParts(acc, accessRec, ro, pos)
 	var none syntax.Expr
@@ -1383,11 +1450,7 @@ func (fl *fileLower) lowerOptSelect(e *syntax.OptSelectExpr) syntax.Expr {
 		noneT = "nil"
 	} else {
 		noneT = rText + "{}"
-		typ, ok := typeExprAt(rText, pos)
-		if !ok {
-			base.Fatalf("logos: cannot respell type %q of the ?. expression at %s", rText, pos.String())
-		}
-		none = at(&syntax.CompositeLit{Type: typ, Rbrace: pos}, pos)
+		none = at(&syntax.CompositeLit{Type: nativeR, Rbrace: pos}, pos)
 	}
 	var cond syntax.Expr
 	var condT string
@@ -1398,10 +1461,7 @@ func (fl *fileLower) lowerOptSelect(e *syntax.OptSelectExpr) syntax.Expr {
 		cond = selOf(pos, nameOf(pos, optTemp), "Present")
 		condT = optTemp + ".Present"
 	}
-	resultType, ok := typeExprAt(rText, pos)
-	if !ok {
-		base.Fatalf("logos: cannot respell type %q of the ?. expression at %s", rText, pos.String())
-	}
+	resultType := nativeR
 	signature := at(&syntax.FuncType{
 		ParamList:  []*syntax.Field{},
 		ResultList: []*syntax.Field{at(&syntax.Field{Type: resultType}, pos)},
@@ -1430,13 +1490,9 @@ func (fl *fileLower) wrapParts(acc syntax.Expr, rec, target types2.Type, pos syn
 	if !wrap {
 		return acc, "", ""
 	}
-	tText, ok := fl.spellLowered(target)
+	typ, tText, ok := fl.spellLoweredBoth(target, pos)
 	if !ok {
 		base.Fatalf("logos: cannot spell type %s of the ?. value at %s", target, pos.String())
-	}
-	typ, ok := typeExprAt(tText, pos)
-	if !ok {
-		base.Fatalf("logos: cannot respell type %q of the ?. value at %s", tText, pos.String())
 	}
 	return at(&syntax.CompositeLit{
 		Type: typ,
@@ -1600,6 +1656,7 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 	rs := sig.Results()
 	var headText string
 	var rText string
+	var nrNode syntax.Expr
 	var rTexts []string
 	switch rs.Len() {
 	case 0:
@@ -1611,7 +1668,7 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 			ro = &types2.Option{Elem: r}
 		}
 		var ok bool
-		rText, ok = fl.spellLowered(ro)
+		nrNode, rText, ok = fl.spellLoweredBoth(ro, pos)
 		if !ok {
 			base.Fatalf("logos: cannot spell type %s of the ?. call at %s", ro, pos.String())
 		}
@@ -1625,7 +1682,7 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 			if fl.asOption(r) == nil {
 				ro = &types2.Option{Elem: r}
 			}
-			t, ok := fl.spellLowered(ro)
+			_, t, ok := fl.spellLoweredBoth(ro, pos)
 			if !ok {
 				base.Fatalf("logos: cannot spell type %s of the ?. call at %s", ro, pos.String())
 			}
@@ -1642,11 +1699,12 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 	}
 	bareRecv := keepMapRead(ox.Elem)
 	recv := nameOf(pos, optTemp)
-	accSuffix := "." + osel.Sel.Value
-	var racc syntax.Expr = selOf(pos, recv, osel.Sel.Value)
-	if !bareRecv {
-		racc = selOf(pos, selOf(pos, recv, "Value"), osel.Sel.Value)
-		accSuffix = ".Value." + osel.Sel.Value
+	var racc syntax.Expr
+	var accSuffix string
+	if bareRecv {
+		racc, accSuffix = fl.selectAccessBare(recv, osel)
+	} else {
+		racc, accSuffix = fl.selectAccessPresent(recv, osel)
 	}
 	var cond syntax.Expr
 	var condT string
@@ -1690,16 +1748,9 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 			noneT = "nil"
 		} else {
 			noneT = rText + "{}"
-			typ, ok := typeExprAt(rText, pos)
-			if !ok {
-				base.Fatalf("logos: cannot respell type %q of the ?. call at %s", rText, pos.String())
-			}
-			none = at(&syntax.CompositeLit{Type: typ, Rbrace: pos}, pos)
+			none = at(&syntax.CompositeLit{Type: nrNode, Rbrace: pos}, pos)
 		}
-		resultType, ok := typeExprAt(rText, pos)
-		if !ok {
-			base.Fatalf("logos: cannot respell type %q of the ?. call at %s", rText, pos.String())
-		}
+		resultType := nrNode
 		signature := at(&syntax.FuncType{
 			ParamList:  []*syntax.Field{},
 			ResultList: []*syntax.Field{at(&syntax.Field{Type: resultType}, pos)},
@@ -1717,6 +1768,7 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 	default:
 		n := rs.Len()
 		rTexts := make([]string, n)
+		nrNodes := make([]syntax.Expr, n)
 		roList := make([]types2.Type, n)
 		recList := make([]types2.Type, n)
 		for i := range n {
@@ -1727,19 +1779,16 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 			}
 			roList[i] = ro
 			recList[i] = r
-			t, ok := fl.spellLowered(ro)
+			nt, t, ok := fl.spellLoweredBoth(ro, pos)
 			if !ok {
 				base.Fatalf("logos: cannot spell type %s of the ?. call at %s", ro, pos.String())
 			}
 			rTexts[i] = t
+			nrNodes[i] = nt
 		}
 		fields := make([]*syntax.Field, n)
 		for i := range n {
-			typ, ok := typeExprAt(rTexts[i], pos)
-			if !ok {
-				base.Fatalf("logos: cannot respell type %q of the ?. call at %s", rTexts[i], pos.String())
-			}
-			fields[i] = at(&syntax.Field{Type: typ}, pos)
+			fields[i] = at(&syntax.Field{Type: nrNodes[i]}, pos)
 		}
 		signature := at(&syntax.FuncType{
 			ParamList:  []*syntax.Field{},
@@ -1766,7 +1815,7 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 		}
 		body := []syntax.Stmt{
 			ifOf(pos, init, cond, then),
-			returnOf(pos, fl.noneExprs(pos, rs, rTexts)),
+			returnOf(pos, fl.noneExprs(pos, rs, nrNodes)),
 		}
 		lit := at(&syntax.FuncLit{Type: signature, Body: blockOf(pos, body)}, pos)
 		fl.add(xEnd, rparen+1, "; "+condT+" { "+strings.Join(headNames, ", ")+" := v"+accSuffix+argsText+"; return "+strings.Join(retWraps, ", ")+" }; return "+strings.Join(noneList, ", ")+" }()")
@@ -1788,8 +1837,10 @@ func (fl *fileLower) bareResult(ro types2.Type) (bool, bool) {
 }
 
 // noneExprs builds the none-branch values of a multi-result optional
-// call.
-func (fl *fileLower) noneExprs(pos syntax.Pos, rs *types2.Tuple, rTexts []string) []syntax.Expr {
+// call from the callers' native result nodes: snapshot isolation across
+// the native tree (exact nodes here) and the eject text (alias spellings
+// in noneList at the call site), composed idempotently in one pass.
+func (fl *fileLower) noneExprs(pos syntax.Pos, rs *types2.Tuple, nrNodes []syntax.Expr) []syntax.Expr {
 	out := make([]syntax.Expr, rs.Len())
 	for i := range rs.Len() {
 		r := rs.At(i).Type()
@@ -1801,11 +1852,7 @@ func (fl *fileLower) noneExprs(pos syntax.Pos, rs *types2.Tuple, rTexts []string
 			out[i] = nilOf(pos)
 			continue
 		}
-		typ, ok := typeExprAt(rTexts[i], pos)
-		if !ok {
-			base.Fatalf("logos: cannot respell type %q of the ?. call at %s", rTexts[i], pos.String())
-		}
-		out[i] = at(&syntax.CompositeLit{Type: typ, Rbrace: pos}, pos)
+		out[i] = at(&syntax.CompositeLit{Type: nrNodes[i], Rbrace: pos}, pos)
 	}
 	return out
 }

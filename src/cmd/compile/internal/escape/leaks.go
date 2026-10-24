@@ -7,13 +7,12 @@ package escape
 import (
 	"cmd/compile/internal/base"
 	"math"
-	"strings"
 )
 
 // A leaks represents a set of assignment flows from a parameter to
 // the heap, mutator, callee, or to any of its function's (first
 // numEscResults) result parameters.
-type leaks [8]uint8
+type leaks [9]uint8
 
 const (
 	leakHeap = iota
@@ -22,7 +21,7 @@ const (
 	leakResult0
 )
 
-const numEscResults = len(leaks{}) - leakResult0
+const numEscResults = 5
 
 // Heap returns the minimum deref count of any assignment flow from l
 // to the heap. If no such flows exist, Heap returns -1.
@@ -109,7 +108,7 @@ func (l leaks) Encode() string {
 	for n > 0 && l[n-1] == 0 {
 		n--
 	}
-	s := "esc:" + string(l[:n])
+	s := l.foreignPrefix() + string(l[:n])
 	leakTagCache[l] = s
 	return s
 }
@@ -117,11 +116,7 @@ func (l leaks) Encode() string {
 // parseLeaks parses a binary string representing a leaks.
 func parseLeaks(s string) leaks {
 	var l leaks
-	if !strings.HasPrefix(s, "esc:") {
-		l.AddHeap(0)
-		return l
-	}
-	copy(l[:], s[4:])
+	l.parseForeign(s)
 	return l
 }
 
@@ -132,7 +127,7 @@ func ParseLeaks(s string) leaks {
 // Any reports whether the value flows anywhere at all.
 func (l leaks) Any() bool {
 	// TODO: do mutator/callee matter?
-	if l.Heap() >= 0 || l.Mutator() >= 0 || l.Callee() >= 0 {
+	if l.Heap() >= 0 || l.Mutator() >= 0 || l.Callee() >= 0 || l.Foreign() >= 0 {
 		return true
 	}
 	for i := range numEscResults {

@@ -39,7 +39,7 @@ func LeafNoSplit(ctxt *obj.Link, text *obj.Prog) bool {
 	}
 	for p := text; p != nil; p = p.Link {
 		switch p.As {
-		case obj.ACALL, ACALLNORESUME, ACall, ACallIndirect, ARETUNWIND:
+		case obj.ACALL, ACALLNORESUME, ACALLCONT, ACall, ACallIndirect, ARETUNWIND:
 			return false
 		case obj.ARET:
 			if p.To.Type == obj.TYPE_MEM {

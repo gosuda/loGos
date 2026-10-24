@@ -72,6 +72,39 @@ func ConstMix(seed, h uint64) uint64 {
 	return finalize(h ^ (seed * 0x9e3779b97f4a7c15))
 }
 
+// ConstMapMaterialization is zero-initialized once-only storage for one
+// top-level regular-map materialization (SPEC T-Sec9). The generated code
+// declares one zero value per const map, one pure builder that rebuilds
+// the full regular map, and one accessor that returns
+// storage.Get(builder). The first Get runs the builder exactly once;
+// later Gets reuse the same map. A builder panic repeats on every later
+// Get, matching sync.OnceValue. Only sync.Once orders the single build;
+// there is no per-read mutex and no package-init work.
+type ConstMapMaterialization[M ~map[K]V, K comparable, V any] struct {
+	once     sync.Once
+	valid    bool
+	panicked any
+	value    M
+}
+
+// Get returns the materialized map, running build once on first use.
+func (m *ConstMapMaterialization[M, K, V]) Get(build func() M) M {
+	m.once.Do(func() {
+		defer func() {
+			m.panicked = recover()
+			if !m.valid {
+				panic(m.panicked)
+			}
+		}()
+		m.value = build()
+		m.valid = true
+	})
+	if !m.valid {
+		panic(m.panicked)
+	}
+	return m.value
+}
+
 // ConstBucket describes one bucket of a const map table. Off and Size name
 // the bucket's slot region. Seed places the bucket's keys inside it. An
 // empty bucket points at the table's shared empty slot with Size 1.

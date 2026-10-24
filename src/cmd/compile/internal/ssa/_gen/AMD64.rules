@@ -1924,3 +1924,6 @@
 (SETEQ t:(TESTL x:(MOVBQZX s:(SET(EQ|NE|L|G|LE|GE|A|B|AE|BE) flags)) x)) && t.Block == s.Block => (SET(NE|EQ|GE|LE|G|L|BE|AE|B|A) flags)
 (SETEQ t:(TESTW x:(MOVBQZX s:(SET(EQ|NE|L|G|LE|GE|A|B|AE|BE) flags)) x)) && t.Block == s.Block => (SET(NE|EQ|GE|LE|G|L|BE|AE|B|A) flags)
 (SETEQ t:(TESTB            s:(SET(EQ|NE|L|G|LE|GE|A|B|AE|BE) flags)  s)) && t.Block == s.Block => (SET(NE|EQ|GE|LE|G|L|BE|AE|B|A) flags)
+
+// Lowering loGo/s arena bump allocation (M18-S3)
+(LogosArenaBump [s] chunk mem) => (LoweredLogosArenaBump [s] chunk mem)

@@ -201,28 +201,26 @@ func TestHintsLoweredConstSwitch(t *testing.T) {
 	}
 }
 
-// TestHintsLoweredConstFor checks the hover site of `const for`, which the
-// parser of this tree does not yet accept: the site comes from the opening
-// keywords of a lowering edit, so a synthetic edit over comment text proves
-// the classification and the range.
+// TestHintsLoweredConstFor checks the hover site of `const for`: the range is
+// the two keywords and the lowered text is the unrolled loop that replaced the
+// statement.
 func TestHintsLoweredConstFor(t *testing.T) {
-	src := []byte("package p\n\n// const  for i, f := range x { }\n")
-	base := syntax.NewFileBase("cf.lgo")
-	file := ejectParse(t, base, src, syntax.LogosMode|syntax.CheckBranches)
-	pkg, info := ejectCheck(t, file)
-	h := NewHints(pkg.Path())
-	h.AddFile(pkg, info, file, src)
-	h.Lowered(file, []Edit{{
-		Start: syntax.MakePos(file.Pos().Base(), 3, 4),
-		End:   syntax.MakePos(file.Pos().Base(), 3, 30),
-		Text:  "unrolled()",
-	}})
-	got := onlyFile(t, h.Report()).Sites
-	if len(got) != 1 || got[0].Kind != SiteConstFor || got[0].Lowered != "unrolled()" {
-		t.Fatalf("const for sites: %+v", got)
+	r, src := hintsFixture(t, "sites.lgo")
+	var got []SiteHint
+	for _, s := range onlyFile(t, r).Sites {
+		if s.Kind == SiteConstFor {
+			got = append(got, s)
+		}
 	}
-	if got[0].Range.Start != startOf(t, src, "const") || got[0].Range.End != endOf(t, src, "const  for") {
-		t.Errorf("const for range %+v", got[0].Range)
+	if len(got) != 1 {
+		t.Fatalf("%d const for sites, want 1", len(got))
+	}
+	s := got[0]
+	if s.Range.Start != startOf(t, src, "const for") || s.Range.End != endOf(t, src, "const for") {
+		t.Errorf("const for range %+v", s.Range)
+	}
+	if !strings.Contains(s.Lowered, `out = append(out, "Name")`) || strings.Contains(s.Lowered, "const for") {
+		t.Errorf("lowered const for:\n%s", s.Lowered)
 	}
 }
 

@@ -5,7 +5,7 @@ package main
 import "fmt"
 
 type Cfg struct {
-	Port int = 8080 `json:"port"`
+	Port int = 8080 `json:"port"` // ERROR "warning: \[portability::serialized_unsized_int\] field Port has type int, which is 4 bytes on a 32-bit target but 8 bytes in the binary layout; use int32, int64, uint32, or uint64"
 	Host string = "localhost"
 }
 
@@ -16,8 +16,8 @@ func main() {
 	fmt.Println(b.Port, b.Host)
 	c := Cfg{Host: "x"}
 	fmt.Println(c.Port, c.Host)
-	var z Cfg
+	var z Cfg // ERROR "warning: \[suspicious::unapplied_struct_default\] zero declaration of Cfg with field defaults"
 	fmt.Println(z.Port, z.Host)
-	n := new(Cfg)
+	n := new(Cfg) // ERROR "warning: \[suspicious::unapplied_struct_default\] zero declaration of Cfg with field defaults"
 	fmt.Println(n.Port, n.Host)
 }

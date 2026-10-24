@@ -39,6 +39,11 @@ type evaluator struct {
 	steps  int
 	depth  int
 	frames []*frame
+	// inSwitch counts direct switch-clause statement execution.
+	// execSwitch arms it only around clause bodies; nested if, for,
+	// and range bodies disarm it, so fallthrough stays admitted
+	// exactly where gc admits it: as a direct clause statement.
+	inSwitch int
 }
 
 // top returns the top-level frame.
@@ -50,6 +55,12 @@ func (e *evaluator) step(pos syntax.Pos) error {
 	e.steps++
 	if e.steps > e.cfg.MaxSteps {
 		return &Error{Code: CodeStepLimit, Pos: pos}
+	}
+	// Enforce the live value budget while frames are live: a temporary
+	// that is dropped before the result still counts during execution.
+	if err := e.checkSize(); err != nil {
+		err.Pos = pos
+		return err
 	}
 	return nil
 }
@@ -113,13 +124,19 @@ func (e *evaluator) execStmt(fr *frame, s syntax.Stmt) (flow, error) {
 	switch s := s.(type) {
 	case *syntax.EmptyStmt:
 		return flow{}, nil
+	case *syntax.BlockStmt:
+		savedSwitch := e.inSwitch
+		e.inSwitch = 0
+		f, err := e.execBlock(fr, s)
+		e.inSwitch = savedSwitch
+		return f, err
 	case *syntax.LabeledStmt:
+		if inner, ok := s.Stmt.(*syntax.ForStmt); ok {
+			return e.execFor(fr, inner, s.Label.Value)
+		}
 		f, err := e.execStmt(fr, s.Stmt)
 		if err != nil {
 			return flow{}, err
-		}
-		if (f.brk != "" || f.cont != "") && f.brk == s.Label.Value && f.cont == s.Label.Value {
-			return flow{}, nil
 		}
 		if f.brk == s.Label.Value || f.cont == s.Label.Value {
 			return flow{}, nil
@@ -146,7 +163,7 @@ func (e *evaluator) execStmt(fr *frame, s syntax.Stmt) (flow, error) {
 	case *syntax.IfStmt:
 		return e.execIf(fr, s)
 	case *syntax.ForStmt:
-		return e.execFor(fr, s)
+		return e.execFor(fr, s, "")
 	case *syntax.SwitchStmt:
 		return e.execSwitch(fr, s)
 	case *syntax.SelectStmt:
@@ -174,6 +191,11 @@ func (e *evaluator) execBranch(fr *frame, s *syntax.BranchStmt) (flow, error) {
 		return flow{cont: label}, nil
 	case syntax.Goto:
 		return flow{}, e.impurity(fr, posOf(s), "goto in const func")
+	case syntax.Fallthrough:
+		if e.inSwitch <= 0 {
+			return flow{}, e.fail(posOf(s), "fallthrough outside switch")
+		}
+		return flow{fall: true}, nil
 	}
 	return flow{}, e.fail(posOf(s), "fallthrough outside switch")
 }
@@ -241,6 +263,8 @@ func (e *evaluator) execVar(fr *frame, names []*syntax.Name, typ, vals syntax.Ex
 		} else {
 			v = defaulted(v)
 		}
+		// Arrays and structs copy on bind; slices and maps share.
+		v = copyValue(v)
 		v.constant = false
 		e.declare(fr, n.Value, v)
 	}
@@ -286,7 +310,12 @@ func (e *evaluator) execAssign(fr *frame, s *syntax.AssignStmt) error {
 			return err
 		}
 		v := p.get()
-		one := intValue(big1(), v.typ, true)
+		var one Value
+		if v.typ != nil && isFloat(v.typ.Kind) {
+			one = FloatValue(1.0, v.typ)
+		} else {
+			one = intValue(big1(), v.typ, true)
+		}
 		var r Value
 		if s.Op == syntax.Add {
 			r, err = e.add(v, one, posOf(s))
@@ -317,9 +346,26 @@ func (e *evaluator) execAssign(fr *frame, s *syntax.AssignStmt) error {
 	if len(rhs) != len(lhs) {
 		return e.fail(posOf(s), "assignment mismatch in const evaluation")
 	}
+	// Resolve every destination before any store: later LHS indices
+	// must see original values (i,a[i]=1,99 writes a[0]). Blank
+	// discards after RHS evaluation. Stored values convert to the
+	// destination declared type with value-copy semantics.
+	type pending struct {
+		pl      place
+		val     Value
+		newName string
+		isNew   bool
+		discard bool
+	}
+	pend := make([]pending, len(lhs))
+	curScope := fr.scopes[len(fr.scopes)-1]
 	for i, le := range lhs {
 		v := rhs[i]
 		if s.Op != 0 && s.Op != syntax.Def {
+			if nm, ok := nameOf(le); ok && nm == "_" {
+				pend[i] = pending{discard: true}
+				continue
+			}
 			p, err := e.resolvePlace(fr, le)
 			if err != nil {
 				return err
@@ -328,33 +374,71 @@ func (e *evaluator) execAssign(fr *frame, s *syntax.AssignStmt) error {
 			if err != nil {
 				return err
 			}
+			dest := p.get().typ
+			if dest != nil {
+				v, err = e.convert(v, dest, posOf(le))
+				if err != nil {
+					return err
+				}
+			}
+			pend[i] = pending{pl: p, val: withVar(copyValue(v))}
+			continue
 		}
 		if isDefine(s) {
-			// := declares or reuses in the current scope.
-			cur := fr.scopes[len(fr.scopes)-1]
 			nm, isName := nameOf(le)
 			if isName && nm == "_" {
+				pend[i] = pending{discard: true}
 				continue
 			}
 			if isName {
-				if _, exists := cur[nm]; exists {
+				if _, exists := curScope[nm]; exists {
 					p, err := e.resolvePlace(fr, le)
 					if err != nil {
 						return err
 					}
-					p.set(withVar(v))
+					dest := p.get().typ
+					if dest != nil {
+						var err error
+						v, err = e.convert(v, dest, posOf(le))
+						if err != nil {
+							return err
+						}
+					}
+					pend[i] = pending{pl: p, val: withVar(copyValue(v))}
 					continue
 				}
-				cur[nm] = withVar(defaulted(v))
+				pend[i] = pending{newName: nm, val: withVar(copyValue(defaulted(v))), isNew: true}
 				continue
 			}
 			return e.fail(posOf(le), "cannot define non-variable in const evaluation")
+		}
+		if nm, ok := nameOf(le); ok && nm == "_" {
+			pend[i] = pending{discard: true}
+			continue
 		}
 		p, err := e.resolvePlace(fr, le)
 		if err != nil {
 			return err
 		}
-		p.set(withVar(v))
+		dest := p.get().typ
+		if dest != nil {
+			var err error
+			v, err = e.convert(v, dest, posOf(le))
+			if err != nil {
+				return err
+			}
+		}
+		pend[i] = pending{pl: p, val: withVar(copyValue(v))}
+	}
+	for _, pd := range pend {
+		if pd.discard {
+			continue
+		}
+		if pd.isNew {
+			curScope[pd.newName] = pd.val
+			continue
+		}
+		pd.pl.set(pd.val)
 	}
 	return nil
 }
@@ -393,22 +477,25 @@ func (e *evaluator) execMapCommaOk(fr *frame, s *syntax.AssignStmt, lhs []syntax
 				continue
 			}
 			if i == 0 {
-				cur[nm] = withVar(val)
+				cur[nm] = withVar(copyValue(val))
 			} else {
-				cur[nm] = withVar(okVal)
+				cur[nm] = withVar(copyValue(okVal))
 			}
 		}
 		return true, nil
 	}
 	for i, le := range lhs {
+		if nm, ok := nameOf(le); ok && nm == "_" {
+			continue
+		}
 		p, err := e.resolvePlace(fr, le)
 		if err != nil {
 			return false, err
 		}
 		if i == 0 {
-			p.set(withVar(val))
+			p.set(withVar(copyValue(val)))
 		} else {
-			p.set(withVar(okVal))
+			p.set(withVar(copyValue(okVal)))
 		}
 	}
 	return true, nil
@@ -496,12 +583,33 @@ func (e *evaluator) execReturn(fr *frame, s *syntax.ReturnStmt) (flow, error) {
 	if err != nil {
 		return flow{}, err
 	}
+	// Explicit returns convert to the declared result types, so
+	// `return 1` in a float64 function yields 1.0 and later
+	// division stays floating-point.
+	if fr.fn != nil && len(fr.fn.Results) > 0 && len(vals) == len(fr.fn.Results) {
+		for i := range vals {
+			if fr.fn.Results[i] == nil {
+				continue
+			}
+			var err error
+			vals[i], err = e.convert(vals[i], fr.fn.Results[i], posOf(s))
+			if err != nil {
+				return flow{}, err
+			}
+		}
+	}
 	return flow{returned: true, values: vals}, nil
 }
 
 func (e *evaluator) execIf(fr *frame, s *syntax.IfStmt) (flow, error) {
 	e.pushScope(fr)
 	defer e.popScope(fr)
+	// An if body is never a direct switch-clause statement, so a
+	// fallthrough inside one is out of place even when the if sits
+	// in a clause. A switch nested in the if re-arms the gate itself.
+	savedSwitch := e.inSwitch
+	e.inSwitch = 0
+	defer func() { e.inSwitch = savedSwitch }()
 	if s.Init != nil {
 		f, err := e.execSimple(fr, s.Init)
 		if err != nil {

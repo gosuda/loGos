@@ -752,7 +752,10 @@ func (rp *IndexPackage) ScanDir(tags map[string]bool) (sortedImports []string, s
 Files:
 	for _, sf := range rp.sourceFiles {
 		name := sf.name()
-		isLGO := isLogosExt(name) && tags["logos"]
+		// The mode signal matches IsGoDir above and uncached
+		// cfg.IsGoFile: logos admission rides on the process mode
+		// cfg.Logos, never on the requested tag set.
+		isLGO := cfg.Logos && isLogosExt(name)
 		if strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".") || (!strings.HasSuffix(name, ".go") && !isLGO) || !imports.MatchFile(name, tags) {
 			continue
 		}

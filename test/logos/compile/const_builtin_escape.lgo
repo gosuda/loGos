@@ -1,0 +1,44 @@
+// errorcheck
+
+package p
+
+// PRRT_kwDOVOeymc6veVY- (SPEC Sec 2.1, T-201): builtins cannot store,
+// escape, or mutate reference-carrying const views. Passing a
+// reference-carrying const []byte to panic escapes the view into any,
+// and closing a channel reached through a const pointer mutates the channel.
+// Non-mutating builtins (len, cap) and permitted scalar reads remain valid.
+
+type Stream struct {
+	ID int
+	Ch chan int
+}
+
+func rejectPanic(v const []byte) {
+	panic(v) // ERROR "const_view_escape"
+}
+
+func rejectClose(s const *Stream) {
+	close(s.Ch) // ERROR "const_view_mutation"
+}
+
+func rejectCloseChan(c const chan int) {
+	close(c) // ERROR "const_view_mutation"
+}
+
+func validControls(v const []byte, s const *Stream) {
+	// len and cap on const []byte remain valid.
+	_ = len(v)
+	_ = cap(v)
+
+	// len and cap on channel through const pointer remain valid.
+	_ = len(s.Ch)
+	_ = cap(s.Ch)
+
+	// Permitted scalar reads through const views remain valid.
+	if len(v) > 0 {
+		var b byte = v[0]
+		_ = b
+	}
+	var id int = s.ID
+	_ = id
+}

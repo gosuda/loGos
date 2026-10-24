@@ -66,6 +66,17 @@ func logosWasmFlags() []string {
 	return flags
 }
 
+// logosWasmAsmFlags returns the assembler flags of the WASM profile: a
+// build with --wasm-features=stack-switching assembles the runtime for
+// goroutines on continuations. The compile action ID already covers the
+// feature list through logosWasmActionID.
+func logosWasmAsmFlags() []string {
+	if cfg.Goarch != "wasm" || !slices.Contains(strings.Split(cfg.WasmFeatures, ","), "stack-switching") {
+		return nil
+	}
+	return []string{"-logos.wasmstackswitch"}
+}
+
 // logosWasmActionID adds the profile flags to a compile action ID, so a
 // switch of profile or feature recompiles and never reuses cached output.
 // It is the hook line in buildActionID.

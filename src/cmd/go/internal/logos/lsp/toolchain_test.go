@@ -247,15 +247,33 @@ func TestToolchainHints(t *testing.T) {
 				SchemaVersion string `json:"schemaVersion"`
 				Package       string `json:"package"`
 				Files         []struct {
-					Path  string `json:"path"`
-					Hints []any  `json:"hints"`
+					File     string `json:"file"`
+					Narrowed []any  `json:"narrowed"`
+					Unions   []any  `json:"unions"`
+					Sites    []struct {
+						Kind    string `json:"kind"`
+						Lowered string `json:"lowered"`
+					} `json:"sites"`
+					Allocs []struct {
+						Tier    string `json:"tier"`
+						Message string `json:"message"`
+					} `json:"allocs"`
 				} `json:"files"`
 			}
 			if err := json.Unmarshal(hints, &report); err != nil {
 				t.Fatalf("hints is not a valid HintsReport: %v\n%s", err, hints)
 			}
+			if report.SchemaVersion != "1.0" {
+				t.Errorf("report schemaVersion = %q, want 1.0", report.SchemaVersion)
+			}
 			if report.Package != "example.com/lmod/a" {
 				t.Errorf("report package = %q, want example.com/lmod/a", report.Package)
+			}
+			if len(report.Files) != 1 || filepath.Base(report.Files[0].File) != "a.lgo" {
+				t.Fatalf("report files = %+v, want one a.lgo entry", report.Files)
+			}
+			if len(report.Files[0].Sites) != 1 || report.Files[0].Sites[0].Kind != "try" {
+				t.Errorf("report sites = %+v, want one try site", report.Files[0].Sites)
 			}
 		})
 	}

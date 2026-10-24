@@ -33,6 +33,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/scanner"
+	"go/token"
 	"internal/testenv"
 	"io/fs"
 	"os"
@@ -108,6 +110,63 @@ func testOutputStem(filename string) string {
 		return stem
 	}
 	return filename
+}
+
+func lgoSourceHasMainFunc(src []byte) bool {
+	var s scanner.Scanner
+	fset := token.NewFileSet()
+	f := fset.AddFile("", fset.Base(), len(src))
+	s.Init(f, src, nil, 0)
+
+	isPkgMain := false
+	sawPackage := false
+	depth := 0
+	prevFunc := false
+
+	for {
+		_, tok, lit := s.Scan()
+		if tok == token.EOF {
+			return false
+		}
+		switch tok {
+		case token.PACKAGE:
+			sawPackage = true
+			continue
+		case token.LBRACE:
+			depth++
+			prevFunc = false
+			continue
+		case token.RBRACE:
+			if depth > 0 {
+				depth--
+			}
+			prevFunc = false
+			continue
+		case token.FUNC:
+			if depth == 0 && isPkgMain {
+				prevFunc = true
+			}
+			continue
+		case token.LPAREN:
+			prevFunc = false
+			continue
+		case token.IDENT:
+			if sawPackage && !isPkgMain {
+				if lit == "main" {
+					isPkgMain = true
+				}
+				sawPackage = false
+				continue
+			}
+			if prevFunc && lit == "main" {
+				return true
+			}
+			prevFunc = false
+			continue
+		}
+		sawPackage = false
+		prevFunc = false
+	}
 }
 
 // routeLogosHarness reports whether a test case runs through runLogos.
@@ -252,15 +311,19 @@ func logosGoBuildCmd(gcflags, file string, buildFlags, optFlags []string) []stri
 }
 
 // runLogos runs one test/logos case. The file is staged under its base
-// name in a throwaway module; .lgo actions drive the logos binary, .go
-// twins drive go, and test/logos/lint/*.go files drive `logos lint`
-// (M9-S2).
+// name (or a non-_test name for action run when defining func main) in
+// a throwaway module; .lgo actions drive the logos binary, .go twins
+// drive go, and test/logos/lint/*.go files drive `logos lint` (M9-S2).
 func (t test) runLogos(c logosCase) error {
 	c = pinTargetFlags(c)
 	base := path.Base(t.goFile)
 	isLgo := strings.HasSuffix(base, ".lgo")
+	stagedBase := base
+	if stem, ok := strings.CutSuffix(base, "_test.lgo"); isLgo && c.action == "run" && ok && lgoSourceHasMainFunc(c.src) {
+		stagedBase = stem + "_main.lgo"
+	}
 	tempDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tempDir, base), c.src, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tempDir, stagedBase), c.src, 0644); err != nil {
 		t.Fatal(err)
 	}
 	runcmd := func(args ...string) ([]byte, error) {
@@ -322,7 +385,7 @@ func (t test) runLogos(c logosCase) error {
 	if err := os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte("module logostest\n\ngo 1.27\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	return t.runLogosLgo(c, base, tempDir, runcmd)
+	return t.runLogosLgo(c, stagedBase, tempDir, runcmd)
 }
 
 // runLogosLint runs one test/logos/lint case: the staged file goes into a
@@ -355,16 +418,10 @@ func (t test) runLogosLgo(c logosCase, base, tempDir string, runcmd runCmd) erro
 	buildFlags, optFlags := splitOptFlags(c.flags)
 	switch c.action {
 	case "run":
-		cmd := []string{logosToolPath(t.T), "run", t.goGcflags()}
-		cmd = append(cmd, buildFlags...)
-		cmd = append(cmd, optFlags...)
-		cmd = append(cmd, ".")
-		cmd = append(cmd, c.args...)
-		out, err := runcmd(cmd...)
-		if err != nil {
-			return err
+		if strings.HasSuffix(base, "_test.lgo") {
+			return t.runLogosLgoTest(buildFlags, runcmd)
 		}
-		return t.checkExpectedOutput(out)
+		return t.runLogosLgoRun(c, base, tempDir, runcmd)
 	case "compile":
 		cmd := []string{logosToolPath(t.T), "build"}
 		cmd = append(cmd, optFlags...)
@@ -388,6 +445,108 @@ func (t test) runLogosLgo(c logosCase, base, tempDir string, runcmd runCmd) erro
 	default:
 		return logosUnsupportedActionErr(c.action)
 	}
+}
+
+// logosFuzzTimeEnv names the environment variable that turns the seed
+// corpus run of a staged _test.lgo case into a fuzzing run of that
+// length (M11-S1 gate: 60s in the slice, seed corpus only in CI).
+const logosFuzzTimeEnv = "LOGOS_TESTDIR_FUZZTIME"
+
+// logosTestCmd builds the `logos test` argv of a staged _test.lgo case: a
+// run action whose file name ends in _test.lgo is a test file, so the case
+// passes when the tests in it pass. A fuzz time from the environment adds
+// -fuzz=^Fuzz, which go test accepts only while the staged file holds one
+// Fuzz function.
+func logosTestCmd(tool, gcflags string, buildFlags []string, fuzzTime string) []string {
+	cmd := []string{tool, "test", "-count=1", gcflags}
+	cmd = append(cmd, buildFlags...)
+	if fuzzTime != "" {
+		cmd = append(cmd, "-fuzz=^Fuzz", "-fuzztime="+fuzzTime)
+	}
+	return append(cmd, ".")
+}
+
+// logosCaseExecCmd returns the executor argv prefix for a program built
+// by a .lgo run case: GOOS/GOARCH entries in c.runenv select the target
+// pair, and the harness default (goos/goarch, from -target or go env)
+// fills any missing half. A native pair returns nil, so the program
+// execs directly; a foreign pair uses the go_<goos>_<goarch>_exec
+// wrapper found on PATH when one exists, exactly as findExecCmd does
+// for the harness default, and falls back to a direct exec when none is
+// found.
+func logosCaseExecCmd(c logosCase) []string {
+	var caseGOOS, caseGOARCH string
+	for _, kv := range c.runenv {
+		if v, ok := strings.CutPrefix(kv, "GOOS="); ok {
+			caseGOOS = v
+			continue
+		}
+		if v, ok := strings.CutPrefix(kv, "GOARCH="); ok {
+			caseGOARCH = v
+		}
+	}
+	if caseGOOS == "" && caseGOARCH == "" {
+		return findExecCmd()
+	}
+	if caseGOOS == "" {
+		caseGOOS = goos
+	}
+	if caseGOARCH == "" {
+		caseGOARCH = goarch
+	}
+	if caseGOOS == runtime.GOOS && caseGOARCH == runtime.GOARCH {
+		return nil
+	}
+	if p, err := exec.LookPath(fmt.Sprintf("go_%s_%s_exec", caseGOOS, caseGOARCH)); err == nil {
+		return []string{p}
+	}
+	return nil
+}
+
+// runLogosLgoRun runs one staged main-package .lgo run case: build the
+// staged module with `logos build`, then execute the built binary.
+// Separating build from execution ensures successful compiler diagnostics
+// (such as portability warnings) do not pollute the executed program's
+// output stream, so .out comparisons validate only what the program
+// printed. Warnings emitted during a successful build stay observable
+// via t.Logf in verbose test logs, while build failures remain failures.
+// Execution resolves the target executor (bundled go_js_wasm_exec for
+// js/wasm) and compares program stdout and stderr against .out exactly.
+func (t test) runLogosLgoRun(c logosCase, base, tempDir string, runcmd runCmd) error {
+	buildFlags, optFlags := splitOptFlags(c.flags)
+	buildCmd := []string{logosToolPath(t.T), "build", t.goGcflags()}
+	buildCmd = withLinkshared(buildCmd)
+	buildCmd = append(buildCmd, buildFlags...)
+	buildCmd = append(buildCmd, optFlags...)
+	buildCmd = append(buildCmd, "-o", "a.exe", ".")
+	buildOut, err := runcmd(buildCmd...)
+	if err != nil {
+		return err
+	}
+	if len(buildOut) > 0 {
+		t.Logf("logos build output:\n%s", buildOut)
+	}
+	full := filepath.Join(tempDir, base)
+	if len(t.wantedErrors(full, base)) > 0 {
+		if err := t.errorCheck(string(buildOut), c.auto, full, base, "./"+base, base); err != nil {
+			return err
+		}
+	}
+	exe := filepath.Join(tempDir, "a.exe")
+	execCmd := append(slices.Clone(logosCaseExecCmd(c)), exe)
+	execCmd = append(execCmd, c.args...)
+	out, err := runcmd(execCmd...)
+	if err != nil {
+		return err
+	}
+	return t.checkExpectedOutput(out)
+}
+
+// runLogosLgoTest runs one staged _test.lgo run case with `logos test`.
+func (t test) runLogosLgoTest(buildFlags []string, runcmd runCmd) error {
+	cmd := logosTestCmd(logosToolPath(t.T), t.goGcflags(), buildFlags, os.Getenv(logosFuzzTimeEnv))
+	_, err := runcmd(cmd...)
+	return err
 }
 
 // runLogosLgoAsmcheck runs one staged .lgo asmcheck case with the same

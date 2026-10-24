@@ -359,10 +359,13 @@ func (fl *fileLower) reparseTopCopy(text string, cf *syntax.ConstForStmt, fctx c
 // the types of its own nodes.
 func (fl *fileLower) miniCheckCopies(blocks []*syntax.BlockStmt, cf *syntax.ConstForStmt, fctx cfFuncCtx) {
 	ctx := types2.LogosCopyContext{
-		Sig:     fctx.sig,
-		Disqual: fl.pkg.info.LogosDisqual[fctx.body],
-		Funcs:   fl.pkg.ctExp.copyFuncs,
-		Aliases: fl.cfAliases(),
+		Sig:      fctx.sig,
+		Disqual:  fl.pkg.info.LogosDisqual[fctx.body],
+		Funcs:    fl.pkg.ctExp.copyFuncs,
+		Aliases:  fl.cfAliases(),
+		MaxSteps: fl.pkg.info.LogosCTFEMaxSteps,
+		Importer: fl.pkg.info.LogosImporter,
+		Context:  fl.pkg.info.LogosContext,
 	}
 	if enclosing := fl.pkg.info.Scopes[cf]; enclosing != nil {
 		ctx.Scope = enclosing.Parent()
@@ -376,10 +379,17 @@ func (fl *fileLower) miniCheckCopies(blocks []*syntax.BlockStmt, cf *syntax.Cons
 // cfAliases returns the synthesized package aliases of the file so far,
 // each keyed by the package object it names.
 func (fl *fileLower) cfAliases() map[*types2.Package]string {
-	if set := logosTypeImports[fl.file]; set != nil {
-		return set.qual
+	reg := fl.getGenImports()
+	if reg == nil {
+		return nil
 	}
-	return nil
+	out := make(map[*types2.Package]string, len(reg.qual))
+	for path, q := range reg.qual {
+		if pkg := reg.pkgs[path]; pkg != nil && q != "" {
+			out[pkg] = q
+		}
+	}
+	return out
 }
 
 // adoptRegion appends text to the working buffer as a new region and

@@ -144,7 +144,7 @@ func TestCompileHintsLgoPackage(t *testing.T) {
 	for _, s := range f.Sites {
 		kinds[s.Kind]++
 	}
-	for _, k := range []string{SiteTry, SiteInterp, SiteConstSwitch} {
+	for _, k := range []string{SiteTry, SiteInterp, SiteConstSwitch, SiteConstFor} {
 		if kinds[k] != 1 {
 			t.Errorf("%d %s sites, want 1", kinds[k], k)
 		}

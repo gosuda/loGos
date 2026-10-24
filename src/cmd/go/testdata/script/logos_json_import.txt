@@ -1,0 +1,189 @@
+# M11-S1: every logos package implicitly imports logos/rt/json, including
+# the external test package; a Go package that imports a loGo/s package
+# gets it too, so the generated MarshalJSON and UnmarshalJSON resolve for
+# the importer; plain Go packages never get the import. Generated static
+# JSON traversal and binary helpers also need direct compiler dependencies
+# on reflect, fmt, encoding/binary, math, and slices, even when the source
+# file imports nothing.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+cd w
+
+# A command-line file with only two tagged fields needs generated imports,
+# not just the imports visible in the original source. In particular, fmt
+# must have a packagefile entry for generated binary decoder errors.
+cd l
+logos run probe.lgo
+stderr '^\{"id":7,"name":"x"\}$'
+cd ..
+
+# The implicit dependency of a .lgo package that never names the import.
+logos list -f '{{.Deps}}' ./l/a
+stdout 'logos/rt/json'
+logos list -compiled -f '{{.Imports}}' ./l/a
+stdout 'encoding/binary'
+stdout 'fmt'
+stdout 'math'
+stdout 'reflect'
+stdout 'slices'
+
+# The external test build passes and carries the import in its own list.
+logos test ./l/...
+stdout 'ok\s+example\.com/l/a'
+logos list -test -f '{{.ImportPath}} {{.Deps}}' ./l/...
+stdout 'example\.com/l/a_test \[example\.com/l/a\.test\] \[.*logos/rt/json.*\]'
+
+# A Go importer in another module marshals and unmarshals through the
+# generated methods, in the same bytes encoding/json writes.
+logos run ./g
+stdout '^\{"id":7,"name":"x\\u003cy"\} <nil>$'
+stdout '^7 gone <nil>$'
+stdout '^logos: json: missing required non-nil field Profile.Bio$'
+logos list -f '{{.Deps}}' ./g
+stdout 'logos/rt/json'
+
+# Plain Go packages never gain the import, under either command.
+cd ../gomod
+go list -deps .
+! stdout 'logos/rt/json'
+logos list -deps .
+! stdout 'logos/rt/json'
+
+-- w/go.work --
+go 1.27
+
+use (
+	./l
+	./g
+)
+
+-- w/l/go.mod --
+module example.com/l
+
+go 1.27
+
+-- w/l/probe.lgo --
+package main
+
+type Probe struct {
+	ID int64 `json:"id"`
+	Name string `json:"name"`
+}
+
+func main() {
+	data, err := (Probe{ID: 7, Name: "x"}).MarshalJSON()
+	if err != nil {
+		panic(err)
+	}
+	println(string(data))
+}
+
+-- w/l/a/a.lgo --
+package a
+
+type User struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
+type Profile struct {
+	Bio *string `json:"bio"`
+}
+
+-- w/l/a/a_test.lgo --
+package a_test
+
+import (
+	"encoding/json"
+	"testing"
+
+	"example.com/l/a"
+)
+
+// These declarations belong to the external test package itself, so its
+// imports must be augmented independently of the package under test.
+type ExternalBinary struct {
+	Name string `json:"name"`
+	Float float64 `json:"float"`
+	Values []int32 `json:"values"`
+	Counts map[string]int64 `json:"counts"`
+}
+
+type ExternalWalk struct {
+	Value string `json:"value"`
+	Next []ExternalWalk `json:"next,omitempty"`
+}
+
+func TestExternalGeneratedImports(t *testing.T) {
+	value := ExternalBinary{Name: "x", Float: 1.5, Values: []int32{7}, Counts: map[string]int64{"a": 9}}
+	data, err := value.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got ExternalBinary
+	if err := got.UnmarshalBinary(data); err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "x" || got.Float != 1.5 || len(got.Values) != 1 || got.Values[0] != 7 || (got.Counts["a"] ?? -1) != 9 {
+		t.Fatal("binary round trip changed fields")
+	}
+	wdata, werr := (ExternalWalk{Value: "x"}).MarshalJSON()
+	if werr == nil {
+		if string(wdata) != `{"value":"x"}` {
+			t.Fatalf("got %s", wdata)
+		}
+	} else {
+		t.Fatal(werr)
+	}
+}
+
+func TestExternalJSON(t *testing.T) {
+	data, err := json.Marshal(a.User{ID: 1, Name: "n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"id":1,"name":"n"}` {
+		t.Fatalf("got %s", data)
+	}
+}
+
+-- w/g/go.mod --
+module example.com/g
+
+go 1.27
+
+-- w/g/main.go --
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"example.com/l/a"
+)
+
+func main() {
+	data, err := json.Marshal(a.User{ID: 7, Name: "x<y"})
+	fmt.Printf("%s %v\n", data, err)
+
+	var u a.User
+	err = json.Unmarshal([]byte(`{"name":"gone","id":7,"extra":[1]}`), &u)
+	fmt.Println(u.ID, u.Name, err)
+
+	var p a.Profile
+	err = json.Unmarshal([]byte(`{}`), &p)
+	fmt.Println(err)
+}
+
+-- gomod/go.mod --
+module example.com/goplain
+
+go 1.27
+
+-- gomod/main.go --
+package main
+
+import "fmt"
+
+func main() { fmt.Println("go-ok") }

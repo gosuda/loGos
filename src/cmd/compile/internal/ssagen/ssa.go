@@ -363,6 +363,9 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 	if fn.Pragma&ir.Nosplit != 0 {
 		s.f.NoSplit = true
 	}
+	if ssa.LogosNoLBFile(base.Ctxt.PosTable.Pos(fn.Pos()).Filename()) || ssa.LogosNoLBFunc(base.Ctxt.Pkgpath, fn.Sym().Name) {
+		s.f.LogosNoLB = true
+	}
 	s.f.ABI0 = ssaConfig.ABI0
 	s.f.ABI1 = ssaConfig.ABI1
 	s.f.ABIDefault = abiForFunc(nil, ssaConfig.ABI0, ssaConfig.ABI1)
@@ -8054,6 +8057,8 @@ func (e *ssafn) Syslook(name string) *obj.LSym {
 		return ir.Syms.WBZero
 	case "wbMove":
 		return ir.Syms.WBMove
+	case "logosImmixStoreBarrier":
+		return typecheck.LookupRuntimeFunc("logosImmixStoreBarrier")
 	case "cgoCheckMemmove":
 		return ir.Syms.CgoCheckMemmove
 	case "cgoCheckPtrWrite":

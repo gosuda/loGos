@@ -1,0 +1,421 @@
+# M5-S2: imported const func boundary values and types (T-201, T-Sec6, R-U2).
+# Anchor: Tony Hoare, Richard Feynman
+#
+# Tests cross-package compile-time evaluation and boundary behavior:
+# 1. Private named integer result as package const and local const,
+#    verifying constant array bounds, methods, and %T representation,
+#    with exported named and basic typed scalar controls.
+# 2. Private struct result with an unexported field exposed only through
+#    an exported read method, surviving native execution and plain-Go eject.
+# 3. Named private slice result with len < cap and initialized tail,
+#    preserving len/cap, elements, and methods while respecting const-view
+#    len-bound policy in Logos; Go caller inspects spare capacity tail.
+# 4. Const map with private named value type passed to const funcs,
+#    verifying copy-on-argument protection and comma-ok lookup/iteration.
+# 5. Readonly storage witness for a foreign-imported computed slice with
+#    spare capacity, using a separate Go child process attempting a write.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+# 1. Consumer module evaluates imported const funcs at compile time.
+cd consumer
+logos run .
+cp stdout $WORK/want.txt
+stdout '^priv-int: 7 3$'
+stdout '^priv-int-methods: 14 6$'
+stdout '^priv-int-types: produce\.privateInt produce\.privateInt$'
+stdout '^priv-int-derived: 8 16$'
+stdout '^priv-int-forwarded: 7 14$'
+stdout '^priv-int-derived-type: produce\.privateInt$'
+stdout '^control-vals: 20 15 105 102$'
+stdout '^control-methods: 21 16$'
+stdout '^control-types: produce\.ExportedInt int$'
+stdout '^bound-lens: 7 3$'
+stdout '^struct-getter: code=42 realm=vault$'
+stdout '^struct-method-id: code=42 realm=vault$'
+stdout '^priv-slice: len=3 cap=5 elems=10,20,30 sum=60$'
+stdout '^exp-slice: len=3 cap=5 elems=11,22,33 total=66$'
+stdout '^map-const-eval: alpha=20 beta=40 missing=-1$'
+stdout '^map-arg-copy: mut=999 after=20$'
+stdout '^map-comma-ok: a=10,true b=20,true c=false$'
+stdout '^map-entry-method: 20$'
+stdout '^map-order: alpha,beta$'
+stdout '^opaque-slice: len=3 cap=5 elems=1000,3000$'
+
+# 2. Eject consumer module to plain Go and verify parity.
+logos eject -o ../eject_out
+exists ../eject_out/main.go
+cd ../eject_out
+go run .
+cmp stdout $WORK/want.txt
+cd ../consumer
+cd ..
+
+# 3. Plain Go caller module sees ordinary function semantics, inspects tails,
+# and executes the readonly storage witness child process.
+cd gocaller
+logos run .
+stdout '^gocaller-struct: code=99 realm=go-secret$'
+stdout '^gocaller-priv-slice: len=3 cap=5 sum=60 tail=40,50$'
+stdout '^gocaller-exp-slice: len=3 cap=5 total=66 tail=44,55$'
+stdout '^gocaller-map: alpha=20$'
+stdout '^gocaller-opaque-tail: len=5 cap=5 tail=4000,5000$'
+stdout '^snapshot-slice: len=3 cap=5 sum=60 tail=40,50$'
+stdout '^rodata-witness: fault OK$'
+cd ..
+
+-- lib/go.mod --
+module example.com/valuelib
+
+go 1.27
+
+-- lib/produce/produce.lgo --
+package produce
+
+// 1. Private named integer type with method.
+type privateInt int
+
+func (p privateInt) Double() int {
+	return int(p) * 2
+}
+
+const func MakePrivateInt(x int) privateInt {
+	return privateInt(x)
+}
+
+// Exported named integer control.
+type ExportedInt int
+
+func (e ExportedInt) Inc() ExportedInt {
+	return e + 1
+}
+
+const func MakeExportedInt(x int) ExportedInt {
+	return ExportedInt(x)
+}
+
+// Basic typed scalar control.
+const func MakeBasicInt(x int) int {
+	return x + 100
+}
+
+// 2. Private struct result with unexported field.
+type privateSecret struct {
+	hiddenCode int
+	realm      string
+}
+
+func (s privateSecret) Code() int {
+	return s.hiddenCode
+}
+
+func (s privateSecret) Realm() string {
+	return s.realm
+}
+
+const func MakePrivateSecret(code int, realm string) privateSecret {
+	return privateSecret{hiddenCode: code, realm: realm}
+}
+
+// 3. Named private slice with len < cap and initialized tail.
+type privateSlice []int
+
+func (s privateSlice) Sum() int {
+	tot := 0
+	for i := 0; i < len(s); i++ {
+		tot += s[i]
+	}
+	return tot
+}
+
+const func MakePrivateSliceWithTail() privateSlice {
+	full := privateSlice{10, 20, 30, 40, 50}
+	return full[:3]
+}
+
+// Exported slice control with spare capacity.
+type ExportedSlice []int
+
+func (s ExportedSlice) Total() int {
+	tot := 0
+	for i := 0; i < len(s); i++ {
+		tot += s[i]
+	}
+	return tot
+}
+
+const func MakeExportedSliceWithTail() ExportedSlice {
+	full := ExportedSlice{11, 22, 33, 44, 55}
+	return full[:3]
+}
+
+// 4. Const map with private named value type.
+type privateEntry struct {
+	Weight int
+}
+
+func (e privateEntry) Doubled() int {
+	return e.Weight * 2
+}
+
+const func MakeConstMap() map[string]privateEntry {
+	return map[string]privateEntry{
+		"beta":  privateEntry{Weight: 20},
+		"alpha": privateEntry{Weight: 10},
+	}
+}
+
+const func LookupConstMap(m map[string]privateEntry, key string) int {
+	entry, ok := m[key]
+	if ok {
+		return entry.Weight * 2
+	}
+	return -1
+}
+
+const func MutateMapArg(m map[string]privateEntry, key string, newWeight int) int {
+	m[key] = privateEntry{Weight: newWeight}
+	entry, ok := m[key]
+	if ok {
+		return entry.Weight
+	}
+	return 0
+}
+
+// 5. Exported computed opaque slice with spare capacity.
+type OpaqueTag int
+
+func (t OpaqueTag) Code() int {
+	return int(t) * 10
+}
+
+const func MakeOpaqueSliceWithTail() []OpaqueTag {
+	full := []OpaqueTag{100, 200, 300, 400, 500}
+	return full[:3]
+}
+
+const ExportedOpaqueSlice = MakeOpaqueSliceWithTail()
+
+-- lib/snapshot/snapshot.lgo --
+package snapshot
+
+import "example.com/valuelib/produce"
+
+// Snapshot is a const defined OUTSIDE the defining package of privateSlice,
+// computed from an imported const func. This exercises foreign opaque
+// keepCall and spare-capacity handling.
+const Snapshot = produce.MakePrivateSliceWithTail()
+
+-- consumer/go.mod --
+module example.com/consumer
+
+go 1.27
+
+require example.com/valuelib v0.0.0
+
+replace example.com/valuelib => ../lib
+
+-- consumer/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/valuelib/produce"
+)
+
+// Const initializers forcing compile-time evaluation.
+const (
+	// Case 1: Package const private named int and controls.
+	PkgPrivateInt  = produce.MakePrivateInt(7)
+	PkgExportedInt = produce.MakeExportedInt(20)
+	PkgBasicInt    = produce.MakeBasicInt(5)
+	DerivedPrivateInt   = produce.MakePrivateInt(7) + 1
+	ForwardedPrivateInt = PkgPrivateInt
+
+	// Case 2: Private struct result.
+	SecretVal = produce.MakePrivateSecret(42, "vault")
+
+	// Case 3: Slices with spare capacity.
+	PrivSliceVal = produce.MakePrivateSliceWithTail()
+	ExpSliceVal  = produce.MakeExportedSliceWithTail()
+
+	// Case 4: Const map with private named value type.
+	RecordedMap    = produce.MakeConstMap()
+	LookupAlpha    = produce.LookupConstMap(RecordedMap, "alpha")
+	LookupBeta     = produce.LookupConstMap(RecordedMap, "beta")
+	LookupMissing  = produce.LookupConstMap(RecordedMap, "gamma")
+	MutatedAlpha   = produce.MutateMapArg(RecordedMap, "alpha", 999)
+	LookupAfterMut = produce.LookupConstMap(RecordedMap, "alpha")
+
+	// Case 5: Exported computed opaque slice with spare capacity.
+	ConsumerOpaqueSlice = produce.MakeOpaqueSliceWithTail()
+)
+
+// Constant array bounds proving compile-time integer constant semantics.
+type PkgPrivateBound [PkgPrivateInt]byte
+
+func checkInts() {
+	const (
+		localPrivateInt  = produce.MakePrivateInt(3)
+		localExportedInt = produce.MakeExportedInt(15)
+		localBasicInt    = produce.MakeBasicInt(2)
+	)
+	type LocalPrivateBound [localPrivateInt]byte
+
+	var _ PkgPrivateBound
+	var _ LocalPrivateBound
+
+	fmt.Printf("priv-int: %d %d\n", PkgPrivateInt, localPrivateInt)
+	fmt.Printf("priv-int-methods: %d %d\n", PkgPrivateInt.Double(), localPrivateInt.Double())
+	fmt.Printf("priv-int-types: %T %T\n", PkgPrivateInt, localPrivateInt)
+	fmt.Printf("priv-int-derived: %d %d\n", DerivedPrivateInt, DerivedPrivateInt.Double())
+	fmt.Printf("priv-int-forwarded: %d %d\n", ForwardedPrivateInt, ForwardedPrivateInt.Double())
+	fmt.Printf("priv-int-derived-type: %T\n", DerivedPrivateInt)
+	fmt.Printf("control-vals: %d %d %d %d\n", PkgExportedInt, localExportedInt, PkgBasicInt, localBasicInt)
+	fmt.Printf("control-methods: %d %d\n", PkgExportedInt.Inc(), localExportedInt.Inc())
+	fmt.Printf("control-types: %T %T\n", PkgExportedInt, PkgBasicInt)
+	fmt.Printf("bound-lens: %d %d\n", len(PkgPrivateBound{}), len(LocalPrivateBound{}))
+}
+
+func checkStruct() {
+	sec := SecretVal
+	var readCode func() int = sec.Code
+	var readRealm func() string = sec.Realm
+	fmt.Printf("struct-getter: code=%d realm=%s\n", sec.Code(), sec.Realm())
+	fmt.Printf("struct-method-id: code=%d realm=%s\n", readCode(), readRealm())
+}
+
+func checkSlices() {
+	ps := PrivSliceVal
+	fmt.Printf("priv-slice: len=%d cap=%d elems=%d,%d,%d sum=%d\n",
+		len(ps), cap(ps), ps[0], ps[1], ps[2], ps.Sum())
+
+	es := ExpSliceVal
+	fmt.Printf("exp-slice: len=%d cap=%d elems=%d,%d,%d total=%d\n",
+		len(es), cap(es), es[0], es[1], es[2], es.Total())
+}
+
+func checkMaps() {
+	entryA, okA := RecordedMap["alpha"]
+	entryB, okB := RecordedMap["beta"]
+	_, okC := RecordedMap["gamma"]
+
+	fmt.Printf("map-const-eval: alpha=%d beta=%d missing=%d\n",
+		LookupAlpha, LookupBeta, LookupMissing)
+	fmt.Printf("map-arg-copy: mut=%d after=%d\n",
+		MutatedAlpha, LookupAfterMut)
+	fmt.Printf("map-comma-ok: a=%d,%t b=%d,%t c=%t\n",
+		entryA.Weight, okA, entryB.Weight, okB, okC)
+	fmt.Printf("map-entry-method: %d\n", entryA.Doubled())
+
+	// Sorted key iteration per SPEC 9.1: single ordered sequence.
+	order := ""
+	for k := range RecordedMap {
+		if order != "" {
+			order += ","
+		}
+		order += k
+	}
+	fmt.Printf("map-order: %s\n", order)
+}
+
+func checkOpaque() {
+	fmt.Printf("opaque-slice: len=%d cap=%d elems=%d,%d\n",
+		len(ConsumerOpaqueSlice), cap(ConsumerOpaqueSlice),
+		ConsumerOpaqueSlice[0].Code(), ConsumerOpaqueSlice[2].Code())
+}
+
+func main() {
+	checkInts()
+	checkStruct()
+	checkSlices()
+	checkMaps()
+	checkOpaque()
+}
+
+-- gocaller/go.mod --
+module example.com/gocaller
+
+go 1.27
+
+require example.com/valuelib v0.0.0
+
+replace example.com/valuelib => ../lib
+
+-- gocaller/main.go --
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+
+	"example.com/valuelib/produce"
+	"example.com/valuelib/snapshot"
+)
+
+func runWitness() {
+	self, err := os.Executable()
+	if err != nil {
+		fmt.Printf("witness-error: %v\n", err)
+		return
+	}
+	cmd := exec.Command(self, "child-rodata-write")
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	runErr := cmd.Run()
+	code := -1
+	if ee, ok := runErr.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	}
+	out := buf.String()
+	faulted := code != 0 && strings.Contains(out, "fault") && !strings.Contains(out, "STORE-SUCCEEDED")
+	if faulted {
+		fmt.Println("rodata-witness: fault OK")
+	} else {
+		fmt.Printf("rodata-witness: store succeeded (code=%d out=%q)\n", code, out)
+	}
+}
+
+func checkGoSemantics() {
+	sec := produce.MakePrivateSecret(99, "go-secret")
+	fmt.Printf("gocaller-struct: code=%d realm=%s\n", sec.Code(), sec.Realm())
+
+	gps := produce.MakePrivateSliceWithTail()
+	gpsTail := gps[:cap(gps)]
+	fmt.Printf("gocaller-priv-slice: len=%d cap=%d sum=%d tail=%d,%d\n",
+		len(gps), cap(gps), gps.Sum(), gpsTail[3], gpsTail[4])
+
+	ges := produce.MakeExportedSliceWithTail()
+	gesTail := ges[:cap(ges)]
+	fmt.Printf("gocaller-exp-slice: len=%d cap=%d total=%d tail=%d,%d\n",
+		len(ges), cap(ges), ges.Total(), gesTail[3], gesTail[4])
+
+	cmap := produce.MakeConstMap()
+	alphaVal := produce.LookupConstMap(cmap, "alpha")
+	fmt.Printf("gocaller-map: alpha=%d\n", alphaVal)
+
+	tail := produce.ExportedOpaqueSlice[:cap(produce.ExportedOpaqueSlice)]
+	fmt.Printf("gocaller-opaque-tail: len=%d cap=%d tail=%d,%d\n",
+		len(tail), cap(tail), tail[3].Code(), tail[4].Code())
+
+	// Inspect snapshot defined in foreign package from imported private slice const func.
+	snapTail := snapshot.Snapshot[:cap(snapshot.Snapshot)]
+	fmt.Printf("snapshot-slice: len=%d cap=%d sum=%d tail=%d,%d\n",
+		len(snapshot.Snapshot), cap(snapshot.Snapshot), snapshot.Snapshot.Sum(), snapTail[3], snapTail[4])
+}
+
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "child-rodata-write" {
+		snapshot.Snapshot[0] = 9999
+		fmt.Println("STORE-SUCCEEDED")
+		return
+	}
+	checkGoSemantics()
+	runWitness()
+}

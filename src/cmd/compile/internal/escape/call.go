@@ -30,6 +30,7 @@ func (e *escape) call(ks []hole, call ir.Node) {
 	case ir.OCALLFUNC, ir.OCALLINTER:
 		call := call.(*ir.CallExpr)
 		typecheck.AssertFixedCall(call)
+		e.foreignCgoFrame(call)
 
 		// Pick out the function callee(s), if statically known.
 		// fns collects all known callees; for a single static callee
@@ -99,12 +100,7 @@ func (e *escape) call(ks []hole, call ir.Node) {
 
 		if call.IsCompilerVarLive {
 			// Don't escape compiler-inserted KeepAlive.
-			if recvArg != nil {
-				argument(e.discardHole(), recvArg)
-			}
-			for _, arg := range args {
-				argument(e.discardHole(), arg)
-			}
+			e.compilerKeepAliveArgs(call, recvArg, args)
 		} else if isEscapeNonString(fns, fntype) {
 			// internal/abi.EscapeNonString forces its argument to
 			// the heap if it contains a non-string pointer. This is
@@ -413,6 +409,9 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 	}
 	if x := esc.Callee(); x >= 0 {
 		tagKs = append(tagKs, e.calleeHole().shift(x))
+	}
+	if x := esc.Foreign(); x >= 0 {
+		tagKs = append(tagKs, e.foreignLoc.asHole().shift(x))
 	}
 
 	if ks != nil {

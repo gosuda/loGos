@@ -192,6 +192,7 @@ func LoadUint32(addr *uint32) (val uint32)
 // Consider using the more ergonomic and less error-prone [Uintptr.Load] instead.
 //
 //go:noescape
+//go:linknamestd LoadUintptr
 func LoadUintptr(addr *uintptr) (val uintptr)
 
 // LoadPointer atomically loads *addr.

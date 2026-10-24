@@ -45,7 +45,7 @@ func constAsView(t types2.Type) *types2.ConstView {
 // EmitConstFacts adds const view positions and receiver/parameter
 // mutation flags for pkg to f (allocating it when nil) and returns f.
 // Objects are func names, type names, and T.M or (*T).M methods;
-// paths are R<i>, P<i>, F<name>, E, K, M<name> steps, mirroring the opt
+// paths are R<i>, P<i>, F<name>, E, K, D, M<name> steps, mirroring the opt
 // records. The mutation mask sets bit i for Pi, formatted as
 // normalized lowercase hex. Generic functions are skipped: their
 // bodies check per instantiation.
@@ -190,89 +190,7 @@ func emitTypeConsts(name string, t types2.Type, emit func(string, string)) {
 }
 
 func walkConstType(t types2.Type, path []string, object string, emit func(string, string), seen map[types2.Type]bool) {
-	if t == nil {
-		return
-	}
-	if c := constAsView(t); c != nil {
-		emit(object, joinPath(path))
-		walkConstType(c.Elem, append(slices.Clone(path), "E"), object, emit, seen)
-		return
-	}
-	u := types2.Unalias(t)
-	if seen[u] {
-		return
-	}
-	seen[u] = true
-	switch u := u.(type) {
-	case *types2.Slice:
-		walkConstType(u.Elem(), append(slices.Clone(path), "E"), object, emit, seen)
-	case *types2.Array:
-		walkConstType(u.Elem(), append(slices.Clone(path), "E"), object, emit, seen)
-	case *types2.Map:
-		walkConstType(u.Key(), append(slices.Clone(path), "K"), object, emit, seen)
-		walkConstType(u.Elem(), append(slices.Clone(path), "E"), object, emit, seen)
-	case *types2.Pointer:
-		walkConstType(u.Elem(), path, object, emit, seen)
-	case *types2.Chan:
-		walkConstType(u.Elem(), path, object, emit, seen)
-	case *types2.Signature:
-		if params := u.Params(); params != nil {
-			for i := range params.Len() {
-				v := params.At(i)
-				if v == nil {
-					continue
-				}
-				walkConstType(v.Type(), append(slices.Clone(path), fmt.Sprintf("P%d", i)), object, emit, seen)
-			}
-		}
-		if results := u.Results(); results != nil {
-			for i := range results.Len() {
-				v := results.At(i)
-				if v == nil {
-					continue
-				}
-				walkConstType(v.Type(), append(slices.Clone(path), fmt.Sprintf("R%d", i)), object, emit, seen)
-			}
-		}
-	case *types2.Struct:
-		for i := range u.NumFields() {
-			f := u.Field(i)
-			if f == nil || !f.Exported() {
-				continue
-			}
-			walkConstType(f.Type(), append(slices.Clone(path), "F"+f.Name()), object, emit, seen)
-		}
-	case *types2.Interface:
-		for i := range u.NumExplicitMethods() {
-			m := u.ExplicitMethod(i)
-			if m == nil || !m.Exported() {
-				continue
-			}
-			sig, ok := m.Type().(*types2.Signature)
-			if !ok {
-				continue
-			}
-			mbase := append(slices.Clone(path), "M"+m.Name())
-			if params := sig.Params(); params != nil {
-				for j := range params.Len() {
-					v := params.At(j)
-					if v == nil {
-						continue
-					}
-					walkConstType(v.Type(), append(slices.Clone(mbase), fmt.Sprintf("P%d", j)), object, emit, seen)
-				}
-			}
-			if results := sig.Results(); results != nil {
-				for j := range results.Len() {
-					v := results.At(j)
-					if v == nil {
-						continue
-					}
-					walkConstType(v.Type(), append(slices.Clone(mbase), fmt.Sprintf("R%d", j)), object, emit, seen)
-				}
-			}
-		}
-	}
+	walkQualType(t, path, object, nil, emit, seen)
 }
 
 // constFuncDecl pairs a declared function with its syntax and type.

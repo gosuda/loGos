@@ -534,7 +534,7 @@ func (fc *funcLower) tryAssignCore(s *syntax.AssignStmt, t *syntax.TryExpr, call
 			errDefineOf(stmtPos, []syntax.Expr{lhsMark}, callMark, nameOf(tpos, errSpelling)),
 			errCheckOf(stmtPos, nameOf(tpos, errSpelling), exitText),
 		}, tw.subs)
-		return fc.groupPrependJoin(tpos, spanStart, native), text, spanStart, spanEnd
+		return fc.groupPrependJoin(stmtPos, spanStart, native), text, spanStart, spanEnd
 	}
 	errDecl := nameOf(tpos, errSpelling)
 	errUse := nameOf(tpos, errSpelling)
@@ -551,7 +551,7 @@ func (fc *funcLower) tryAssignCore(s *syntax.AssignStmt, t *syntax.TryExpr, call
 		assignOf(stmtPos, withErrT, []syntax.Expr{callMark}),
 		errCheckOf(stmtPos, nameOf(tpos, errSpelling), exitText),
 	})}, tw.subs)
-	return fc.groupPrependJoin(tpos, spanStart, native), text, spanStart, spanEnd
+	return fc.groupPrependJoin(stmtPos, spanStart, native), text, spanStart, spanEnd
 }
 
 // lowerTryExpr lowers f()? as an expression statement.
@@ -594,7 +594,7 @@ func (fc *funcLower) tryExprCore(s *syntax.ExprStmt, t *syntax.TryExpr, call *sy
 			errCheckOf(stmtPos, nameOf(tpos, errSpelling), exitText),
 		}, tw.subs)
 	}
-	return fc.groupPrependJoin(tpos, spanStart, native), text, spanStart, spanEnd
+	return fc.groupPrependJoin(stmtPos, spanStart, native), text, spanStart, spanEnd
 }
 
 // trimSpanBytes trims ASCII white space around src.

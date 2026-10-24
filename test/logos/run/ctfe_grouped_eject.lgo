@@ -1,0 +1,22 @@
+// run
+
+package main
+
+// Grouped non-static composite consts move after their group when
+// ejected; the moved vars must land outside the group and outside
+// the following type group.
+
+const (
+	rows = []map[string]int{{"a": 1}}
+	more = []map[string]int{{"b": 2}}
+)
+
+type (
+	Label string
+)
+
+var tag Label = "rows"
+
+func main() {
+	println(tag, rows[0]["a"] ?? -1, more[0]["b"] ?? -1)
+}

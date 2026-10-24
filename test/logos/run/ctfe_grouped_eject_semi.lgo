@@ -1,0 +1,12 @@
+// run
+
+package main
+
+// Single-line grouped composite: the moved var must land after the
+// semicolon that terminates the group, not before it.
+
+const ( rows = []map[string]int{{"a": 1}} ); var first = rows[0]["a"] ?? -1
+
+func main() {
+	println(first, len(rows))
+}

@@ -35,6 +35,7 @@ var goRules = []string{
 	"complexity::cognitive_overflow",
 	"perf::large_backing_array_pin",
 	"perf::time_after_in_loop",
+	"correctness::printf_misuse",
 }
 
 // lgoRules are the 8 rules that never apply to Go packages.
@@ -139,10 +140,10 @@ func g() {
 	}
 }
 
-// TestRuleScopesSpecCounts pins the 13 and 8 of SPEC Sec 1.2.
+// TestRuleScopesSpecCounts pins the 14 and 8 of SPEC Sec 1.2.
 func TestRuleScopesSpecCounts(t *testing.T) {
-	if len(goRules) != 13 || len(lgoRules) != 8 {
-		t.Fatalf("goRules = %d, lgoRules = %d, want 13 and 8", len(goRules), len(lgoRules))
+	if len(goRules) != 14 || len(lgoRules) != 8 {
+		t.Fatalf("goRules = %d, lgoRules = %d, want 14 and 8", len(goRules), len(lgoRules))
 	}
 }
 

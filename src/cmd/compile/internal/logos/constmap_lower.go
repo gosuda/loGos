@@ -40,20 +40,146 @@ const constMapSwitchMax = 8
 
 // constMapGen is one registered const map of the package.
 type constMapGen struct {
-	name string // prefix of the generated names, unique in the package
-	obj  *types2.Const
-	val  ctfe.Value
+	name        string // prefix of the generated names, unique in the package
+	obj         *types2.Const
+	val         ctfe.Value
+	init        syntax.Expr
+	nativeDecls []syntax.Decl
 }
 
 func (g *constMapGen) lookupName() string { return g.name + "_lookup" }
 func (g *constMapGen) sortedName() string { return g.name + "_sorted" }
 func (g *constMapGen) mapName() string    { return g.name + "_map" }
 func (g *constMapGen) tabName() string    { return g.name + "_tab" }
+func (g *constMapGen) matName() string    { return g.name + "_mat" }
+func (g *constMapGen) buildName() string  { return g.name + "_build" }
+func (g *constMapGen) valName() string    { return g.name + "_val" }
+func (g *constMapGen) allName() string    { return g.name + "_all" }
+
+func constMapBearing(vals []ctfe.Value) bool {
+	for _, v := range vals {
+		if !rodataStaticKeptValue(v) {
+			return true
+		}
+	}
+	return false
+}
+
+type constMapEmission struct {
+	name        string
+	kT          string
+	vT          string
+	mapT        string
+	keyTexts    []string
+	valTexts    []string
+	builderBody string
+	hashExpr    string
+	order       []int
+	layout      *constMapLayout
+	isSwitch    bool
+	bearing     bool
+}
+
+func emitConstMapDecls(e constMapEmission) string {
+	var b strings.Builder
+	name := e.name
+	if !e.bearing {
+		fmt.Fprintf(&b, "%s\nvar %s_sorted = []%s.ConstEntry[%s, %s]{", rodataMarker, name, rtAlias, e.kT, e.vT)
+		for j, i := range e.order {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "{Key: %s, Val: %s}", e.keyTexts[i], e.valTexts[i])
+		}
+		b.WriteString("}\n")
+	} else {
+		fmt.Fprintf(&b, "%s\nvar %s_sorted = []%s.ConstEntry[%s, uint32]{", rodataMarker, name, rtAlias, e.kT)
+		for j, i := range e.order {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "{Key: %s, Val: %d}", e.keyTexts[i], i)
+		}
+		b.WriteString("}\n")
+	}
+	fmt.Fprintf(&b, "var %s_mat %s.ConstMapMaterialization[%s, %s, %s]\n", name, rtAlias, e.mapT, e.kT, e.vT)
+	fmt.Fprintf(&b, "func %s_build() %s { return %s }\n", name, e.mapT, e.builderBody)
+	fmt.Fprintf(&b, "func %s_map() %s { return %s_mat.Get(%s_build) }\n", name, e.mapT, name, name)
+	if e.bearing {
+		fmt.Fprintf(&b, "func %s_val(idx uint32) %s {\n\tswitch idx {\n", name, e.vT)
+		for i := range e.valTexts {
+			fmt.Fprintf(&b, "\tcase %d:\n\t\treturn %s\n", i, e.valTexts[i])
+		}
+		fmt.Fprintf(&b, "\t}\n\tvar zero %s\n\treturn zero\n}\n", e.vT)
+		fmt.Fprintf(&b, "func %s_all(yield func(%s, %s) bool) {\n\tfor _, e := range %s_sorted {\n\t\tif !yield(e.Key, %s_val(e.Val)) {\n\t\t\treturn\n\t\t}\n\t}\n}\n", name, e.kT, e.vT, name, name)
+	}
+	if e.isSwitch {
+		if !e.bearing {
+			fmt.Fprintf(&b, "func %s_lookup(k %s) (%s, bool) {\n\tswitch k {\n", name, e.kT, e.vT)
+			for i := range e.keyTexts {
+				fmt.Fprintf(&b, "\tcase %s:\n\t\treturn %s, true\n", e.keyTexts[i], e.valTexts[i])
+			}
+			fmt.Fprintf(&b, "\t}\n\tvar zero %s\n\treturn zero, false\n}\n", e.vT)
+			return b.String()
+		}
+		fmt.Fprintf(&b, "func %s_lookup(k %s) (%s, bool) {\n\tswitch k {\n", name, e.kT, e.vT)
+		for i := range e.keyTexts {
+			fmt.Fprintf(&b, "\tcase %s:\n\t\treturn %s_val(%d), true\n", e.keyTexts[i], name, i)
+		}
+		fmt.Fprintf(&b, "\t}\n\tvar zero %s\n\treturn zero, false\n}\n", e.vT)
+		return b.String()
+	}
+	if !e.bearing {
+		fmt.Fprintf(&b, "%s\nvar %s = %s.ConstTable[%s, %s]{Salt: %d, Buckets: []%s.ConstBucket{", rodataMarker, name+"_tab", rtAlias, e.kT, e.vT, e.layout.salt, rtAlias)
+		for i, bk := range e.layout.buckets {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "{Off: %d, Size: %d, Seed: %d}", bk.off, bk.size, bk.seed)
+		}
+		fmt.Fprintf(&b, "}, Slots: []%s.ConstSlot[%s, %s]{", rtAlias, e.kT, e.vT)
+		for s, ki := range e.layout.slots {
+			if s > 0 {
+				b.WriteString(", ")
+			}
+			if ki < 0 {
+				b.WriteString("{}")
+				continue
+			}
+			fmt.Fprintf(&b, "{Key: %s, Val: %s, Occ: true}", e.keyTexts[ki], e.valTexts[ki])
+		}
+		b.WriteString("}}\n")
+		fmt.Fprintf(&b, "func %s_lookup(k %s) (%s, bool) {\n\treturn %s.Get(%s, k)\n}\n", name, e.kT, e.vT, name+"_tab", e.hashExpr)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "%s\nvar %s = %s.ConstTable[%s, uint32]{Salt: %d, Buckets: []%s.ConstBucket{", rodataMarker, name+"_tab", rtAlias, e.kT, e.layout.salt, rtAlias)
+	for i, bk := range e.layout.buckets {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "{Off: %d, Size: %d, Seed: %d}", bk.off, bk.size, bk.seed)
+	}
+	fmt.Fprintf(&b, "}, Slots: []%s.ConstSlot[%s, uint32]{", rtAlias, e.kT)
+	for s, ki := range e.layout.slots {
+		if s > 0 {
+			b.WriteString(", ")
+		}
+		if ki < 0 {
+			b.WriteString("{}")
+			continue
+		}
+		fmt.Fprintf(&b, "{Key: %s, Val: %d, Occ: true}", e.keyTexts[ki], ki)
+	}
+	b.WriteString("}}\n")
+	fmt.Fprintf(&b, "func %s_lookup(k %s) (%s, bool) {\n\tif idx, ok := %s.Get(%s, k); ok {\n\t\treturn %s_val(idx), true\n\t}\n\tvar zero %s\n\treturn zero, false\n}\n", name, e.kT, e.vT, name+"_tab", e.hashExpr, name, e.vT)
+	return b.String()
+}
 
 // collectConstMaps registers every single-name const of the package whose
 // evaluated value is a map. Names carry a package-wide sequence number, so
 // const maps in different functions never collide.
 func collectConstMaps(files []*syntax.File, info *types2.Info) map[*types2.Const]*constMapGen {
+	clearConstMat()
 	out := map[*types2.Const]*constMapGen{}
 	seq := 0
 	for _, file := range files {
@@ -70,10 +196,12 @@ func collectConstMaps(files []*syntax.File, info *types2.Info) map[*types2.Const
 			if !ok || v.Type() == nil || v.Type().Kind != ctfe.KMap {
 				return true
 			}
+			init := cd.Values
 			out[obj] = &constMapGen{
 				name: fmt.Sprintf("_logos_cm%d_%s", seq, cd.NameList[0].Value),
 				obj:  obj,
 				val:  v,
+				init: init,
 			}
 			seq++
 			return true
@@ -113,6 +241,14 @@ func constMapElem(t types2.Type) types2.Type {
 // records its generated declarations for this file.
 func (fl *fileLower) lowerConstMapSpec(cd *syntax.ConstDecl, g *constMapGen) {
 	fl.needRT = true
+	if _, ejectText, ok := fl.constMapOwnedTexts(g, cd.Pos()); ok {
+		decls := g.nativeDecls
+		fl.markConstMapTables(decls, g)
+		fl.constDecls = append(fl.constDecls, decls...)
+		fl.constText += "\n" + ejectText
+		fl.dropConstSpec(cd)
+		return
+	}
 	text := fl.constMapText(g, cd.Pos())
 	decls := parseConstMapDecls(text, cd.Pos())
 	fl.markConstMapTables(decls, g)
@@ -129,7 +265,11 @@ func (fl *fileLower) lowerConstMapSpec(cd *syntax.ConstDecl, g *constMapGen) {
 func (fl *fileLower) markConstMapTables(decls []syntax.Decl, g *constMapGen) {
 	for _, d := range decls {
 		vd, ok := d.(*syntax.VarDecl)
-		if !ok || len(vd.NameList) != 1 || vd.NameList[0].Value == g.name+"_map" {
+		if !ok || len(vd.NameList) != 1 {
+			continue
+		}
+		v := vd.NameList[0].Value
+		if v != g.sortedName() && v != g.tabName() {
 			continue
 		}
 		fl.rodataVars = append(fl.rodataVars, rodataVar{vd: vd})
@@ -159,72 +299,47 @@ func (fl *fileLower) constMapText(g *constMapGen, pos syntax.Pos) string {
 	kT := fl.mustSpell(mt.Key(), pos)
 	vT := fl.mustSpell(mt.Elem(), pos)
 	mapT := fl.mustSpell(elem, pos)
-
 	keys, vals := g.constMapEntries()
 	keyText := make([]string, len(keys))
 	valText := make([]string, len(vals))
 	for i := range keys {
-		keyText[i] = fl.mustRender(keys[i], pos)
-		valText[i] = fl.mustRender(vals[i], pos)
+		keyText[i] = fl.mustRenderWith(keys[i], mt.Key(), pos)
+		valText[i] = fl.mustRenderWith(vals[i], mt.Elem(), pos)
 	}
 	order := make([]int, len(keys))
 	for i := range order {
 		order[i] = i
 	}
 	slices.SortFunc(order, func(a, b int) int { return constKeyCompare(keys[a], keys[b]) })
-
-	var b strings.Builder
-	name := g.name
-	fmt.Fprintf(&b, "%s\nvar %s_sorted = []%s.ConstEntry[%s, %s]{", rodataMarker, name, rtAlias, kT, vT)
-	for j, i := range order {
-		if j > 0 {
-			b.WriteString(", ")
-		}
-		fmt.Fprintf(&b, "{Key: %s, Val: %s}", keyText[i], valText[i])
-	}
-	b.WriteString("}\n")
-	fmt.Fprintf(&b, "var %s_map = %s.Materialize(func() %s { return %s })\n", name, rtAlias, mapT, fl.mustRender(g.val, pos))
-
-	if len(keys) <= constMapSwitchMax {
-		fmt.Fprintf(&b, "func %s_lookup(k %s) (%s, bool) {\n\tswitch k {\n", name, kT, vT)
+	bearing := constMapBearing(vals)
+	isSwitch := len(keys) <= constMapSwitchMax
+	var layout *constMapLayout
+	if !isSwitch {
+		entries := make([]constMapKey, len(keys))
 		for i := range keys {
-			fmt.Fprintf(&b, "\tcase %s:\n\t\treturn %s, true\n", keyText[i], valText[i])
+			entries[i] = constMapKey{hash: constKeyHash(keys[i]), canon: constKeyCanon(keys[i])}
 		}
-		fmt.Fprintf(&b, "\t}\n\tvar zero %s\n\treturn zero, false\n}\n", vT)
-		return b.String()
-	}
-
-	entries := make([]constMapKey, len(keys))
-	for i := range keys {
-		entries[i] = constMapKey{hash: constKeyHash(keys[i]), canon: constKeyCanon(keys[i])}
-	}
-	layout, err := buildConstMap(entries, defaultConstMapBudget)
-	if err != nil {
-		base.Errorf("%s: %v", pos.String(), err)
-		base.ExitIfErrors()
-	}
-	fmt.Fprintf(&b, "%s\nvar %s = %s.ConstTable[%s, %s]{Salt: %d, Buckets: []%s.ConstBucket{", rodataMarker, g.tabName(), rtAlias, kT, vT, layout.salt, rtAlias)
-	for i, bk := range layout.buckets {
-		if i > 0 {
-			b.WriteString(", ")
+		var err error
+		layout, err = buildConstMap(entries, defaultConstMapBudget)
+		if err != nil {
+			base.Errorf("%s: %v", pos.String(), err)
+			base.ExitIfErrors()
 		}
-		fmt.Fprintf(&b, "{Off: %d, Size: %d, Seed: %d}", bk.off, bk.size, bk.seed)
 	}
-	fmt.Fprintf(&b, "}, Slots: []%s.ConstSlot[%s, %s]{", rtAlias, kT, vT)
-	for s, ki := range layout.slots {
-		if s > 0 {
-			b.WriteString(", ")
-		}
-		if ki < 0 {
-			b.WriteString("{}")
-			continue
-		}
-		fmt.Fprintf(&b, "{Key: %s, Val: %s, Occ: true}", keyText[ki], valText[ki])
-	}
-	b.WriteString("}}\n")
-	fmt.Fprintf(&b, "func %s_lookup(k %s) (%s, bool) {\n\treturn %s.Get(%s, k)\n}\n",
-		name, kT, vT, g.tabName(), fl.constKeyHashText(mt.Key(), "k", pos))
-	return b.String()
+	return emitConstMapDecls(constMapEmission{
+		name:        g.name,
+		kT:          kT,
+		vT:          vT,
+		mapT:        mapT,
+		keyTexts:    keyText,
+		valTexts:    valText,
+		builderBody: fl.mustRender(g.val, pos),
+		hashExpr:    fl.constKeyHashText(mt.Key(), "k", pos),
+		order:       order,
+		layout:      layout,
+		isSwitch:    isSwitch,
+		bearing:     bearing,
+	})
 }
 
 // constKeyHashText spells the base hash of key x of type t: the expression
@@ -280,6 +395,17 @@ func (fl *fileLower) mustRender(v ctfe.Value, pos syntax.Pos) string {
 	return renderExpr(e)
 }
 
+// mustRenderWith spells map elements with their declared type.
+func (fl *fileLower) mustRenderWith(v ctfe.Value, t types2.Type, pos syntax.Pos) string {
+	if e, err := v.Expr(pos); err == nil {
+		return renderExpr(e)
+	}
+	if _, s, ok := fl.buildMatValue(v, t, pos); ok {
+		return s
+	}
+	return fl.mustRender(v, pos)
+}
+
 // parseConstMapDecls parses generated declaration text into nodes at pos,
 // so every generated node carries the declaration's position.
 func parseConstMapDecls(text string, pos syntax.Pos) []syntax.Decl {
@@ -291,11 +417,29 @@ func parseConstMapDecls(text string, pos syntax.Pos) []syntax.Decl {
 		syntax.Inspect(d, func(n syntax.Node) bool {
 			if n != nil {
 				n.SetPos(pos)
+				setRbrace(n, pos)
 			}
 			return true
 		})
 	}
 	return file.DeclList
+}
+
+// setRbrace moves the closing brace position of a block, switch, select,
+// or composite literal to pos, so every scope boundary of generated code
+// stays at the generated declaration (the scope marker of dwarfgen
+// requires non-decreasing positions inside one function).
+func setRbrace(n syntax.Node, pos syntax.Pos) {
+	switch n := n.(type) {
+	case *syntax.BlockStmt:
+		n.Rbrace = pos
+	case *syntax.SwitchStmt:
+		n.Rbrace = pos
+	case *syntax.SelectStmt:
+		n.Rbrace = pos
+	case *syntax.CompositeLit:
+		n.Rbrace = pos
+	}
 }
 
 // lowerConstMapRanges rewrites `range m` over a const map to the sorted
@@ -313,6 +457,13 @@ func (fl *fileLower) lowerConstMapRanges() {
 		}
 		pos := rc.X.Pos()
 		start, end := fl.off(syntax.StartPos(rc.X)), fl.endOff(rc.X)
+		_, vals := g.constMapEntries()
+		if constMapBearing(vals) {
+			fl.add(start, end, g.allName())
+			fl.needRT = true
+			rc.X = nameOf(pos, g.allName())
+			return true
+		}
 		fl.add(start, end, rtAlias+".ConstAll("+g.sortedName()+")")
 		fl.needRT = true
 		rc.X = callOf(pos, selOf(pos, nameOf(pos, rtAlias), "ConstAll"), []syntax.Expr{nameOf(pos, g.sortedName())})

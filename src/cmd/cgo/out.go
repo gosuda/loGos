@@ -1727,6 +1727,10 @@ func _cgo_runtime_cgocall_fast(unsafe.Pointer, uintptr) int32
 //go:noescape
 func _cgoCheckPointer(interface{}, interface{})
 
+//go:linkname _cgoCanonicalizeSlot runtime.cgoCanonicalizeSlot
+//go:noescape
+func _cgoCanonicalizeSlot(any, unsafe.Pointer)
+
 //go:linkname _cgoCheckResult runtime.cgoCheckResult
 //go:noescape
 func _cgoCheckResult(interface{})

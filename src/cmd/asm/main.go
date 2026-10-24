@@ -49,6 +49,7 @@ func main() {
 	ctxt.Flag_maymorestack = flags.DebugFlags.MayMoreStack
 	ctxt.Debugpcln = flags.DebugFlags.PCTab
 	ctxt.IsAsm = true
+	logosWasmStackSwitch(ctxt) // loGos hook: wasm stack switching.
 	ctxt.Pkgpath = *flags.Importpath
 	ctxt.Std = *flags.Std
 	ctxt.DwTextCount = objabi.DummyDwarfFunctionCountForAssembler()

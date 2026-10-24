@@ -51,7 +51,6 @@ func (fl *fileLower) lowerUnions() {
 		return true
 	})
 	fl.lowerUnionMembers()
-	fl.flushTypeImports()
 }
 
 // replaceSwitchExprs replaces each *syntax.SwitchExpr that n holds
@@ -107,13 +106,9 @@ func (fl *fileLower) lowerSwitchExpr(e *syntax.SwitchExpr) syntax.Expr {
 	if typ == nil {
 		base.Fatalf("logos: switch expression at %s has no checked type", pos.String())
 	}
-	text, ok := fl.spellType(typ)
+	resultType, text, ok := fl.spellTypeBoth(typ, pos)
 	if !ok {
-		base.Fatalf("logos: switch expression at %s has type %s that cannot be spelled in this file", pos.String(), text)
-	}
-	resultType, ok := typeExprAt(text, pos)
-	if !ok {
-		base.Fatalf("logos: cannot respell type %q of the switch expression at %s", text, pos.String())
+		base.Fatalf("logos: switch expression at %s has type %s that cannot be spelled in this file", pos.String(), typ)
 	}
 
 	results := fl.expandArmCases(e)
@@ -268,21 +263,6 @@ func (fl *fileLower) importNames() map[*types2.Package]string {
 	return fl.names
 }
 
-// typeImportSet collects the imports spellType synthesizes for one file:
-// every package of a spelled switch-expression result type that the file
-// does not import, mapped to the qualifier used for it, in first-use
-// order. Lowering runs file by file, so the set is filled while the
-// switch walk spells result types and drained at the end of lowerUnions.
-type typeImportSet struct {
-	qual  map[*types2.Package]string
-	order []*types2.Package
-}
-
-// logosTypeImports holds the pending synthesized imports per file under
-// lowering. It lives outside fileLower so the import machinery stays in
-// this M2 file; lower.go keeps only its hook line.
-var logosTypeImports = make(map[*syntax.File]*typeImportSet)
-
 // spellType renders typ as Go source in this file: names of the package
 // itself stand bare, and names from other packages always use a
 // synthesized import (see synthQualifier) recorded for flushTypeImports.
@@ -292,16 +272,23 @@ var logosTypeImports = make(map[*syntax.File]*typeImportSet)
 // false only when typ mentions an unexported name of another package,
 // which no import can spell.
 func (fl *fileLower) spellType(typ types2.Type) (string, bool) {
+	ok := spellableType(typ, fl.pkg.tpkg)
 	qualify := func(p *types2.Package) string {
 		if p == fl.pkg.tpkg {
 			return ""
+		}
+		if !ok {
+			// Unspellable types never reach the native tree, so their
+			// packages keep the plain name without recording an import
+			// flushTypeImports would otherwise emit unused.
+			return p.Name()
 		}
 		// packagePrefix never calls the qualifier with a nil package,
 		// so p is always a real package here.
 		return fl.synthQualifier(p)
 	}
 	text := types2.TypeString(typ, qualify)
-	return text, spellableType(typ, fl.pkg.tpkg)
+	return text, ok
 }
 
 // synthQualifier returns the qualifier spelling package p in this file,
@@ -309,69 +296,196 @@ func (fl *fileLower) spellType(typ types2.Type) (string, bool) {
 // reserved name, so it collides with neither user identifiers (which
 // cannot use the reserved prefix) nor the file's imports.
 func (fl *fileLower) synthQualifier(p *types2.Package) string {
-	set := logosTypeImports[fl.file]
-	if set == nil {
-		set = &typeImportSet{qual: make(map[*types2.Package]string)}
-		logosTypeImports[fl.file] = set
-	}
-	if q, found := set.qual[p]; found {
+	reg := fl.getGenImports()
+	reg.pkgs[p.Path()] = p
+	if q, found := reg.qual[p.Path()]; found {
 		return q
 	}
-	used := map[string]bool{rtAlias: true}
-	for _, name := range fl.importNames() {
-		used[name] = true
+	for prior, q := range fl.importNames() {
+		if prior.Path() == p.Path() && q != "" {
+			reg.qual[p.Path()] = q
+			reg.used[q] = true
+			if ownedEjectImports != nil {
+				if ownedEjectImports[fl.file] == nil {
+					ownedEjectImports[fl.file] = make(map[string]string)
+				}
+				ownedEjectImports[fl.file][p.Path()] = q
+			}
+			return q
+		}
 	}
-	for _, q := range set.qual {
-		used[q] = true
+	if existing, ok := fl.existingImportName(p.Path()); ok && existing != "" {
+		reg.qual[p.Path()] = existing
+		reg.used[existing] = true
+		if ownedEjectImports != nil {
+			if ownedEjectImports[fl.file] == nil {
+				ownedEjectImports[fl.file] = make(map[string]string)
+			}
+			ownedEjectImports[fl.file][p.Path()] = existing
+		}
+		return existing
 	}
 	var q string
 	for i := 0; ; i++ {
 		q = fmt.Sprintf("_logos_t%d", i)
-		if !used[q] {
+		if !reg.used[q] {
 			break
 		}
 	}
-	set.qual[p] = q
-	set.order = append(set.order, p)
+	reg.used[q] = true
+	reg.qual[p.Path()] = q
+	reg.order = append(reg.order, p.Path())
+	if ownedEjectImports != nil {
+		if ownedEjectImports[fl.file] == nil {
+			ownedEjectImports[fl.file] = make(map[string]string)
+		}
+		ownedEjectImports[fl.file][p.Path()] = q
+	}
 	return q
 }
 
-// flushTypeImports prepends one import declaration per synthesized package
-// and records the matching eject-text header edit. It runs at the end of
-// lowerUnions, so one import serves every switch expression of the file.
-// The header splice composes with addHeaderSplice: both are zero-width
-// inserts after the package clause.
-func (fl *fileLower) flushTypeImports() {
-	set := logosTypeImports[fl.file]
-	delete(logosTypeImports, fl.file)
-	if set == nil || len(set.order) == 0 {
-		return
-	}
-	pos := fl.file.Pos()
-	decls := make([]syntax.Decl, 0, len(set.order))
-	var text string
-	for _, p := range set.order {
-		q := set.qual[p]
-		decls = append(decls, at(&syntax.ImportDecl{
-			LocalPkgName: nameOf(pos, q),
-			Path:         litOf(pos, fmt.Sprintf("%q", p.Path()), syntax.StringLit),
-		}, pos))
-		text += "\n\nimport " + q + " " + fmt.Sprintf("%q", p.Path())
-	}
-	fl.file.DeclList = append(decls, fl.file.DeclList...)
-	off := fl.off(fl.file.PkgName.Pos())
-	ins := -1
-	scanSegment(fl.src, off, len(fl.src), func(t tok) bool {
-		if t.comment || t.auto {
+func containsIdent(s, ident string) bool {
+	idx := 0
+	for {
+		i := strings.Index(s[idx:], ident)
+		if i < 0 {
+			return false
+		}
+		pos := idx + i
+		beforeOk := pos == 0 || !isIdentChar(s[pos-1])
+		afterPos := pos + len(ident)
+		afterOk := afterPos >= len(s) || !isIdentChar(s[afterPos])
+		if beforeOk && afterOk {
 			return true
 		}
-		ins = t.end
-		return false
-	})
-	if ins < 0 {
-		ins = off
+		idx = pos + len(ident)
 	}
-	fl.add(ins, ins, text)
+}
+
+func isIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+// flushTypeImports prepends one import declaration per synthesized package
+// and records the matching eject-text header edit. It runs once at the end of
+// lowerFile, filtering by liveness across native AST and eject text.
+func (fl *fileLower) flushTypeImports() {
+	reg := fl.genImps
+	if reg == nil || len(reg.order) == 0 {
+		return
+	}
+	nativeUsed := fl.cfNamesInUse()
+	var ejectTexts []string
+	if fl.constText != "" {
+		ejectTexts = append(ejectTexts, fl.constText)
+	}
+	for _, sp := range fl.splices {
+		if len(sp.text) > 0 {
+			ejectTexts = append(ejectTexts, string(sp.text))
+		}
+	}
+	aliasInEject := func(alias string) bool {
+		for _, text := range ejectTexts {
+			if containsIdent(text, alias) {
+				return true
+			}
+		}
+		return false
+	}
+
+	pos := fl.file.Pos()
+	var decls []syntax.Decl
+	var text string
+	seen := make(map[string]bool)
+	for _, p := range reg.order {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		q := reg.qual[p]
+		if q == "" {
+			continue
+		}
+		if existing, ok := fl.existingImportName(p); ok && existing == q {
+			continue
+		}
+		if !nativeUsed[q] && !aliasInEject(q) {
+			continue
+		}
+		decls = append(decls, at(&syntax.ImportDecl{
+			LocalPkgName: nameOf(pos, q),
+			Path:         litOf(pos, fmt.Sprintf("%q", p), syntax.StringLit),
+		}, pos))
+		text += "\n\nimport " + q + " " + fmt.Sprintf("%q", p)
+	}
+	if len(decls) > 0 {
+		fl.file.DeclList = append(decls, fl.file.DeclList...)
+	}
+	if text != "" {
+		off := fl.off(fl.file.PkgName.Pos())
+		ins := -1
+		scanSegment(fl.src, off, len(fl.src), func(t tok) bool {
+			if t.comment || t.auto {
+				return true
+			}
+			ins = t.end
+			return false
+		})
+		if ins < 0 {
+			ins = off
+		}
+		fl.add(ins, ins, text)
+	}
+}
+
+// ownedTypeBridge delegates private-type spelling to UnifiedMapAdapters
+// (logos/ownedconstant.go). It is nil until that file registers. On a hit
+// it returns the ready-built native type node and the eject spelling for
+// t: native is a syntax node over exact compiler-owned registrations
+// (fresh recheck types, never a private name in package Scope and never
+// a reparsed text), eject names the copied-output alias. Callers use the
+// native node directly in the native tree and eject for add() text, in
+// the single source-order walk; no second map pass or skip flags. The
+// bridge records its own native/eject imports and sidecar requests; this
+// file records no synthQualifier on a bridge hit. A nil bridge or a miss
+// falls back to the historical spell paths, preserving generics and
+// aliases. Exact-node registration and sidecar transport live in
+// ownedconstant.go, not here.
+var ownedTypeBridge func(fl *fileLower, t types2.Type, pos syntax.Pos) (native syntax.Expr, eject string, ok bool)
+
+// ownedFieldBridge builds compiler-owned private field access for the
+// exact node e. Only exactly registered nodes pass; source-spelling
+// prefix match is not authority. Callers must pass the original
+// *syntax.OptSelectExpr, never a synthetic rebuild, plus the caller's
+// default native access and eject suffix for its receiver shape. On a hit
+// it returns the ready-built native access expression (exact registered
+// nodes the fresh recheck accepts) and the eject suffix spelling
+// (copied-output alias) separately: the native tree must never use source
+// spelling for a private member, or recheck rejects it. Nil until
+// ownedconstant.go registers; a nil bridge or a miss means no private
+// access.
+var ownedFieldBridge func(fl *fileLower, e *syntax.OptSelectExpr, defNative syntax.Expr, defEject string) (nativeAcc syntax.Expr, ejectSuffix string, ok bool)
+
+// spellTypeBoth spells typ for the two roots. A bridge hit returns the
+// adapter's native node plus eject spelling; otherwise native is the
+// historical spelling reparsed at pos and eject is that same spelling.
+// Callers must use native directly in the native tree and eject for
+// splice text (ejected source).
+func (fl *fileLower) spellTypeBoth(typ types2.Type, pos syntax.Pos) (native syntax.Expr, eject string, ok bool) {
+	if ownedTypeBridge != nil {
+		if n, e, ok := ownedTypeBridge(fl, typ, pos); ok {
+			return n, e, true
+		}
+	}
+	s, ok := fl.spellType(typ)
+	if !ok {
+		return nil, "", false
+	}
+	n, ok := typeExprAt(s, pos)
+	if !ok {
+		return nil, "", false
+	}
+	return n, s, true
 }
 
 // spellableType reports whether typ can be spelled in generated source:
@@ -586,8 +700,10 @@ type unionUse struct {
 	suffix  string        // helper-name suffix, unique per package
 	union   string        // Union field: "<pkg>.<name>"
 	members []types2.Type // direct members in declaration order
-	texts   []string      // spelled members, aligned with members
-	utext   string        // spelled union type
+	texts   []string      // eject spellings of members, aligned with members
+	utext   string        // eject spelling of the union type
+	nnodes  []syntax.Expr // native member type nodes, aligned with members
+	nnode   syntax.Expr   // native union type node
 }
 
 // isName returns the membership-test helper name of u.
@@ -797,17 +913,19 @@ func (ul *unionLower) useOf(t types2.Type, pos syntax.Pos) *unionUse {
 			return nil
 		}
 	}
-	utext, ok := fl.spellType(t)
+	nnode, utext, ok := fl.spellTypeBoth(t, pos)
 	if !ok {
 		base.Fatalf("logos: union type %s at %s cannot be spelled in this file", key, pos.String())
 	}
 	texts := make([]string, len(members))
+	nnodes := make([]syntax.Expr, len(members))
 	for i, m := range members {
-		mt, ok := fl.spellType(m)
+		nmt, mt, ok := fl.spellTypeBoth(m, pos)
 		if !ok {
 			base.Fatalf("logos: union member %s at %s cannot be spelled in this file", key, pos.String())
 		}
 		texts[i] = mt
+		nnodes[i] = nmt
 	}
 	var stem, ustr string
 	if named, ok := types2.Unalias(t).(*types2.Named); ok {
@@ -827,10 +945,30 @@ func (ul *unionLower) useOf(t types2.Type, pos syntax.Pos) *unionUse {
 		suffix = fmt.Sprintf("%s_%d", stem, i)
 	}
 	st.names[suffix] = true
-	u := &unionUse{suffix: suffix, union: ustr, members: members, texts: texts, utext: utext}
+	u := &unionUse{suffix: suffix, union: ustr, members: members, texts: texts, utext: utext, nnodes: nnodes, nnode: nnode}
 	st.byKey[key] = u
 	logosUnionUses[fl.file] = append(logosUnionUses[fl.file], u)
 	return u
+}
+
+// mustTypeExprAt parses text as a type at pos, stopping compilation on
+// failure. Eject alias spellings always parse; a failure is a diagnostic,
+// never a guessed type.
+func mustTypeExprAt(fl *fileLower, text string, pos syntax.Pos) syntax.Expr {
+	e, ok := typeExprAt(text, pos)
+	if !ok {
+		base.Fatalf("logos: cannot respell type %q", text)
+	}
+	return e
+}
+
+// mustTypeExprsAt parses each spelling of texts as a type at pos.
+func mustTypeExprsAt(fl *fileLower, texts []string, pos syntax.Pos) []syntax.Expr {
+	out := make([]syntax.Expr, len(texts))
+	for i, text := range texts {
+		out[i] = mustTypeExprAt(fl, text, pos)
+	}
+	return out
 }
 
 // emitHelpers appends the helper triple of u to the file, in the native
@@ -839,13 +977,14 @@ func (ul *unionLower) emitHelpers(u *unionUse) {
 	fl := ul.fl
 	pos := fl.file.Pos()
 	fl.needRT = true // _logos_assert_U panics with _logos_rt.UnionAssertionError
-	texpr := func(text string) syntax.Expr {
-		e, ok := typeExprAt(text, pos)
-		if !ok {
-			base.Fatalf("logos: cannot respell type %q", text)
-		}
-		return e
-	}
+	// Native and eject decls stay paired per helper: native decls carry
+	// the adapter's exact registered type nodes (fresh recheck types,
+	// never a reparsed private spelling), eject decls name the
+	// copied-output aliases. Both are built inline in this single pass;
+	// nothing is deferred to a later flush. Consistency across the two
+	// roots is snapshot isolation: each root renders the same helper
+	// shape from its own type nodes, and both are idempotent on revisit
+	// (helpers emit once per package).
 	anyField := func(name string) *syntax.Field {
 		return at(&syntax.Field{Name: nameOf(pos, name), Type: nameOf(pos, "any")}, pos)
 	}
@@ -856,84 +995,89 @@ func (ul *unionLower) emitHelpers(u *unionUse) {
 			Body: blockOf(pos, body),
 		}, pos)
 	}
-	memberCases := func() []syntax.Expr {
-		out := make([]syntax.Expr, len(u.texts))
-		for i, mt := range u.texts {
-			out[i] = texpr(mt)
+	build := func(utype syntax.Expr, mtypes []syntax.Expr) []syntax.Decl {
+		memberCases := func() []syntax.Expr {
+			return mtypes
 		}
-		return out
-	}
-	isCall := func(x syntax.Expr) *syntax.CallExpr {
-		return callOf(pos, nameOf(pos, u.isName()), []syntax.Expr{x})
-	}
-	unionAssert := func(x syntax.Expr) *syntax.AssertExpr {
-		return at(&syntax.AssertExpr{X: x, Type: texpr(u.utext)}, pos)
-	}
+		isCall := func(x syntax.Expr) *syntax.CallExpr {
+			return callOf(pos, nameOf(pos, u.isName()), []syntax.Expr{x})
+		}
+		unionAssert := func(x syntax.Expr) *syntax.AssertExpr {
+			return at(&syntax.AssertExpr{X: x, Type: utype}, pos)
+		}
 
-	// func _logos_is_U(v any) bool {
-	//   switch v.(type) { case <members>: return true }
-	//   return false
-	// }
-	isBody := []syntax.Stmt{
-		at(&syntax.SwitchStmt{
-			Tag: at(&syntax.TypeSwitchGuard{X: nameOf(pos, "v")}, pos),
-			Body: []*syntax.CaseClause{at(&syntax.CaseClause{
-				Cases: listOf(pos, memberCases()),
-				Body:  []syntax.Stmt{returnOf(pos, []syntax.Expr{nameOf(pos, "true")})},
-				Colon: pos,
-			}, pos)},
+		// func _logos_is_U(v any) bool {
+		//   switch v.(type) { case <members>: return true }
+		//   return false
+		// }
+		isBody := []syntax.Stmt{
+			at(&syntax.SwitchStmt{
+				Tag: at(&syntax.TypeSwitchGuard{X: nameOf(pos, "v")}, pos),
+				Body: []*syntax.CaseClause{at(&syntax.CaseClause{
+					Cases: listOf(pos, memberCases()),
+					Body:  []syntax.Stmt{returnOf(pos, []syntax.Expr{nameOf(pos, "true")})},
+					Colon: pos,
+				}, pos)},
+				Rbrace: pos,
+			}, pos),
+			returnOf(pos, []syntax.Expr{nameOf(pos, "false")}),
+		}
+		isFn := decl(u.isName(), []*syntax.Field{anyField("v")},
+			[]*syntax.Field{at(&syntax.Field{Type: nameOf(pos, "bool")}, pos)}, isBody)
+
+		// func _logos_assert_U(x any) U {
+		//   if !_logos_is_U(x) {
+		//     panic(&_logos_rt.UnionAssertionError{Value: x, Union: "<pkg>.U"})
+		//   }
+		//   return x.(U)
+		// }
+		errLit := at(&syntax.CompositeLit{
+			Type: rtSel(pos, "UnionAssertionError"),
+			ElemList: []syntax.Expr{
+				at(&syntax.KeyValueExpr{Key: nameOf(pos, "Value"), Value: nameOf(pos, "x")}, pos),
+				at(&syntax.KeyValueExpr{Key: nameOf(pos, "Union"), Value: litOf(pos, fmt.Sprintf("%q", u.union), syntax.StringLit)}, pos),
+			},
+			NKeys:  2,
 			Rbrace: pos,
-		}, pos),
-		returnOf(pos, []syntax.Expr{nameOf(pos, "false")}),
+		}, pos)
+		panicCall := callOf(pos, nameOf(pos, "panic"), []syntax.Expr{
+			at(&syntax.Operation{Op: syntax.And, X: errLit}, pos),
+		})
+		check := ifOf(pos, nil,
+			at(&syntax.Operation{Op: syntax.Not, X: isCall(nameOf(pos, "x"))}, pos),
+			[]syntax.Stmt{exprStmtOf(pos, panicCall)})
+		assertFn := decl(u.assertName(), []*syntax.Field{anyField("x")},
+			[]*syntax.Field{at(&syntax.Field{Type: utype}, pos)},
+			[]syntax.Stmt{check, returnOf(pos, []syntax.Expr{unionAssert(nameOf(pos, "x"))})})
+
+		// func _logos_assert2_U(x any) (U, bool) {
+		//   if _logos_is_U(x) { return x.(U), true }
+		//   var z U
+		//   return z, false
+		// }
+		hit := returnOf(pos, []syntax.Expr{unionAssert(nameOf(pos, "x")), nameOf(pos, "true")})
+		miss := []syntax.Stmt{
+			typedVarDecl(pos, nameOf(pos, "z"), utype),
+			returnOf(pos, []syntax.Expr{nameOf(pos, "z"), nameOf(pos, "false")}),
+		}
+		assert2Fn := decl(u.assert2Name(), []*syntax.Field{anyField("x")},
+			[]*syntax.Field{
+				at(&syntax.Field{Type: utype}, pos),
+				at(&syntax.Field{Type: nameOf(pos, "bool")}, pos),
+			},
+			[]syntax.Stmt{ifOf(pos, nil, isCall(nameOf(pos, "x")), []syntax.Stmt{hit}), miss[0], miss[1]})
+		return []syntax.Decl{isFn, assertFn, assert2Fn}
 	}
-	isFn := decl(u.isName(), []*syntax.Field{anyField("v")},
-		[]*syntax.Field{at(&syntax.Field{Type: nameOf(pos, "bool")}, pos)}, isBody)
-
-	// func _logos_assert_U(x any) U {
-	//   if !_logos_is_U(x) {
-	//     panic(&_logos_rt.UnionAssertionError{Value: x, Union: "<pkg>.U"})
-	//   }
-	//   return x.(U)
-	// }
-	errLit := at(&syntax.CompositeLit{
-		Type: rtSel(pos, "UnionAssertionError"),
-		ElemList: []syntax.Expr{
-			at(&syntax.KeyValueExpr{Key: nameOf(pos, "Value"), Value: nameOf(pos, "x")}, pos),
-			at(&syntax.KeyValueExpr{Key: nameOf(pos, "Union"), Value: litOf(pos, fmt.Sprintf("%q", u.union), syntax.StringLit)}, pos),
-		},
-		NKeys:  2,
-		Rbrace: pos,
-	}, pos)
-	panicCall := callOf(pos, nameOf(pos, "panic"), []syntax.Expr{
-		at(&syntax.Operation{Op: syntax.And, X: errLit}, pos),
-	})
-	check := ifOf(pos, nil,
-		at(&syntax.Operation{Op: syntax.Not, X: isCall(nameOf(pos, "x"))}, pos),
-		[]syntax.Stmt{exprStmtOf(pos, panicCall)})
-	assertFn := decl(u.assertName(), []*syntax.Field{anyField("x")},
-		[]*syntax.Field{at(&syntax.Field{Type: texpr(u.utext)}, pos)},
-		[]syntax.Stmt{check, returnOf(pos, []syntax.Expr{unionAssert(nameOf(pos, "x"))})})
-
-	// func _logos_assert2_U(x any) (U, bool) {
-	//   if _logos_is_U(x) { return x.(U), true }
-	//   var z U
-	//   return z, false
-	// }
-	hit := returnOf(pos, []syntax.Expr{unionAssert(nameOf(pos, "x")), nameOf(pos, "true")})
-	miss := []syntax.Stmt{
-		typedVarDecl(pos, nameOf(pos, "z"), texpr(u.utext)),
-		returnOf(pos, []syntax.Expr{nameOf(pos, "z"), nameOf(pos, "false")}),
-	}
-	assert2Fn := decl(u.assert2Name(), []*syntax.Field{anyField("x")},
-		[]*syntax.Field{
-			at(&syntax.Field{Type: texpr(u.utext)}, pos),
-			at(&syntax.Field{Type: nameOf(pos, "bool")}, pos),
-		},
-		[]syntax.Stmt{ifOf(pos, nil, isCall(nameOf(pos, "x")), []syntax.Stmt{hit}), miss[0], miss[1]})
-
-	fl.file.DeclList = append(fl.file.DeclList, isFn, assertFn, assert2Fn)
+	// Linearizability across roots: one inline build per root from its
+	// own type nodes; the eject parse below is local and infallible for
+	// bridge aliases (a Fatalf on failure keeps the diagnostic, never a
+	// guessed type). No outbox or saga: both roots derive from the same
+	// in-memory helper, not from cross-service events.
+	nativeDecls := build(u.nnode, u.nnodes)
+	ejectDecls := build(mustTypeExprAt(fl, u.utext, pos), mustTypeExprsAt(fl, u.texts, pos))
+	fl.file.DeclList = append(fl.file.DeclList, nativeDecls...)
 	var text strings.Builder
-	for _, d := range []syntax.Decl{isFn, assertFn, assert2Fn} {
+	for _, d := range ejectDecls {
 		text.WriteString("\n\n")
 		var buf bytes.Buffer
 		_, _ = syntax.Fprint(&buf, d, 0)

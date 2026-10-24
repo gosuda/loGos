@@ -140,6 +140,14 @@ func cgocall(fn, arg unsafe.Pointer) int32 {
 		throw("cgocall nil")
 	}
 
+	// The kernel and C reject colored addresses: untag the argument
+	// on the Go side before the trap. Foreign words pass through.
+	// This covers the top-level frame pointer only. Nested words C
+	// dereferences are judged canonical-or-pinned by the color-aware
+	// verdicts below; generated code reloads them pre-frame through
+	// the boundary canonicalizer at parent-wired call sites.
+	arg = logosZgcUntagArg(arg)
+
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(&racecgosync))
 	}
@@ -570,6 +578,58 @@ var racecgosync uint64 // represents possible synchronization in C code
 // also have to change to pin Go pointers that cannot point to Go
 // pointers.)
 
+// cgoCanonicalPP resolves pp to the address the collector means by it so
+// boundary verdicts judge the object named. A nested word healed to the
+// good color fails the heap test and would skip the pin check, silently
+// accepting an unpinned pointer; stale source words already resolve
+// through forwarding. Read-only: slots and C frames are untouched, so an
+// integer that alias heap in untyped memory is never rewritten.
+func cgoCanonicalPP(pp unsafe.Pointer) unsafe.Pointer {
+	return unsafe.Pointer(logosZgcCanonicalValue(uintptr(pp)))
+}
+
+// logosZgcCanonicalValue resolves v to the address the collector means by
+// it: stale source words forward through the table and color bits come
+// off, foreign words pass through. It reads only, allocates nothing, and
+// runs in any preemptible context. This lives in shared code (not the
+// tagged boundary file) so both collector configurations link it: the
+// off-build zgcCanonical stub keeps it identity there.
+func logosZgcCanonicalValue(v uintptr) uintptr {
+	if !zgcCycleEnabled() {
+		return v
+	}
+	return zgcCanonical(v)
+}
+
+// logosZgcCanonicalizeSlot rewrites *slot to its uncolored canonical
+// address when it differs, and reports whether it stored. The store is
+// an uncolored canonical word, the same shape every collector fixup
+// writes; the replaced word names the same object (or its published
+// copy, which is born marked), so no barrier is needed and concurrent
+// marking stays sound.
+//
+// Call only from preemptible code before the values are copied into a
+// foreign frame: cgocall and entersyscall themselves are nosplit and
+// cannot walk types, and healing a slot after C copied the value cannot
+// reach the copy. Generated cgo frames and syscall wrappers reload each
+// pointer they hand out through this helper before the trap
+// (parent-wired call sites, one slot at a time with the type metadata
+// the walker already owns); the runtime's own top-level untag in cgocall
+// stays the nosplit backstop for the frame pointer itself.
+//
+//go:nowritebarrierrec
+func logosZgcCanonicalizeSlot(slot *uintptr) bool {
+	if !zgcCycleEnabled() {
+		return false
+	}
+	c := zgcCanonical(*slot)
+	if c == *slot {
+		return false
+	}
+	*slot = c
+	return true
+}
+
 // cgoCheckPointer checks if the argument contains a Go pointer that
 // points to an unpinned Go pointer, and panics if it does.
 func cgoCheckPointer(ptr any, arg any) {
@@ -586,6 +646,7 @@ func cgoCheckPointer(ptr any, arg any) {
 		if !t.IsDirectIface() {
 			p = *(*unsafe.Pointer)(p)
 		}
+		p = cgoCanonicalPP(p)
 		if p == nil || !cgoIsGoPointer(p) {
 			return
 		}
@@ -672,6 +733,7 @@ func cgoCheckArg(t *_type, p unsafe.Pointer, indir, top bool, msg cgoErrorMsg) {
 		if indir {
 			p = *(*unsafe.Pointer)(p)
 		}
+		p = cgoCanonicalPP(p)
 		if !cgoIsGoPointer(p) {
 			return
 		}
@@ -688,6 +750,7 @@ func cgoCheckArg(t *_type, p unsafe.Pointer, indir, top bool, msg cgoErrorMsg) {
 			panic(cgoFormatErr(msg, t.Kind()))
 		}
 		p = *(*unsafe.Pointer)(add(p, goarch.PtrSize))
+		p = cgoCanonicalPP(p)
 		if !cgoIsGoPointer(p) {
 			return
 		}
@@ -699,6 +762,7 @@ func cgoCheckArg(t *_type, p unsafe.Pointer, indir, top bool, msg cgoErrorMsg) {
 		st := (*slicetype)(unsafe.Pointer(t))
 		s := (*slice)(p)
 		p = s.array
+		p = cgoCanonicalPP(p)
 		if p == nil || !cgoIsGoPointer(p) {
 			return
 		}
@@ -714,10 +778,11 @@ func cgoCheckArg(t *_type, p unsafe.Pointer, indir, top bool, msg cgoErrorMsg) {
 		}
 	case abi.String:
 		ss := (*stringStruct)(p)
-		if !cgoIsGoPointer(ss.str) {
+		str := cgoCanonicalPP(ss.str)
+		if !cgoIsGoPointer(str) {
 			return
 		}
-		if !top && !isPinned(ss.str) {
+		if !top && !isPinned(str) {
 			panic(cgoFormatErr(msg, t.Kind()))
 		}
 	case abi.Struct:
@@ -742,6 +807,7 @@ func cgoCheckArg(t *_type, p unsafe.Pointer, indir, top bool, msg cgoErrorMsg) {
 				return
 			}
 		}
+		p = cgoCanonicalPP(p)
 
 		if !cgoIsGoPointer(p) {
 			return
@@ -754,11 +820,166 @@ func cgoCheckArg(t *_type, p unsafe.Pointer, indir, top bool, msg cgoErrorMsg) {
 	}
 }
 
+// cgoCanonicalizeSlot walks the value ptr names starting at the original
+// variable slot, rewriting every pointer slot to its uncolored canonical
+// address. It follows the same type-driven traversal as cgoCheckArg but
+// never judges and never panics, so unpinned nesting is canonicalized
+// rather than rejected. Generated code calls it pre-frame for each
+// pointer argument, next to its _cgoCheckPointer emission, passing the
+// address of its own argument variable: healing the walker's copies
+// inside cgoCheckPointer could not reach what C reads, but healing the
+// originals before the frame is built can. No-op unless the zgc cycle
+// runs; preemptible context only.
+//
+//go:linkname cgoCanonicalizeSlot
+func cgoCanonicalizeSlot(ptr any, slot unsafe.Pointer) {
+	if slot == nil || !zgcCycleEnabled() {
+		return
+	}
+	ep := efaceOf(&ptr)
+	t := ep._type
+	if t == nil || !t.Pointers() {
+		return
+	}
+	if t.IsDirectIface() {
+		// The slot holds the value itself. Canonicalize the top
+		// word, then walk the referent for pointer kinds by their
+		// element type, which preserves the nested layout; other
+		// direct kinds have no walkable referent, matching the
+		// checker, which rejects them instead.
+		logosZgcCanonicalizeSlot((*uintptr)(slot))
+		if t.Kind() == abi.Pointer || t.Kind() == abi.UnsafePointer {
+			p := *(*unsafe.Pointer)(slot)
+			if p != nil {
+				pt := (*ptrtype)(unsafe.Pointer(t))
+				cgoCanonicalizeArg(pt.Elem, p, true)
+			}
+		}
+		return
+	}
+	cgoCanonicalizeArg(t, slot, true)
+}
+
+// cgoCanonicalizeArg rewrites every pointer slot of the value of type t
+// at p to its uncolored canonical address. The traversal mirrors
+// cgoCheckArg case for case (same typed metadata, same scoping, same
+// structural recursion profile) minus verdicts: panics become returns,
+// pin tests are skipped, and each descended slot is canonicalized first
+// so the walk continues into the canonical subgraph. Stores are plain
+// uncolored canonical words naming the same object or its born-marked
+// copy, so concurrent marking stays sound without a barrier.
+func cgoCanonicalizeArg(t *_type, p unsafe.Pointer, indir bool) {
+	if !t.Pointers() || p == nil {
+		return
+	}
+	switch t.Kind() {
+	default:
+		throw("can't happen")
+	case abi.Array:
+		at := (*arraytype)(unsafe.Pointer(t))
+		if !indir {
+			if at.Len != 1 {
+				throw("can't happen")
+			}
+			cgoCanonicalizeArg(at.Elem, p, !at.Elem.IsDirectIface())
+			return
+		}
+		for range at.Len {
+			cgoCanonicalizeArg(at.Elem, p, true)
+			p = add(p, at.Elem.Size_)
+		}
+	case abi.Chan, abi.Map, abi.Func:
+		// No walkable referent under the checker either. The top
+		// word is canonicalized by the caller.
+		if indir {
+			logosZgcCanonicalizeSlot((*uintptr)(p))
+		}
+	case abi.Interface:
+		it := *(**_type)(p)
+		if it == nil || inheap(uintptr(unsafe.Pointer(it))) {
+			return
+		}
+		dp := add(p, goarch.PtrSize)
+		logosZgcCanonicalizeSlot((*uintptr)(unsafe.Pointer(dp)))
+		p = *(*unsafe.Pointer)(dp)
+		if p == nil {
+			return
+		}
+		cgoCanonicalizeArg(it, p, !it.IsDirectIface())
+	case abi.Slice:
+		st := (*slicetype)(unsafe.Pointer(t))
+		s := (*slice)(p)
+		logosZgcCanonicalizeSlot((*uintptr)(unsafe.Pointer(&s.array)))
+		p = s.array
+		if p == nil {
+			return
+		}
+		if !st.Elem.Pointers() {
+			return
+		}
+		for range s.cap {
+			cgoCanonicalizeArg(st.Elem, p, true)
+			p = add(p, st.Elem.Size_)
+		}
+	case abi.String:
+		ss := (*stringStruct)(p)
+		logosZgcCanonicalizeSlot((*uintptr)(unsafe.Pointer(&ss.str)))
+	case abi.Struct:
+		st := (*structtype)(unsafe.Pointer(t))
+		if !indir {
+			if len(st.Fields) != 1 {
+				throw("can't happen")
+			}
+			cgoCanonicalizeArg(st.Fields[0].Typ, p, !st.Fields[0].Typ.IsDirectIface())
+			return
+		}
+		for _, f := range st.Fields {
+			if !f.Typ.Pointers() {
+				continue
+			}
+			cgoCanonicalizeArg(f.Typ, add(p, f.Offset), true)
+		}
+	case abi.Pointer, abi.UnsafePointer:
+		if indir {
+			logosZgcCanonicalizeSlot((*uintptr)(p))
+			p = *(*unsafe.Pointer)(p)
+			if p == nil {
+				return
+			}
+		}
+		cgoCanonicalizeUnknown(p)
+	}
+}
+
+// cgoCanonicalizeUnknown rewrites the pointer slots of the heap object at
+// p using heap type information, the same metadata
+// cgoCheckUnknownPointer judges with, minus verdicts. One level, like the
+// checker: pinned interiors stay a documented residual in both.
+func cgoCanonicalizeUnknown(p unsafe.Pointer) {
+	p = cgoCanonicalPP(p)
+	if !inheap(uintptr(p)) {
+		return
+	}
+	base, span, _ := findObject(uintptr(p), 0, 0)
+	if base == 0 {
+		return
+	}
+	tp := span.typePointersOfUnchecked(base)
+	for {
+		var addr uintptr
+		if tp, addr = tp.next(base + span.elemsize); addr == 0 {
+			break
+		}
+		logosZgcCanonicalizeSlot((*uintptr)(unsafe.Pointer(addr)))
+	}
+}
+
 // cgoCheckUnknownPointer is called for an arbitrary pointer into Go
 // memory. It checks whether that Go memory contains any other
 // pointer into unpinned Go memory. If it does, we panic.
 // The return values are unused but useful to see in panic tracebacks.
 func cgoCheckUnknownPointer(p unsafe.Pointer, msg cgoErrorMsg) (base, i uintptr) {
+	p = cgoCanonicalPP(p)
 	if inheap(uintptr(p)) {
 		b, span, _ := findObject(uintptr(p), 0, 0)
 		base = b
@@ -772,6 +993,7 @@ func cgoCheckUnknownPointer(p unsafe.Pointer, msg cgoErrorMsg) (base, i uintptr)
 				break
 			}
 			pp := *(*unsafe.Pointer)(unsafe.Pointer(addr))
+			pp = cgoCanonicalPP(pp)
 			if cgoIsGoPointer(pp) && !isPinned(pp) {
 				panic(cgoFormatErr(msg, abi.Pointer))
 			}

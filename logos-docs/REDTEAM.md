@@ -16,7 +16,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #10 | M9 | test/logos/lint/exhaustive_union_switch.lgo; src/cmd/go/testdata/script/logos_pedantic_lint.txt | tested |
 | #11 | M18 |  | planned |
 | #12 | M18 |  | planned |
-| #13 | M8, M9 | test/logos/lint/concurrent_multiword_race.lgo; test/logos/lint/concurrent_multiword_race_go.go | planned |
+| #13 | M8, M9 | test/logos/lint/concurrent_multiword_race.lgo; test/logos/lint/concurrent_multiword_race_go.go | tested |
 | #14 | M3 | src/internal/types/testdata/logos/narrowing.lgo | tested |
 | #15 | M13 |  | planned |
 | #16 | M5 | src/internal/types/testdata/logos/const_views.lgo (cvPlainReslice, cvPlainReuseLoop); test/logos/run/reslice_reuse.lgo | tested |
@@ -151,7 +151,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #145 | M4 | src/internal/types/testdata/logos/property_iface.lgo | tested |
 | #146 | M6 | src/cmd/compile/internal/logos/spread_test.go; test/logos/codegen/spread_nomemmove.lgo | tested |
 | #147 | M8 | src/logos/rt/group_test.go; test/logos/run/group_panic.lgo | tested |
-| #148 | M8, M9 | test/logos/lint/concurrent_multiword_race.lgo; test/logos/lint/concurrent_multiword_race_go.go | planned |
+| #148 | M8, M9 | test/logos/lint/concurrent_multiword_race.lgo; test/logos/lint/concurrent_multiword_race_go.go | tested |
 | #149 | M15 | test/logos/codegen/clear_kept.lgo | satisfied upstream |
 | #150 | M7 | src/cmd/go/testdata/script/logos_comptime_nodes.txt | tested |
 | #151 | M8 | test/logos/run/group_netpoll.lgo; src/runtime/logos_group_netpoll_test.go | tested |
@@ -160,7 +160,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #154 | M8 | src/logos/sync/sync_test.go (TestHotLayout) | tested |
 | #155 | M18 |  | planned |
 | #156 | M3 | src/internal/types/testdata/logos/error_first.lgo | tested |
-| #157 | M7, M9 | test/logos/lint/infinite_recursion.lgo; test/logos/lint/infinite_recursion_go.go | planned |
+| #157 | M7, M9 | test/logos/lint/infinite_recursion.lgo; test/logos/lint/infinite_recursion_go.go | tested |
 | #158 | M9 | test/logos/lint/large_backing_array_pin.lgo; test/logos/lint/large_backing_array_pin_go.go | tested |
 | #159 | M19 |  | planned |
 | #160 | M19, M20 |  | planned |

@@ -4973,6 +4973,8 @@ func rewriteValueAMD64(v *Value) bool {
 		return rewriteValueAMD64_OpLoadMasked8(v)
 	case OpLocalAddr:
 		return rewriteValueAMD64_OpLocalAddr(v)
+	case OpLogosArenaBump:
+		return rewriteValueAMD64_OpLogosArenaBump(v)
 	case OpLsh16x16:
 		return rewriteValueAMD64_OpLsh16x16(v)
 	case OpLsh16x32:
@@ -100092,6 +100094,21 @@ func rewriteValueAMD64_OpLocalAddr(v *Value) bool {
 		return true
 	}
 	return false
+}
+func rewriteValueAMD64_OpLogosArenaBump(v *Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (LogosArenaBump [s] chunk mem)
+	// result: (LoweredLogosArenaBump [s] chunk mem)
+	for {
+		s := auxIntToInt64(v.AuxInt)
+		chunk := v_0
+		mem := v_1
+		v.reset(OpAMD64LoweredLogosArenaBump)
+		v.AuxInt = int64ToAuxInt(s)
+		v.AddArg2(chunk, mem)
+		return true
+	}
 }
 func rewriteValueAMD64_OpLsh16x16(v *Value) bool {
 	v_1 := v.Args[1]

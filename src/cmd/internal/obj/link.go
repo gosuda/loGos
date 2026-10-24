@@ -1174,6 +1174,7 @@ type Link struct {
 	Retpoline            bool   // emit use of retpoline stubs for indirect jmp/call
 	Flag_maymorestack    string // If not "", call this function before stack checks
 	WasmProfile          bool   // wasm: selective resume points (loGo/s M16-S1, obj/wasm/dispatch_logos.go)
+	WasmStackSwitch      bool   // wasm: goroutines on continuations (loGo/s M16-S1, obj/wasm/stackswitch_logos.go)
 	KeepProgs            bool   // keep Progs intact after Free so Flush can run later
 	Bso                  *bufio.Writer
 	Pathname             string

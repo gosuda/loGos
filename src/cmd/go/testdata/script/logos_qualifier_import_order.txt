@@ -1,0 +1,58 @@
+# Canonical qualifier owner: forward and reverse import orders share one
+# Named/alias/instance identity for foreign const-view qualifiers.
+# Anchor: Tony Hoare, David Parnas.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+logos run ./forward
+stdout '^11 2$'
+
+logos run ./reverse
+stdout '^11 2$'
+
+-- go.mod --
+module example.com/order
+
+go 1.27
+
+-- a/a.lgo --
+package a
+
+type Box struct { Items const []int }
+
+func Make() Box { return Box{Items: []int{11, 22}} }
+
+-- b/b.lgo --
+package b
+
+import "example.com/order/a"
+
+func Make() a.Box { return a.Make() }
+
+-- forward/main.lgo --
+package main
+
+import (
+	"example.com/order/a"
+	"example.com/order/b"
+	"fmt"
+)
+
+func main() {
+	var value a.Box = b.Make()
+	fmt.Println(value.Items[0], len(value.Items))
+}
+
+-- reverse/main.lgo --
+package main
+
+import (
+	"example.com/order/b"
+	"example.com/order/a"
+	"fmt"
+)
+
+func main() {
+	var value a.Box = b.Make()
+	fmt.Println(value.Items[0], len(value.Items))
+}

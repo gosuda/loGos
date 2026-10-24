@@ -1,0 +1,81 @@
+//go:build js && wasm
+
+// run -goexperiment preemptibleloops -gcflags=all=-d=logosloopstride=4096
+
+// M15-S3 long-loop preemption on wasm: a goroutine spinning in a
+// call-free loop must not starve a second goroutine (red-team #137).
+// The back-edge counter fires the first reschedule check on iteration
+// 4096 and the next on 8192, never in the first 4095. Each phase spins a
+// fresh loop while a printer goroutine counts its own quanta; the counts
+// must read 0, 1, 2. wasm-only: native back-edge checks sample the stack
+// limit and never fire deterministically, so only the strip-mined
+// counter gives exact boundaries.
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"runtime"
+)
+
+var sink int
+
+func spin(n int) {
+	s := 0
+	for i := 0; i < n; i++ {
+		s += i
+	}
+	sink = s
+}
+
+func quanta(n int) (int, error) {
+	done := make(chan struct{})
+	count := 0
+	go group (context.Background()) {
+		go {
+			q := 0
+			for {
+				select {
+				case <-done:
+					count = q
+					q = -1
+				default:
+					runtime.Gosched()
+					q++
+				}
+				if q < 0 {
+					break
+				}
+			}
+		}
+		spin(n)
+		close(done)
+	}
+	return count, nil
+}
+
+func run() error {
+	runtime.GOMAXPROCS(1)
+	if q := quanta(4095)?; q != 0 {
+		fmt.Println("check fired in first 4095 iterations:", q)
+		os.Exit(1)
+	}
+	if q := quanta(4096)?; q != 1 {
+		fmt.Println("want 1 quantum at 4096, got", q)
+		os.Exit(1)
+	}
+	if q := quanta(8192)?; q != 2 {
+		fmt.Println("want 2 quanta at 8192, got", q)
+		os.Exit(1)
+	}
+	fmt.Println("ok")
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		panic(err)
+	}
+}
