@@ -184,6 +184,7 @@ func Batch(fns []*ir.Func, reassignOracles map[*ir.Func]*ir.ReassignOracle) {
 	b.finish(fns)
 	b.logosCollect()      // logos M9: escaping subslices of large backing stores.
 	b.logosArenaMark(fns) // logos M18-S2: arena vetoes and caller-region verdicts.
+	b.logosCollectHints() // logos M18-S2: hints mode escape and arena decisions.
 }
 
 func (b *batch) with(fn *ir.Func) *escape {

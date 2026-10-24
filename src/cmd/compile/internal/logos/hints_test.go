@@ -273,3 +273,68 @@ func TestHintsAllocWorstTierWins(t *testing.T) {
 		t.Errorf("merged allocs: %+v", got)
 	}
 }
+
+// TestHintsAllocTierMerge checks pairwise tier precedence at one source
+// position: heap beats both arena and stack, arena beats stack when both are
+// possible, and all three beat rodata, regardless of arrival order.
+func TestHintsAllocTierMerge(t *testing.T) {
+	tests := []struct {
+		first, second string
+		want          string
+	}{
+		// Arena vs Stack: arena beats stack both ways.
+		{TierStack, TierArena, TierArena},
+		{TierArena, TierStack, TierArena},
+		// Heap vs Arena: heap beats arena both ways.
+		{TierArena, TierHeap, TierHeap},
+		{TierHeap, TierArena, TierHeap},
+		// Heap vs Stack: heap beats stack both ways.
+		{TierStack, TierHeap, TierHeap},
+		{TierHeap, TierStack, TierHeap},
+		// Rodata vs others: others beat rodata.
+		{TierRodata, TierArena, TierArena},
+		{TierArena, TierRodata, TierArena},
+		{TierRodata, TierStack, TierStack},
+		{TierStack, TierRodata, TierStack},
+		{TierRodata, TierHeap, TierHeap},
+		{TierHeap, TierRodata, TierHeap},
+	}
+	for _, tc := range tests {
+		t.Run(tc.first+"+"+tc.second, func(t *testing.T) {
+			src := []byte("package p\n\nvar x = 1\n")
+			file := ejectParse(t, syntax.NewFileBase("a.go"), src, syntax.CheckBranches)
+			pkg, info := ejectCheck(t, file)
+			h := NewHints(pkg.Path())
+			h.AddFile(pkg, info, file, src)
+			h.AddAlloc(Alloc{File: "a.go", Line: 3, Col: 9, Tier: tc.first, Message: tc.first})
+			h.AddAlloc(Alloc{File: "a.go", Line: 3, Col: 9, Tier: tc.second, Message: tc.second})
+			got := onlyFile(t, h.Report()).Allocs
+			if len(got) != 1 || got[0].Tier != tc.want {
+				t.Fatalf("merge(%s, %s) = %+v, want tier %s", tc.first, tc.second, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHintsArenaAlloc checks that an arena allocation badge is assigned
+// when an allocation decision carries the arena tier.
+func TestHintsArenaAlloc(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("testdata", "hints", "sites.lgo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := ejectParse(t, syntax.NewFileBase("sites.lgo"), src, syntax.LogosMode|syntax.CheckBranches)
+	pkg, info := ejectCheck(t, file)
+	h := NewHints(pkg.Path())
+	h.AddFile(pkg, info, file, src)
+	makePos := positionAt(src, strings.Index(string(src), "make([]byte, n)")+len("make"))
+	// Byte column is 1-based.
+	line := makePos.Line + 1
+	col := len(string(src[:strings.Index(string(src), "make([]byte, n)")+len("make")])) - strings.LastIndex(string(src[:strings.Index(string(src), "make([]byte, n)")+len("make")]), "\n")
+	h.AddAlloc(Alloc{File: "sites.lgo", Line: line, Col: col, Tier: TierArena, Message: "make([]byte, n) does not escape"})
+	got := onlyFile(t, h.Report()).Allocs
+	a, ok := allocAt(got, makePos)
+	if !ok || a.Tier != TierArena {
+		t.Fatalf("arena alloc: got %+v, want tier %s at %+v", a, TierArena, makePos)
+	}
+}

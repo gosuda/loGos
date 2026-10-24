@@ -19,6 +19,7 @@ import (
 type LogosHintDecision struct {
 	Pos     src.XPos
 	Heap    bool
+	Arena   bool
 	Message string
 	Reason  string
 }
@@ -65,6 +66,18 @@ func (b *batch) logosCollectHints() {
 	}
 }
 
+// logosArenaHint reports whether n is an allocation placed in an arena.
+func logosArenaHint(n ir.Node, fn *ir.Func) bool {
+	if !LogosArenaEnabled() || fn == nil {
+		return false
+	}
+	m, ok := n.(*ir.MakeExpr)
+	if !ok || m.Op() != ir.OMAKESLICE {
+		return false
+	}
+	return LogosArenaMake(m, fn) || LogosArenaConstMake(m, fn) || LogosArenaRetMake(m, fn)
+}
+
 // logosHintOf returns the decision for loc, or false when loc is not an
 // allocation or a named variable that moved to the heap.
 func logosHintOf(loc *location) (LogosHintDecision, bool) {
@@ -73,7 +86,13 @@ func logosHintOf(loc *location) (LogosHintDecision, bool) {
 	if n == nil || !n.Pos().IsKnown() || !logosHintNode(n, heap) {
 		return LogosHintDecision{}, false
 	}
-	d := LogosHintDecision{Pos: n.Pos(), Heap: heap, Message: logosHintMessage(n, heap)}
+	arena := logosArenaHint(n, loc.curfn)
+	d := LogosHintDecision{
+		Pos:     n.Pos(),
+		Heap:    heap,
+		Arena:   arena,
+		Message: logosHintMessage(n, heap),
+	}
 	if heap {
 		d.Reason = HeapAllocReason(n)
 	}

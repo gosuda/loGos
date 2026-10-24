@@ -86,3 +86,8 @@ func names() []string {
 	}
 	return out
 }
+
+func arenaBuffer(n int) int {
+	buf := make([]byte, n)
+	return len(buf)
+}
