@@ -9,7 +9,7 @@ import "net/http"
 
 func badGet() {
 	resp, err := http.Get("http://example.com")
-	defer resp.Body.Close() // ERROR "\[correctness::httpresponse\]"
+	defer resp.Body.Close() // ERROR "\[correctness::httpresponse\]" "\[nogo::sa5001\]"
 	if err != nil {
 		return
 	}
@@ -38,6 +38,7 @@ func otherDefer() {
 func cleanup() {}
 
 //logos:allow(correctness::httpresponse)
+//logos:allow(nogo::sa5001)
 func allowedInGo() {
 	resp, err := http.Get("http://example.com")
 	defer resp.Body.Close()

@@ -12,20 +12,20 @@ import (
 )
 
 func badArgCount() {
-	fmt.Printf("user %s count %d\n", "alice") // ERROR "\[correctness::printf_misuse\]"
-	fmt.Sprintf("user %s count %d\n")         // ERROR "\[correctness::printf_misuse\]"
-	fmt.Fprintf(os.Stdout, "%s %s\n", "one")  // ERROR "\[correctness::printf_misuse\]"
-	fmt.Printf("count %d\n", 1, 2)            // ERROR "\[correctness::printf_misuse\]"
+	fmt.Printf("user %s count %d\n", "alice") // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
+	fmt.Sprintf("user %s count %d\n")         // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
+	fmt.Fprintf(os.Stdout, "%s %s\n", "one")  // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
+	fmt.Printf("count %d\n", 1, 2)            // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
 }
 
 func badType() {
-	fmt.Printf("%d\n", "not an int") // ERROR "\[correctness::printf_misuse\]"
-	fmt.Printf("%s\n", 42)           // ERROR "\[correctness::printf_misuse\]"
-	fmt.Printf("%t\n", 123)          // ERROR "\[correctness::printf_misuse\]"
+	fmt.Printf("%d\n", "not an int") // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
+	fmt.Printf("%s\n", 42)           // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
+	fmt.Printf("%t\n", 123)          // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
 }
 
 func badIndex() {
-	fmt.Printf("%[0]d\n", 1) // ERROR "\[correctness::printf_misuse\]"
+	fmt.Printf("%[0]d\n", 1) // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
 }
 
 func cleanForms(dynamic string) {

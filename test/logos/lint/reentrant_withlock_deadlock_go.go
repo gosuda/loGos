@@ -43,7 +43,7 @@ func lockParam(l *sync.Locked[int]) {
 	l.WithLock(func(n *int) { *n++ })
 }
 
-func lockByValue(l sync.Locked[int]) {
+func lockByValue(l sync.Locked[int]) { // ERROR "\[suspicious::copy_lock\]"
 	l.WithLock(func(n *int) { *n++ })
 }
 
@@ -230,7 +230,7 @@ func passDifferentParameter() {
 func passByValueCopy() {
 	var l sync.Locked[int]
 	l.WithLock(func(n *int) {
-		lockByValue(l)
+		lockByValue(l) // ERROR "\[suspicious::copy_lock\]"
 	})
 }
 
