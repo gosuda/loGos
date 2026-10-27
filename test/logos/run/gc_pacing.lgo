@@ -15,8 +15,8 @@ import (
 // re-executes itself as "child" with GODEBUG=gcpacertrace=1; the child starts
 // two collections by hand, and a cycle start under elastic pacing prints a
 // "pacer: elastic" line beside the upstream "pacer: assist ratio" line.
-// test/logos/run/gc_pacing_go.go is the plain-go twin that keeps the
-// upstream pacing.
+// test/logos/run/gc_pacing_go.go is the plain-go twin that reports the same
+// elastic pacing by default.
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "child" {

@@ -14,10 +14,12 @@ import "internal/runtime/atomic"
 type logosFractionalGoal = atomic.Float64
 
 // Elastic background marking (M19-S2, SPEC Sec 19, T-301.2). Under the
-// greentea collector the background mark utilization follows the PLAN curve
+// greentea collector and under an empty production-controller mode the
+// background mark utilization follows the PLAN curve
 // of live heap over heap goal instead of the fixed gcBackgroundUtilization.
 // Mark assist, its debt accounting and the CPU limiter are the upstream ones:
-// they stay the backstop when background marking falls behind.
+// they stay the backstop when background marking falls behind. An empty
+// test-controller mode keeps the upstream pacing.
 
 const (
 	// logosElasticFloor is the background utilization below logosElasticRise.
@@ -128,13 +130,15 @@ func (c *gcControllerState) logosElasticTotal(live, goal uint64) float64 {
 }
 
 // logosElasticStart replaces the worker split of a starting cycle when the
-// collector mode is greentea. dedicated is the upstream split. It returns the
+// collector mode is greentea or, for the runtime's own controller, empty.
+// dedicated is the upstream split. It returns the
 // number of dedicated workers to start, and sets the fractional goal for the
-// rest. Any other mode, and stop-the-world collection, keep the upstream
-// split. The caller holds worldsema with the world stopped.
+// rest. Any other mode, an empty test-controller mode, and stop-the-world
+// collection keep the upstream split. The caller holds worldsema with the world stopped.
 func (c *gcControllerState) logosElasticStart(procs int, dedicated int64) int64 {
 	e := &c.logosElastic
-	e.active = c.logosElasticMode() == "greentea" && debug.gcstoptheworld == 0
+	mode := c.logosElasticMode()
+	e.active = (mode == "greentea" || (!c.test && mode == "")) && debug.gcstoptheworld == 0
 	if !e.active {
 		return dedicated
 	}
@@ -253,7 +257,7 @@ func (e *logosElasticState) mean(d int64) float64 {
 // time-weighted mean goal instead; without it the cons/mark estimate would
 // credit the garbage collector with a quarter of the CPU while it ran with up
 // to three quarters of it. The result stays below logosElasticMaxUtilization.
-// Any other mode keeps upstream's value.
+// Any other mode, including an empty test-controller mode, keeps upstream's value.
 func (c *gcControllerState) logosElasticEndUtilization(utilization float64, now int64, procs int) float64 {
 	e := &c.logosElastic
 	if !e.active {

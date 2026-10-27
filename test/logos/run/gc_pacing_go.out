@@ -1,2 +1,2 @@
-elastic pacing: false
+elastic pacing: true
 assist ratio traced: true
