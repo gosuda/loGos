@@ -63,12 +63,15 @@ func logosPinChan(c *hchan, mem uintptr, elem *_type) {
 // maps_logosPinMapKey pins every heap object whose address the hash of the
 // map key at p mixes in (#159). The map code calls it before it hashes the
 // key. Holding the M keeps a stop-the-world evacuation from moving an object
-// between the read of its address and the pin. Shared by both moving
-// collectors; the gate selects the mode, not the lane.
+// between the read of its address and the pin. Immix uses this pin; zgc
+// resolves relocated keys through its side-table identity hash instead.
 //
 //go:linkname maps_logosPinMapKey internal/runtime/maps.logosPinMapKey
 func maps_logosPinMapKey(key *abi.Type, p unsafe.Pointer) {
-	if !logosMovingMode() {
+	if logosGCMode != "immix" {
+		// Immix pins address-hashed keys. ZGC instead relocates them
+		// and resolves lookups through its side-table identity hash
+		// (SPEC 8.4); pinning here would make that relocation impossible.
 		return
 	}
 	mp := acquirem()
