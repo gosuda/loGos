@@ -297,8 +297,9 @@ type (
 	// Name Type
 	//      Type
 	Field struct {
-		Name *Name // nil means anonymous field/parameter (structs/parameters), or embedded element (interfaces)
-		Type Expr  // field names declared in a list share the same Type (identical pointers)
+		Name  *Name // nil means anonymous field/parameter (structs/parameters), or embedded element (interfaces)
+		Type  Expr  // field names declared in a list share the same Type (identical pointers)
+		Const bool  // loGo/s only: `const` readonly interface method qualifier; never set for struct fields, parameters, ordinary funcs, or property elements (those use PropertyType.Const)
 		node
 	}
 
