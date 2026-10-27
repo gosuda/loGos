@@ -18,6 +18,8 @@ func (s *Walk) checkDepth(offset int64) error {
 	return nil
 }
 
+var walkMethodTypes = []reflect.Type{marshalerType, textMarshalerType}
+
 // checkMapKeys rejects maps whose key type the reflective encoder
 // cannot resolve, before the nil fast path: newMapEncoder selects
 // unsupportedTypeEncoder from the key type without consulting nilness,
