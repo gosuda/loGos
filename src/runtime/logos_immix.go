@@ -6,6 +6,7 @@ package runtime
 
 import (
 	"internal/byteorder"
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -34,12 +35,58 @@ type logosLineMark [logosImmixLines]uint8
 // logosImmixBlock is the off-heap metadata of one 32 KiB-aligned block of
 // the Go heap address space. A zero base marks metadata that was never
 // created.
+//
+// O4 production (M19-S5/S8): occupancy and dirt are separate planes with
+// explicit ownership. No allocation decision derives from lines; no marker
+// writes occupy or dirty.
+//
+//   - lines (recompute view): evac selection input rebuilt each cycle by
+//     logosBlockLines from authoritative mark bits. The barrier never
+//     writes it; unit tests cover the line/hole layer through it.
+//   - occupy (plane O): line set iff some slot of this block's span
+//     overlapping the line is allocated under the freeindex OR allocBits
+//     composite. Writers: span init (exclusive), allocation (mcache
+//     exclusivity, O2), sweep rebuild (sweeper sweepgen CAS, O3), STW
+//     claimSlot (O4 via allocator-owner helper). The barrier and the
+//     marker never write it.
+//   - dirty (plane D parity pair): production barrier input. Active table
+//     is dirty[epoch&1]; barrier ORs atomically (linearizable byte-OR)
+//     and enlists once per epoch; STW start flips epoch to a clean table,
+//     STW termination (after selection) clears the incoming table for
+//     exactly the previous cycle's dirtied blocks. Never merge post-flip.
+//   - epoch: last enlisted global epoch (CAS dedup, at-most-once push).
+//     Fresh slots start at ^uint32(0) sentinel so first touch enlists;
+//     span init resets to sentinel under exclusive ownership.
+//   - dirtyNext: intrusive per-parity stack links for the bounded
+//     dirtied-block lists; drained only at STW (no concurrent push).
+//   - blockPinned: sticky pin bit; a pinned block never evacuates.
 type logosImmixBlock struct {
 	_           sys.NotInHeap
 	base        uintptr
 	lines       logosLineMark
+	occupy      logosLineMark
+	dirty       [2]logosLineMark
+	epoch       uint32
+	dirtyNext   [2]unsafe.Pointer
 	blockPinned uint8
 }
+
+// logosImmixDirtyEpoch is the global parity selector for the dirty pair.
+// Starts at 1 so zeroed fresh slots (epoch 0) mismatch and enlist on first
+// touch — no per-creation epoch store, hence no publish-vs-enqueue race.
+// Flipped once per cycle at gcStart STW with the world stopped; the active
+// table is dirty[epoch&1]. The barrier ORs only (atomic, lossless); no
+// CAS-then-clear runs on the hot path, so no mark is lost. Termination STW,
+// after selection has read the active table, clears the incoming table
+// dirty[(epoch+1)&1] for exactly the blocks enlisted in that parity's
+// dirtied-block list (bounded work, no whole-heap scan).
+var logosImmixDirtyEpoch uint32 = 1
+
+// logosImmixDirtyHead holds the intrusive per-parity dirtied-block stacks.
+// Barrier (world running) pushes to head[epoch&1] via epoch-CAS dedup;
+// termination STW drains head[(epoch+1)&1] while the world is stopped, so
+// the drained list sees no concurrent push. Off-heap links, never scanned.
+var logosImmixDirtyHead [2]unsafe.Pointer
 
 // logosImmixArena is the metadata of every block of one heap arena. It is
 // mapped zeroed on first use, so the pages of blocks that are never touched
@@ -139,14 +186,16 @@ func logosImmixBlockFor(addr uintptr) *logosImmixBlock {
 	return b
 }
 
-// logosImmixStoreBarrier records the lines occupied by a pointer store before
-// the store publishes its value. Metadata creation may allocate, so it runs on
-// the system stack and only when the immix collector is selected.
+// logosImmixStoreBarrier records the lines dirtied by a pointer store before
+// the store publishes its value. Production O4 path: atomic OR into the
+// active dirty parity table plus bounded enlist for STW clearing.
+// Span initialization publishes metadata before mutator stores can occur.
+// The barrier uses only existing metadata on the system stack.
 //
 //go:nowritebarrierrec
 //go:nosplit
 func logosImmixStoreBarrier(dst, size uintptr) {
-	if !logosImmixMode() || size == 0 {
+	if !goexperiment.LogosGCMoving || logosImmixOn == 0 || size == 0 {
 		return
 	}
 	systemstack(func() {
@@ -154,18 +203,87 @@ func logosImmixStoreBarrier(dst, size uintptr) {
 	})
 }
 
-// logosImmixMarkStoreRange maps a destination byte range to its block lines.
-// The caller must be on the system stack because first use can allocate metadata.
+// logosImmixMarkStoreRange maps a destination byte range to its block dirty
+// lines in the active parity table. The caller must be on the system stack.
+// Metadata is initialized before span publication. Lossless: atomic byte-OR only;
+// enlist is epoch-CAS dedup (at-most-once per block per cycle, idempotent
+// clear), so a mark racing a STW clear cannot be lost — the clear runs with
+// the world stopped, when no barrier is in flight (causal handoff).
 //
 //go:systemstack
 func logosImmixMarkStoreRange(dst, size uintptr) {
 	for size != 0 {
 		n := min(size, logosImmixBlockBytes-dst%logosImmixBlockBytes)
-		if b := logosImmixBlockFor(dst); b != nil {
-			b.markRange(dst, dst+n)
+		if b := logosImmixBlockLookup(dst); b != nil {
+			b.markDirtyAtomicRange(dst, dst+n)
+			logosImmixNoteDirty(b)
 		}
 		dst += n
 		size -= n
+	}
+}
+
+// logosImmixNoteDirty enlists b in the current epoch's dirtied-block stack,
+// once per block per epoch. Idempotent: concurrent first-touches agree via
+// epoch CAS; exactly one winner pushes. The push is a Treiber-stack CAS on
+// the parity head; the pop runs only at STW with no concurrent push to the
+// drained parity (partition-free STW gives linearizable drain).
+func logosImmixNoteDirty(b *logosImmixBlock) {
+	g := logosImmixDirtyEpoch
+	for {
+		old := atomic.Load(&b.epoch)
+		if old == g {
+			return
+		}
+		if atomic.Cas(&b.epoch, old, g) {
+			idx := g & 1
+			for {
+				head := atomic.Loadp(unsafe.Pointer(&logosImmixDirtyHead[idx]))
+				// Off-heap publication: the block lives in sysAlloc
+				// metadata (sys.NotInHeap, never scanned), so no GC
+				// edge needs a barrier. The plain pointer store
+				// carries a write barrier and is forbidden under the
+				// nowritebarrierrec StoreBarrier above; the NoWB
+				// store preserves the exact Treiber-stack publish
+				// with no barrier and no ordering change.
+				atomic.StorepNoWB(unsafe.Pointer(&b.dirtyNext[idx]), head)
+				if atomic.Casp1(&logosImmixDirtyHead[idx], head, unsafe.Pointer(b)) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// logosImmixFlipDirtyEpoch moves to a clean active table at cycle start.
+// Call with the world stopped (gcStart STW, after stopTheWorldWithSema).
+// The incoming table was cleared at the previous termination, so the flip
+// is lossless. Plain increment is safe: mutators are parked (snapshot
+// isolation of the epoch value for the coming mark window).
+func logosImmixFlipDirtyEpoch() {
+	if !goexperiment.LogosGCMoving || logosImmixOn == 0 {
+		return
+	}
+	logosImmixDirtyEpoch++
+}
+
+// logosImmixClearIncomingDirty clears the incoming table for exactly the
+// blocks dirtied in the previous cycle. Call with the world stopped after
+// selection has read the active table (termination STW). Bounded: work is
+// proportional to the dirtied-block count, never a whole-heap scan. Stale
+// dirt can only over-pin (underselect), never free live lines.
+func logosImmixClearIncomingDirty() {
+	if !goexperiment.LogosGCMoving || logosImmixOn == 0 {
+		return
+	}
+	idx := (logosImmixDirtyEpoch + 1) & 1
+	head := atomic.Loadp(unsafe.Pointer(&logosImmixDirtyHead[idx]))
+	logosImmixDirtyHead[idx] = nil
+	for p := head; p != nil; {
+		b := (*logosImmixBlock)(p)
+		p = b.dirtyNext[idx&1]
+		b.dirtyNext[idx&1] = nil
+		b.clearDirtyTable(idx & 1)
 	}
 }
 
@@ -218,6 +336,107 @@ func (b *logosImmixBlock) markRange(lo, hi uintptr) {
 //go:nosplit
 func (b *logosImmixBlock) clearLines() {
 	b.lines = logosLineMark{}
+}
+
+// markOccupyRange sets the occupy byte of every line that [lo, hi)
+// overlaps, after clipping to the block. Caller must hold span ownership
+// (init exclusive, mcache exclusivity, sweeper sweepgen CAS, or STW):
+// plane O is never written concurrently.
+//
+//go:nosplit
+func (b *logosImmixBlock) markOccupyRange(lo, hi uintptr) {
+	lo = max(lo, b.base)
+	hi = min(hi, b.base+logosImmixBlockBytes)
+	if lo >= hi {
+		return
+	}
+	last := (hi - 1 - b.base) >> logosImmixLineShift
+	for i := (lo - b.base) >> logosImmixLineShift; i <= last; i++ {
+		b.occupy[i] = 1
+	}
+}
+
+// clearOccupyRange clears the occupy byte of every line that [lo, hi)
+// overlaps, after clipping to the block. Caller must hold span ownership.
+//
+//go:nosplit
+func (b *logosImmixBlock) clearOccupyRange(lo, hi uintptr) {
+	lo = max(lo, b.base)
+	hi = min(hi, b.base+logosImmixBlockBytes)
+	if lo >= hi {
+		return
+	}
+	last := (hi - 1 - b.base) >> logosImmixLineShift
+	for i := (lo - b.base) >> logosImmixLineShift; i <= last; i++ {
+		b.occupy[i] = 0
+	}
+}
+
+// clearOccupy marks every occupy line of the block free. Call only with
+// exclusive ownership (span init/free, sweep rebuild).
+//
+//go:nosplit
+func (b *logosImmixBlock) clearOccupy() {
+	b.occupy = logosLineMark{}
+}
+
+// occupyFreeLines returns the number of free occupy lines of the block.
+// O2/O3 hole reuse derives from occupy, never from lines.
+//
+//go:nosplit
+func (b *logosImmixBlock) occupyFreeLines() int {
+	h := b.occupy.holes()
+	n := 0
+	for _, w := range h {
+		n += sys.OnesCount64(w)
+	}
+	return n
+}
+
+// dirtyActive returns dirty[global&1] for mutator barrier use.
+// O4 STW merge must use dirty[old&1] captured before flip, not this
+// accessor post-flip.
+//
+//go:nosplit
+func (b *logosImmixBlock) dirtyActive() *logosLineMark {
+	return &b.dirty[logosImmixDirtyEpoch&1]
+}
+
+// markDirtyAtomicRange ORs 1 into the active dirty table for every line
+// that [lo, hi) overlaps, after clipping to the block. Lossless: atomic
+// byte-OR only, no CAS, no clear racing a set. For O4 barrier use; O1
+// never calls it on the hot path.
+//
+//go:nosplit
+func (b *logosImmixBlock) markDirtyAtomicRange(lo, hi uintptr) {
+	lo = max(lo, b.base)
+	hi = min(hi, b.base+logosImmixBlockBytes)
+	if lo >= hi {
+		return
+	}
+	active := &b.dirty[logosImmixDirtyEpoch&1]
+	last := (hi - 1 - b.base) >> logosImmixLineShift
+	for i := (lo - b.base) >> logosImmixLineShift; i <= last; i++ {
+		atomic.Or8(&active[i], 1)
+	}
+}
+
+// clearDirtyTable clears dirty[idx]. Call only at STW (O4 termination,
+// clearing the incoming table) or under exclusive ownership (span
+// init/free). Idx must be 0 or 1.
+//
+//go:nosplit
+func (b *logosImmixBlock) clearDirtyTable(idx uint32) {
+	b.dirty[idx&1] = logosLineMark{}
+}
+
+// clearDirtyAll clears both dirty tables. Call only under exclusive
+// ownership (span init/free).
+//
+//go:nosplit
+func (b *logosImmixBlock) clearDirtyAll() {
+	b.dirty[0] = logosLineMark{}
+	b.dirty[1] = logosLineMark{}
 }
 
 // freeLines returns the number of free lines of the block.

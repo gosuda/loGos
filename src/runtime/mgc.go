@@ -857,6 +857,10 @@ func gcStart(trigger gcTrigger) {
 		finishsweep_m()
 	})
 	logosGenBeginCycle(trigger)
+	// Immix O4: flip to a clean active dirty table. World stopped (after
+	// stopTheWorldWithSema above), so no barrier is in flight — lossless.
+	// Incoming table was cleared at the previous termination.
+	logosImmixFlipDirtyEpoch()
 
 	// clearpools before we start the GC. If we wait the memory will not be
 	// reclaimed until the next GC cycle.
@@ -1420,6 +1424,11 @@ func gcMarkTermination(stw worldStop) {
 		}
 		logosGenEndCycle()
 		logosMovingMarkTermination()
+		// Immix O4: selection has read the active dirty plane; clear the
+		// incoming table for exactly the previous cycle's dirtied blocks.
+		// Still STW (world restarts below), bounded work, no whole-heap
+		// scan. Stale dirt would only over-pin (underselect), never free.
+		logosImmixClearIncomingDirty()
 
 		// marking is complete so we can turn the write barrier off
 		setGCPhase(_GCoff)
