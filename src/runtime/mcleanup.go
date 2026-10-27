@@ -177,20 +177,19 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 		gcCleanups.createGs()
 	}
 
-	// Resolve the stable attach address before taking locks: when the
-	// object sits unpublished on a registered page, addCleanup copies it
-	// into to-space and attaches the special to the copy, so a handle
-	// naming the source would miss at Stop once the source page is
-	// released, retired, and reused and the forwarding entry is gone.
-	// Keeping the copy's address makes the handle independent of the
-	// forwarding table: the copy's span carries the special, so page
-	// selection excludes it (sticky logosNoReloc plus specials != nil)
-	// and it cannot move again while the handle is live. addCleanup
-	// re-resolves the same copy through its own hoisted ensure-copy (a
-	// published forward-hit: no copy, no allocation), so both agree on
-	// the span. Without a cycle this is the identity and nothing changes.
-	attach := zgcAttachEnsureCopy(unsafe.Pointer(ptr))
-	id := addCleanup(attach, cleanupFn{
+	// addCleanup attaches at the object's home and returns that address:
+	// when the object is unpublished on a registered page it is copied
+	// into to-space first and the special goes onto the copy, and a
+	// pause that moves the page again before the attach pins the M makes
+	// addCleanup copy once more. The handle keeps the address the special
+	// actually landed on, never the pre-attach word, so a handle naming
+	// the source would not miss at Stop once the source page is released,
+	// retired and reused and its forwarding entry is gone. The home span
+	// carries the special, so page selection excludes it (sticky
+	// logosNoReloc plus specials != nil) and the home cannot move again
+	// while the handle is live. Without a cycle this is the identity and
+	// nothing changes.
+	id, home := addCleanup(unsafe.Pointer(ptr), cleanupFn{
 		// Instantiate a caller function to call the cleanup, that is cleanup(*argv).
 		//
 		// TODO(mknyszek): This allocates because the generic dictionary argument
@@ -202,11 +201,11 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 	})
 	if debug.checkfinalizers != 0 {
 		cleanupFn := *(**funcval)(unsafe.Pointer(&cleanup))
-		setCleanupContext(attach, abi.TypeFor[T](), sys.GetCallerPC(), cleanupFn.fn, id)
+		setCleanupContext(home, abi.TypeFor[T](), sys.GetCallerPC(), cleanupFn.fn, id)
 	}
 	return Cleanup{
 		id:  id,
-		ptr: uintptr(attach),
+		ptr: uintptr(home),
 	}
 }
 
