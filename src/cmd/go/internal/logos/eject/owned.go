@@ -30,7 +30,8 @@ import (
 // and emission, so generated files land only in the output tree, and
 // before go.mod rewriting, so a dependency module pulled in only by an
 // owned helper still gets its require and replace lines. It reports
-// whether any helper uses the support module.
+// whether any helper, or any dependency module copied for one, uses the
+// support module.
 //
 // Three passes:
 //  1. resolve each owner to its destination (copying a dependency
@@ -66,6 +67,7 @@ func emitOwnedHelpers(plan *ejectPlan, staging, out string, ejected map[string]s
 
 	// Pass 1 — resolve owners to destinations.
 	dests := make([]*ownedDest, 0, len(reqs))
+	copiedRT := false
 	for i := range reqs {
 		req := &reqs[i]
 		owner := findOwnedOwner(plan, req.Owner)
@@ -81,7 +83,10 @@ func emitOwnedHelpers(plan *ejectPlan, staging, out string, ejected map[string]s
 		if owner.Name == "" || req.Package != owner.Name {
 			return false, fmt.Errorf("owned request package %q does not match owner package %q (%s)", req.Package, owner.Name, req.Owner)
 		}
-		dstRoot, modRoot := ownedOutputRoots(plan, owner, out, abs, ejected)
+		dstRoot, modRoot, copyUsesRT := ownedOutputRoots(plan, owner, out, abs, ejected)
+		if copyUsesRT {
+			copiedRT = true
+		}
 		rel, err := filepath.Rel(modRoot, owner.Dir)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return false, fmt.Errorf("owned request for %q outside its module", req.Owner)
@@ -101,8 +106,9 @@ func emitOwnedHelpers(plan *ejectPlan, staging, out string, ejected map[string]s
 	}
 
 	// Pass 3 — write final bytes (never the input source: the output
-	// hash names the final file independently of the input ID).
-	usedRT := false
+	// hash names the final file independently of the input ID). The
+	// result also carries support use of modules copied in pass 1.
+	usedRT := copiedRT
 	for _, d := range dests {
 		if _, err := os.Lstat(d.dst); err == nil {
 			return false, fmt.Errorf("owned output %q already exists (conflicting generated declarations)", d.dst)
@@ -308,10 +314,11 @@ func ownedFindDeclPackage(plan *ejectPlan, owner string) *load.Package {
 // main tree for main-module owners, the ejected copy for dependency
 // owners. A dependency module with no other ejected content is copied
 // now, so the helper still lands in a complete module the go.mod
-// rewriting below covers.
-func ownedOutputRoots(plan *ejectPlan, owner *load.Package, out, abs string, ejected map[string]string) (dstRoot, modRoot string) {
+// rewriting below covers. usesRT reports whether that copy imports the
+// support packages; it is false when nothing was copied.
+func ownedOutputRoots(plan *ejectPlan, owner *load.Package, out, abs string, ejected map[string]string) (dstRoot, modRoot string, usesRT bool) {
 	if owner.Module.Main {
-		return out, plan.main.dir
+		return out, plan.main.dir, false
 	}
 	m := plan.depByPath[owner.Module.Path]
 	if m == nil {
@@ -319,14 +326,14 @@ func ownedOutputRoots(plan *ejectPlan, owner *load.Package, out, abs string, eje
 		base.Fatalf("logos eject: owned request for %q has no module", owner.ImportPath)
 	}
 	if dst, ok := ejected[m.path]; ok {
-		return dst, m.dir
+		return dst, m.dir, false
 	}
 	dst := filepath.Join(out, "_logos_deps", m.path+"@"+m.version)
 	ejected[m.path] = dst
-	copyModuleTree(m.dir, dst, ejectSkipDir(m.dir, abs, out))
+	usesRT = copyModuleTree(m.dir, dst, ejectSkipDir(m.dir, abs, out))
 	plan.deps = append(plan.deps, m)
 	slices.SortFunc(plan.deps, func(a, b *ejectModule) int { return strings.Compare(a.path, b.path) })
-	return dst, m.dir
+	return dst, m.dir, usesRT
 }
 
 // ownedCheckDir rejects a destination outside dstRoot or behind a
