@@ -43,8 +43,9 @@ import (
 //
 // Wiring: logos lint (src/cmd/go/internal/logos/lintcmd/lint.go runLint)
 // adds a NogoAction sibling beside each LintAction for every LintsPackage.
-// LintAction keeps the native compiler lints; NogoAction runs the full
-// helper analyzer registry (all analyzers, no -analyzers filter) over the
+// LintAction keeps the native compiler lints; NogoAction runs the helper's
+// pinned per-package selection (logosPinnedAnalyzers plus Requires closure;
+// binary analyzers are skipped when cmd/go passes no -archive) over the
 // package's sources (ejected Go for loGo/s, original Go for Go) and
 // normalizes raw helper findings on the cmd/go side: rule IDs as
 // nogo::<lowercase-analyzer> (digits kept, e.g. nogo::sa1019), severity from

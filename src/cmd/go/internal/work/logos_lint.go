@@ -146,6 +146,10 @@ func logosLintFlags(sh *Shell, a *Action) ([]string, error) {
 	if cfg.LogosJSON {
 		flags = append(flags, "-logos.json")
 	}
+	if _, ok := a.Actor.(nogoEjectActor); ok {
+		flags = append(flags, "-logos.eject="+a.Objdir+"eject", "-logos.lintonly")
+		return flags, nil
+	}
 	policy := logosCompilePolicy(a)
 	if policy == nil {
 		return flags, nil
