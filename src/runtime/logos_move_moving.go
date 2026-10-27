@@ -36,7 +36,7 @@ func (span *mspan) logosExcludeRelocation(kind uint8) {
 // reused: the object's address feeds an address hash or an untraced root.
 func logosPinObject(p unsafe.Pointer) {
 	if s := spanOfHeap(uintptr(p)); s != nil {
-		s.logosPinned = true
+		s.logosPinned.Store(true)
 	}
 }
 
