@@ -516,7 +516,7 @@ type mspan struct {
 	speciallock           mutex         // guards specials list and changes to pinnerBits
 	specials              *special      // linked list of special records sorted by offset.
 	logosNoReloc          bool          // finalizer or cleanup ever attached; excludes relocation until init; guarded by speciallock
-	logosPinned           bool          // an object of the span feeds an address hash; excludes relocation until init
+	logosPinned           atomic.Bool   // an object of the span feeds an address hash; excludes relocation until init
 	logosFwd              uintptr       // address of the forwarding table of an evacuated span (nelems entries) while the world is stopped
 	userArenaChunkFree    addrRange     // interval for managing chunk allocation
 	largeType             *_type        // malloc header for large objects.
@@ -1867,7 +1867,7 @@ func (span *mspan) init(base uintptr, npages uintptr) {
 	span.speciallock.key = 0
 	span.specials = nil
 	span.logosNoReloc = false
-	span.logosPinned = false
+	span.logosPinned.Store(false)
 	span.logosFwd = 0
 	span.logosAge = 0
 	span.logosImmixBlock = nil
