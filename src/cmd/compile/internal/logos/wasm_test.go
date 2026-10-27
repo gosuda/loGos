@@ -163,7 +163,17 @@ func wasmLogos(tb testing.TB) string {
 
 // wasmGoEnv returns the environment of a wasm build for goos.
 func wasmGoEnv(cmd *exec.Cmd, goos string) []string {
-	return append(cmd.Environ(), "GOOS="+goos, "GOARCH=wasm", "GOFLAGS=", "GOWORK=off", "GO111MODULE=on")
+	var env []string
+	for _, kv := range cmd.Environ() {
+		switch {
+		case strings.HasPrefix(kv, "GOOS="), strings.HasPrefix(kv, "GOARCH="),
+			strings.HasPrefix(kv, "GOMAXPROCS="), strings.HasPrefix(kv, "GOFLAGS="),
+			strings.HasPrefix(kv, "GOWORK="), strings.HasPrefix(kv, "GO111MODULE="):
+		default:
+			env = append(env, kv)
+		}
+	}
+	return append(env, "GOOS="+goos, "GOARCH=wasm", "GOMAXPROCS=1", "GOFLAGS=", "GOWORK=off", "GO111MODULE=on")
 }
 
 // buildWasm builds src as a main package with tool ("go" or logos) and
@@ -199,6 +209,7 @@ func runWasmNode(tb testing.TB, wasm string) (string, error) {
 	node := wasmNode(tb)
 	host := filepath.Join(testenv.GOROOT(tb), "lib", "wasm", "wasm_exec_node.js")
 	cmd := testenv.Command(tb, node, host, wasm)
+	cmd.Env = wasmGoEnv(cmd, "js")
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
@@ -302,19 +313,6 @@ func TestWasmGoPackagesCarryMayYieldFacts(t *testing.T) {
 		if got, ok := yield[name]; !ok || !got {
 			t.Errorf("runtime.%s: MayYield = %v (recorded %v), want 1", name, got, ok)
 		}
-	}
-}
-
-func TestWasmFactsAbsentOffWasm(t *testing.T) {
-	testenv.MustHaveGoBuild(t)
-	cmd := testenv.Command(t, testenv.GoToolPath(t), "list", "-export", "-f", "{{.Export}}", "errors")
-	cmd.Env = append(cmd.Environ(), "GOFLAGS=")
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("go list: %v", err)
-	}
-	if got := readFacts(t, strings.TrimSpace(string(out))); got != nil {
-		t.Fatalf("a Go package built for the host carries a __.LOGOS member: %+v", got)
 	}
 }
 

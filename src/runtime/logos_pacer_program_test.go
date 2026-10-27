@@ -240,7 +240,7 @@ func logosProgramRunWasm(t *testing.T, wasm string, env []string) string {
 }
 
 func logosProgramWasmEnv() []string {
-	return []string{"GOOS=js", "GOARCH=wasm", "GOEXPERIMENT=", "GOTOOLCHAIN=local", "GOPROXY=off"}
+	return []string{"GOOS=js", "GOARCH=wasm", "GOMAXPROCS=1", "GOEXPERIMENT=", "GOTOOLCHAIN=local", "GOPROXY=off"}
 }
 
 func TestLogosPacerWasmDefaultLogosKeepsUpstream(t *testing.T) {
