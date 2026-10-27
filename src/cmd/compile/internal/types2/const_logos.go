@@ -117,6 +117,23 @@ func (check *Checker) logosConstAssign(x *operand, T Type, context string) bool 
 	if !check.conf.Logos {
 		return false
 	}
+	if csrc0 := logosAsConstView(x.typ()); csrc0 == nil && logosAsConstView(T) == nil {
+		if qiface := logosQualifiedIface(T); qiface != nil && x.isValid() && !x.isNil() && T != nil {
+			if Vu := Unalias(x.typ()); Vu != nil && !isTypeParam(Vu) {
+				var cause string
+				if !check.hasAllMethodsAt(Vu, T, true, Identical, &cause, x.Pos()) {
+					if cause != "" {
+						check.errorf(x, InvalidIfaceAssign, "cannot use %s as %s value in %s: %s", x, T, context, cause)
+					} else {
+						check.errorf(x, InvalidIfaceAssign, "cannot use %s as %s value in %s", x, T, context)
+					}
+					x.invalidate()
+				}
+				return true
+			}
+		}
+		return false
+	}
 	csrc := logosAsConstView(x.typ())
 	cdst := logosAsConstView(T)
 	if csrc == nil && cdst == nil {
@@ -185,10 +202,164 @@ func (check *Checker) logosConstWrap(x *operand, csrc *ConstView, cdst *ConstVie
 		return true
 	}
 	if ok, _ := x.assignableTo(check, cdst.Elem, nil); !ok {
+		if check.logosConstCovariant(x, cdst, context) {
+			return true
+		}
 		check.constWrapError(x, T, context)
 		return true
 	}
 	return true
+}
+
+func (check *Checker) logosConstCovariant(x *operand, cdst *ConstView, context string) bool {
+	if !strings.HasPrefix(context, "argument to ") {
+		return false
+	}
+	iface := check.logosCovariantTargetChecked(x.typ(), cdst.Elem, x.Pos())
+	if iface == nil || !check.logosNameable(iface) {
+		return false
+	}
+	if _, spread := check.Info.TypeOf(x.expr).(*Tuple); spread {
+		return false
+	}
+	if check.Info.LogosConstCov == nil {
+		check.Info.LogosConstCov = make(map[syntax.Expr]Type)
+	}
+	check.Info.LogosConstCov[x.expr] = iface
+	return true
+}
+
+// logosCovariantTarget returns the interface I when a []C source converts
+// to a `const []I` target element by the covariance rule (SPEC T-203.4):
+// C implements I and C differs from I. The source may be a defined or
+// alias slice type, found through its underlying type; the target must be
+// an unnamed slice (or alias of one), since a named target is refused.
+func logosCovariantTarget(src, dst Type) Type {
+	if logosAsConstView(src) != nil {
+		return nil
+	}
+	s := Unalias(src)
+	if s == nil {
+		return nil
+	}
+	from, _ := s.Underlying().(*Slice)
+	to, _ := Unalias(dst).(*Slice)
+	if from == nil || to == nil {
+		return nil
+	}
+	c, i := from.Elem(), to.Elem()
+	if Identical(c, i) || !logosElemImplements(c, i) {
+		return nil
+	}
+	return i
+}
+
+func (check *Checker) logosNameable(t Type) bool {
+	var obj *TypeName
+	var targs *TypeList
+	switch t := t.(type) {
+	case *Alias:
+		obj, targs = t.Obj(), t.TypeArgs()
+	case *Named:
+		obj, targs = t.Obj(), t.TypeArgs()
+	default:
+		return true
+	}
+	if obj.pkg != nil && obj.pkg != check.pkg && !obj.Exported() {
+		return false
+	}
+	for i := range targs.Len() {
+		if !check.logosNameable(targs.At(i)) {
+			return false
+		}
+	}
+	return true
+}
+
+func logosElemImplements(c, i Type) bool {
+	if isTypeParam(i) || logosAsConstView(c) != nil || logosAsConstView(i) != nil {
+		return false
+	}
+	target, _ := i.Underlying().(*Interface)
+	return target != nil && Implements(c, target)
+}
+
+func (check *Checker) logosElemImplementsChecked(c, i Type, pos syntax.Pos) bool {
+	if isTypeParam(i) || logosAsConstView(c) != nil || logosAsConstView(i) != nil {
+		return false
+	}
+	target, _ := i.Underlying().(*Interface)
+	if target == nil {
+		return false
+	}
+	return check.hasAllMethodsAt(c, target, true, Identical, nil, pos)
+}
+
+func (check *Checker) logosCovariantTargetChecked(src, dst Type, pos syntax.Pos) Type {
+	if logosAsConstView(src) != nil {
+		return nil
+	}
+	s := Unalias(src)
+	if s == nil {
+		return nil
+	}
+	from, _ := s.Underlying().(*Slice)
+	to, _ := Unalias(dst).(*Slice)
+	if from == nil || to == nil {
+		return nil
+	}
+	c, i := from.Elem(), to.Elem()
+	if Identical(c, i) || !check.logosElemImplementsChecked(c, i, pos) {
+		return nil
+	}
+	return i
+}
+
+func (check *Checker) logosCovSliceCall(call *syntax.CallExpr, args []*operand) {
+	inst, _ := syntax.Unparen(call.Fun).(*syntax.IndexExpr)
+	if inst == nil || len(args) != 1 || !args[0].isValid() {
+		return
+	}
+	var name *syntax.Name
+	switch f := syntax.Unparen(inst.X).(type) {
+	case *syntax.Name:
+		name = f
+	case *syntax.SelectorExpr:
+		name = f.Sel
+	default:
+		return
+	}
+	fn, _ := check.Info.Uses[name].(*Func)
+	if fn == nil || fn.Pkg() == nil || fn.Pkg().Path() != "logos/rt" || fn.Name() != "CovSlice" {
+		return
+	}
+	first := inst.Index
+	var explicitElem Type
+	if list, ok := first.(*syntax.ListExpr); ok {
+		if len(list.ElemList) == 0 {
+			return
+		}
+		first = list.ElemList[0]
+		if len(list.ElemList) > 1 {
+			explicitElem = check.Info.TypeOf(list.ElemList[1])
+		}
+	}
+	i := check.Info.TypeOf(first)
+	from, _ := args[0].typ().Underlying().(*Slice)
+	if i == nil {
+		return
+	}
+	if target, _ := i.Underlying().(*Interface); isTypeParam(i) || target == nil {
+		check.errorf(args[0], IncompatibleAssign, "rt.CovSlice target %s is not an interface", i)
+		return
+	}
+	elem := explicitElem
+	if from != nil {
+		elem = from.Elem()
+	}
+	if elem != nil && !check.logosElemImplementsChecked(elem, i, args[0].Pos()) {
+		check.errorf(args[0], IncompatibleAssign, "rt.CovSlice cannot convert %s to []%s: element type %s does not implement interface %s", args[0].typ(), i, elem, i)
+	}
 }
 
 // constWrapError reports a failed wrap into a const view.
@@ -300,6 +471,52 @@ func (check *Checker) logosConstSelect(x *operand, e *syntax.SelectorExpr, sel s
 			x.invalidate()
 			return true
 		}
+		if _, isIface := Unalias(base.Elem).Underlying().(*Interface); isIface {
+			// Interface-dynamic through a const view: admitted only when
+			// the selected method carries the enforced readonly
+			// obligation (core owner populates Func.LogosReadonly from
+			// syntax.Field.Const). Ordinary unknown interface methods
+			// stay rejected fail-closed.
+			if logosIfaceMethodReadonly(obj) {
+				x.typ_ = base.Elem
+				return false
+			}
+			check.errorf(e.Sel, IncompatibleAssign, "%s cannot call %s through const view %s", logosConstMutation, sel, ExprString(e.X))
+			x.invalidate()
+			return true
+		}
+		// Concrete value receiver: explicit const receivers and
+		// reference-free copies are order-independent and admitted
+		// synchronously. Imported concrete methods are decided
+		// synchronously on the verified Readonly fact (fail closed).
+		// Local concrete methods needing a body proof are tentatively
+		// admitted with a package-end deferred check (cleanup, after all
+		// bodies), so declaration order cannot change legality.
+		rt := sig.Recv().Type()
+		if logosAsConstView(rt) != nil {
+			x.typ_ = base.Elem
+			return false
+		}
+		if logosReferenceFree(rt) {
+			x.typ_ = base.Elem
+			return false
+		}
+		decl := obj.Origin()
+		if decl != obj {
+			check.errorf(e.Sel, IncompatibleAssign, "%s cannot call %s through const view %s", logosConstMutation, sel, ExprString(e.X))
+			x.invalidate()
+			return true
+		}
+		if decl.Pkg() != check.pkg {
+			if check.logosReceiverReadonly(obj) {
+				x.typ_ = base.Elem
+				return false
+			}
+			check.errorf(e.Sel, IncompatibleAssign, "%s cannot call %s through const view %s", logosConstMutation, sel, ExprString(e.X))
+			x.invalidate()
+			return true
+		}
+		check.logosDeferReadonlyCheck(obj, e.Sel.Pos(), e.X, sel)
 		x.typ_ = base.Elem
 		return false
 	}
@@ -465,6 +682,7 @@ func (check *Checker) logosConstArgs(call *syntax.CallExpr, sigParams *Tuple, ar
 	if !check.conf.Logos {
 		return
 	}
+	check.logosCovSliceCall(call, args)
 	if name, _ := call.Fun.(*syntax.Name); name != nil {
 		if _, ok := check.lookup(name.Value).(*Builtin); ok {
 			return
@@ -482,6 +700,11 @@ func (check *Checker) logosConstArgs(call *syntax.CallExpr, sigParams *Tuple, ar
 			continue
 		}
 		pt := sigParams.At(i).Type()
+		if cp := logosAsConstView(pt); cp != nil && logosCovariantTarget(c.Elem, cp.Elem) != nil {
+			check.errorf(a, IncompatibleAssign, "%s cannot pass const view %s as %s in argument to %s: its elements would convert through an interface", logosConstEscape, ExprString(a.expr), pt, ExprString(call.Fun))
+			a.invalidate()
+			continue
+		}
 		if logosAsConstView(pt) != nil || isTypeParam(pt) {
 			a.typ_ = c.Elem
 			check.updateExprType(a.expr, c.Elem, false)
