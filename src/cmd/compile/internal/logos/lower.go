@@ -77,16 +77,19 @@ func Lower(pkg *types2.Package, info *types2.Info, files []*syntax.File, src map
 		if !ok {
 			continue
 		}
+		buf := slices.Clone(data)
 		fl := &fileLower{
 			pkg:           shared,
 			file:          file,
-			src:           slices.Clone(data),
-			orig:          len(data),
+			src:           buf,
+			origSrc:       buf,
+			orig:          len(buf),
 			base:          file.Pos().FileBase(),
-			start:         lineStarts(data),
+			start:         lineStarts(buf),
 			loweredChains: make(map[*syntax.CallExpr]bool),
 		}
 		fl.baseName = filepath.Base(fl.base.Filename())
+		fl.srcMap = origBuf(buf)
 		fl.lowerFile()
 		if fl.changed {
 			changed = true
@@ -151,6 +154,8 @@ type fileLower struct {
 	pkg         *packageLower
 	file        *syntax.File
 	src         []byte
+	origSrc     []byte
+	srcMap      srcBuf
 	orig        int
 	start       []int
 	base        *syntax.PosBase
@@ -312,6 +317,16 @@ func (fl *fileLower) addOwned(id, start, end int, text string) {
 	fl.appendSplice(splice{start: start, end: end, text: text, owner: id})
 }
 
+// addT records one replacement whose text carries origin chunks.
+func (fl *fileLower) addT(start, end int, t otext) {
+	fl.appendSplice(splice{start: start, end: end, text: t.s, chunks: t.chunks})
+}
+
+// addOwnedT is addOwned for text that carries origin chunks.
+func (fl *fileLower) addOwnedT(id, start, end int, t otext) {
+	fl.appendSplice(splice{start: start, end: end, text: t.s, chunks: t.chunks, owner: id})
+}
+
 // chainMove is a source region that a hoist copies ahead of its statement
 // while the region itself keeps a stub in place. The copy stands in the
 // hoist text as mark; the edits inside the region, those already recorded
@@ -353,31 +368,38 @@ func (fl *fileLower) resolveChainMoves() {
 		r := m.region
 		adj := make([]splice, len(m.inner))
 		for j, sp := range m.inner {
-			adj[j] = splice{start: sp.start - r.start, end: sp.end - r.start, text: sp.text, owner: sp.owner}
+			adj[j] = splice{start: sp.start - r.start, end: sp.end - r.start, text: sp.text, chunks: sp.chunks, owner: sp.owner}
 		}
-		out, err := applySplices(fl.src[r.start:r.end], adj)
+		out, err := applyChunks(fl.srcMap.sliceO(r.start, r.end), adj)
 		if err != nil {
 			base.Fatalf("logos: overlapping edits at byte offset %d", r.start)
 		}
-		for j := range fl.splices {
-			fl.splices[j].text = strings.ReplaceAll(fl.splices[j].text, m.mark, string(out))
-		}
-		for _, rg := range fl.regions {
-			for j := range rg.splices {
-				rg.splices[j].text = strings.ReplaceAll(rg.splices[j].text, m.mark, string(out))
+		subst := func(list []splice) {
+			for j := range list {
+				t := substNul(otext{s: list[j].text, chunks: list[j].chunks}, func(mark string) (otext, bool) {
+					if mark == m.mark {
+						return out, true
+					}
+					return otext{}, false
+				})
+				list[j].text, list[j].chunks = t.s, t.chunks
 			}
+		}
+		subst(fl.splices)
+		for _, rg := range fl.regions {
+			subst(rg.splices)
 		}
 		for _, later := range fl.moves[i+1:] {
-			for j := range later.inner {
-				later.inner[j].text = strings.ReplaceAll(later.inner[j].text, m.mark, string(out))
-			}
+			subst(later.inner)
 		}
 	}
 	fl.moves = nil
 }
 
-// textOf returns the source of s with nested splices substituted.
-func (fl *fileLower) textOf(s span) string {
+// textOf returns the source of s with nested splices substituted,
+// carrying origin: the untouched bytes keep their source offsets and
+// every nested splice embeds its own chunks.
+func (fl *fileLower) textOf(s span) otext {
 	var inner []splice
 	if m := fl.moveContaining(s); m != nil {
 		var kept []splice
@@ -386,16 +408,21 @@ func (fl *fileLower) textOf(s span) string {
 	} else {
 		inner = fl.drainInner(s)
 	}
-	sub := fl.src[s.start:s.end]
 	adj := make([]splice, len(inner))
 	for i, sp := range inner {
-		adj[i] = splice{start: sp.start - s.start, end: sp.end - s.start, text: sp.text, owner: sp.owner}
+		adj[i] = splice{start: sp.start - s.start, end: sp.end - s.start, text: sp.text, chunks: sp.chunks, owner: sp.owner}
 	}
-	out, err := applySplices(sub, adj)
+	out, err := applyChunks(fl.srcMap.sliceO(s.start, s.end), adj)
 	if err != nil {
 		base.Fatalf("logos: overlapping edits at byte offset %d", s.start)
 	}
-	return string(out)
+	return out
+}
+
+// srcUser returns the verbatim source of [start, end) with its origin:
+// the bytes map to themselves in the original file.
+func (fl *fileLower) srcUser(start, end int) otext {
+	return fl.srcMap.sliceO(start, end)
 }
 
 func spanInside(sp splice, s span) bool {
@@ -423,7 +450,8 @@ func (fl *fileLower) drainInner(s span) []splice {
 	for _, sp := range fl.splices {
 		switch {
 		case sp.host != nil && spanInside(sp, s):
-			inner = append(inner, splice{start: sp.start, end: sp.end, text: fl.retireHost(sp.host), owner: sp.owner})
+			t := fl.retireHost(sp.host)
+			inner = append(inner, splice{start: sp.start, end: sp.end, text: t.s, chunks: t.chunks, owner: sp.owner})
 		case sp.host != nil && hostOverlaps(sp, s):
 			cutsHost(sp, s)
 		case sp.host == nil && spanInside(sp, s):
@@ -489,7 +517,8 @@ func (fl *fileLower) lowerFile() {
 	fl.lowerZeroCopy()       // M5-S5 hook: zero-copy string/bytes conversions.
 	fl.lowerCTFE()           // M5-S2 hook: const composite literals and const func erasure.
 	fl.lowerConstMapRanges() // M5-S4 hook: range over a const map reads its sorted entries.
-	fl.eraseConstViews()     // M5-S1 hook: erase const views and bound recorded slices.
+	fl.eraseConstViews()     // M5-S1 hook: erase const views and bound recorded slices; also erases readonly interface `const` qualifiers.
+	fl.lowerConstSlices()    // M13-S3 hook: []C arguments to `const []I` parameters convert through rt.CovSlice.
 	fl.lowerPlatform()       // M3-S5 hook: MustNonNil wraps for platform-pointer stores.
 	fl.lowerUnions()         // M2 hook: switch expressions and struct assertions.
 	fl.lowerOptions()        // M3-S6 hook: single-value map reads and ?? over them.
