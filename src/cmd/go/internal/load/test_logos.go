@@ -169,6 +169,15 @@ func paramFields(toks []token.Token, lits []string) []*ast.Field {
 	if len(toks) == 0 {
 		return nil
 	}
+	// Go permits one optional trailing comma in a parameter list and the
+	// token scan keeps it; a lone trailing comma carries no type, so the
+	// exact-length match below sees the list without it. Anything else,
+	// including a newline SEMICOLON without the required comma or a second
+	// comma, still reaches BadExpr through the same match.
+	if toks[len(toks)-1] == token.COMMA {
+		toks = toks[:len(toks)-1]
+		lits = lits[:len(lits)-1]
+	}
 	var names []*ast.Ident
 	if len(toks) > 1 && toks[0] == token.IDENT && toks[1] == token.MUL {
 		names = []*ast.Ident{{Name: lits[0]}}
