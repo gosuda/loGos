@@ -1,0 +1,87 @@
+# Collision: imported method T.As must not reuse clean func As fact.
+# Producer: clean func As (pure read) + mutating method T.As (t.S[0]=1).
+# Consumer const-receiver caller must REJECT with const_view_mutation;
+# clean func path runs native. Pre-fix: mutating build wrongly succeeds (RED).
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+mkdir $WORK/bin
+
+cd cleancons
+logos build -o $WORK/bin/cleancons$GOEXE .
+exec $WORK/bin/cleancons$GOEXE
+stdout '^clean-ok$'
+cd ..
+
+cd mutcons
+! logos build ./...
+stderr '\[correctness::const_view_mutation\]'
+cd ..
+
+-- lib/go.mod --
+module example.com/collib
+
+go 1.27
+
+-- lib/c/c.lgo --
+package c
+
+func As(s []int) int {
+	return s[0]
+}
+
+type T struct {
+	S []int
+}
+
+func (t T) As() int {
+	t.S[0] = 1
+	return t.S[0]
+}
+
+-- cleancons/go.mod --
+module example.com/cleancons
+
+go 1.27
+
+require example.com/collib v0.0.0
+
+replace example.com/collib => ../lib
+
+-- cleancons/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/collib/c"
+)
+
+func Wrap(s []int) int {
+	return c.As(s)
+}
+
+func main() {
+	if Wrap([]int{7}) != 7 {
+		panic("bad")
+	}
+	fmt.Println("clean-ok")
+}
+
+-- mutcons/go.mod --
+module example.com/mutcons
+
+go 1.27
+
+require example.com/collib v0.0.0
+
+replace example.com/collib => ../lib
+
+-- mutcons/mut.lgo --
+package mutcons
+
+import "example.com/collib/c"
+
+func Attack(t const c.T) int {
+	return t.As()
+}

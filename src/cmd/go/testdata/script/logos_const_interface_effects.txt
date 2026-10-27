@@ -1,0 +1,486 @@
+# T-201, R-U2: readonly interface methods `const Name() string` in .lgo contracts.
+# The contract package declares `const Name() string` inside interface braces
+# only, parallel to the existing `const Name T` property prefix. A pure value-
+# receiver getter satisfies it structurally across packages: the user package
+# names the qualified interface (`c.Namer`), converts through it, and calls
+# through a const view of the imported concrete type after export/import.
+# A mutating plain `*Bad` receiver from another package is rejected at the
+# call site through a const view with the approved call-site diagnostic; no
+# new satisfaction/obligation string is pinned here (parent ticket owns it).
+# A Go importer in another workspace module sees the erased `Name() string`
+# (plain-interface assignment both ways runs); the Logos view keeps the
+# readonly proof. A stale `__.LOGOS` fingerprint, and an incremental rebuild
+# after the imported getter proof changes, cannot reuse the old proof.
+# Modules stay homogeneous: w/l and neg are all-.lgo, w/g is all-.go; the
+# stale/impcheck helpers are stdlib-only Go mains under w/g. Behavior is
+# proven by installed `logos build`/`logos run` output, never source grep.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+mkdir $WORK/bin
+
+# Case 1: pure getter accepted through the qualified interface and const
+# view after export/import; the Go importer runs against erased signatures.
+cd w
+logos build ./...
+logos build -o $WORK/bin/lgoiface$GOEXE ./l/cmd
+exec $WORK/bin/lgoiface$GOEXE
+stdout '^lgo-ok$'
+logos build -o $WORK/bin/goiface$GOEXE ./g/cmd
+exec $WORK/bin/goiface$GOEXE
+stdout '^go-ok$'
+cd ..
+
+# Case 2: a mutating plain-pointer receiver from another package is rejected
+# at the const-view call site with the approved call-site diagnostic.
+cd neg
+! logos build ./...
+stderr '\[correctness::const_view_mutation\] cannot call Name through const view'
+cd ..
+
+# Case 3: the contract archive carries the bound facts sidecar; flipping its
+# fingerprint fails the dependent import instead of reusing the old readonly
+# proof, while a Go importer reading only __.PKGDEF still sees Name() string.
+go tool compile -p example.com/l/c -o $WORK/lc.a w/l/c/c.lgo
+go tool pack t $WORK/lc.a
+stdout '__\.LOGOS'
+cd w/g
+go run ./stale $WORK/lc.a $WORK/lc-stale.a
+mkdir $WORK/impstale
+mkdir $WORK/impstale/example.com
+mkdir $WORK/impstale/example.com/l
+cp $WORK/lc-stale.a $WORK/impstale/example.com/l/c.a
+! go tool compile -I $WORK/impstale -p example.com/l/p -o $WORK/p-stale.a ../l/p/p.lgo
+stdout 'logos: stale facts for example\.com/l/c \(fingerprint mismatch\)'
+go run ./impcheck $WORK/lc.a
+stdout '^importer ok: Namer-Name 0 1$'
+cd ../..
+
+# Case 4: incremental rebuild after the imported getter proof changes cannot
+# reuse the old qualification. The const-view call builds cleanly against the
+# pure getter, then the implementation package is rewritten so Good.Name
+# mutates receiver-reachable state; rebuilding rejects the same call site
+# instead of reusing the cached readonly proof.
+cd re
+logos build ./...
+logos run ./cmd
+stdout '^re-ok$'
+cp badsrc/p.lgo.bad p/p.lgo
+! logos build ./...
+stderr '\[correctness::const_view_mutation\] cannot call Name through const view'
+cd ..
+
+-- w/go.work --
+go 1.27
+
+use (
+	./l
+	./g
+)
+
+-- w/l/go.mod --
+module example.com/l
+
+go 1.27
+
+-- w/l/c/c.lgo --
+package c
+
+type Namer interface {
+	const Name() string
+}
+
+func Greet(n Namer) string {
+	return n.Name()
+}
+
+-- w/l/p/p.lgo --
+package p
+
+import "example.com/l/c"
+
+type Good struct {
+	name string
+}
+
+func (g Good) Name() string {
+	return g.name
+}
+
+func Make(name string) Good {
+	return Good{name: name}
+}
+
+func MakeNamer(name string) c.Namer {
+	return Make(name)
+}
+
+-- w/l/q/q.lgo --
+package q
+
+import (
+	"example.com/l/c"
+	"example.com/l/p"
+)
+
+var _ c.Namer = p.Make("x")
+
+func ViaQualified(n c.Namer) string {
+	return n.Name()
+}
+
+func ViaConstView(g const p.Good) string {
+	return g.Name()
+}
+
+func Run() string {
+	g := p.Make("ada")
+	if ViaQualified(g) != "ada" {
+		return "bad-qualified"
+	}
+	if ViaConstView(g) != "ada" {
+		return "bad-constview"
+	}
+	if c.Greet(g) != "ada" {
+		return "bad-greet"
+	}
+	if p.MakeNamer("ada").Name() != "ada" {
+		return "bad-makenamer"
+	}
+	return "lgo-ok"
+}
+
+-- w/l/cmd/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/l/q"
+)
+
+func main() {
+	fmt.Println(q.Run())
+}
+
+-- w/g/go.mod --
+module example.com/g
+
+go 1.27
+
+-- w/g/qq/qq.go --
+package qq
+
+import (
+	"example.com/l/c"
+	"example.com/l/p"
+)
+
+type G string
+
+func (g G) Name() string { return string(g) }
+
+func Run() string {
+	var plain interface{ Name() string } = p.Make("ada")
+	if plain.Name() != "ada" {
+		return "bad-erased"
+	}
+	var n c.Namer = p.Make("ada")
+	if n.Name() != "ada" {
+		return "bad-name"
+	}
+	if c.Greet(n) != "ada" {
+		return "bad-greet"
+	}
+	var m c.Namer = G("bob")
+	if m.Name() != "bob" {
+		return "bad-go-impl"
+	}
+	if c.Greet(m) != "bob" {
+		return "bad-go-greet"
+	}
+	return "go-ok"
+}
+
+-- w/g/cmd/main.go --
+package main
+
+import (
+	"fmt"
+
+	"example.com/g/qq"
+)
+
+func main() { fmt.Println(qq.Run()) }
+
+-- w/g/stale/main.go --
+// Command stale copies a compiler archive while flipping one hex digit of
+// the __.LOGOS fingerprint line, producing an archive whose facts are stale
+// relative to its __.PKGDEF.
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+func fatal(err any) {
+	fmt.Fprintf(os.Stderr, "stale: %v\n", err)
+	os.Exit(1)
+}
+
+func main() {
+	if len(os.Args) != 3 {
+		fatal("usage: stale in.a out.a")
+	}
+	raw, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		fatal(err)
+	}
+	if !bytes.HasPrefix(raw, []byte("!<arch>\n")) {
+		fatal("not an archive")
+	}
+	off := len("!<arch>\n")
+	found := false
+	for off+60 <= len(raw) {
+		hdr := raw[off : off+60]
+		if hdr[58] != '`' || hdr[59] != '\n' {
+			fatal("corrupt header")
+		}
+		name := strings.TrimRight(string(hdr[:16]), " ")
+		size, err := strconv.ParseUint(strings.TrimRight(string(hdr[48:58]), " "), 10, 64)
+		if err != nil {
+			fatal(err)
+		}
+		dataOff := off + 60
+		if name == "__.LOGOS" {
+			end := dataOff + int(size)
+			if end > len(raw) {
+				fatal("truncated member")
+			}
+			i := bytes.Index(raw[dataOff:end], []byte("fingerprint "))
+			if i < 0 {
+				fatal("no fingerprint line")
+			}
+			hexOff := dataOff + i + len("fingerprint ")
+			if hexOff >= end {
+				fatal("empty fingerprint")
+			}
+			if raw[hexOff] == '0' {
+				raw[hexOff] = '1'
+			} else {
+				raw[hexOff] = '0'
+			}
+			found = true
+			break
+		}
+		off = dataOff + int(size) + int(size&1)
+	}
+	if !found {
+		fatal("no __.LOGOS member")
+	}
+	if err := os.WriteFile(os.Args[2], raw, 0o666); err != nil {
+		fatal(err)
+	}
+}
+
+-- w/g/impcheck/main.go --
+// Command impcheck proves a Go importer reads only __.PKGDEF from a loGo/s
+// contract archive: Namer is visible with the erased method Name() string,
+// unaffected by the __.LOGOS sidecar. It asserts no readonly fact line,
+// only the erased Go signature.
+package main
+
+import (
+	"fmt"
+	"go/importer"
+	"go/token"
+	"go/types"
+	"io"
+	"os"
+)
+
+func fatal(err any) {
+	fmt.Fprintf(os.Stderr, "impcheck: %v\n", err)
+	os.Exit(1)
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fatal("usage: impcheck archive.a")
+	}
+	path := os.Args[1]
+	imp := importer.ForCompiler(token.NewFileSet(), "gc", func(p string) (io.ReadCloser, error) {
+		if p != "example.com/l/c" {
+			return nil, fmt.Errorf("unknown package %s", p)
+		}
+		return os.Open(path)
+	})
+	pkg, err := imp.Import("example.com/l/c")
+	if err != nil {
+		fatal(err)
+	}
+	obj := pkg.Scope().Lookup("Namer")
+	tn, ok := obj.(*types.TypeName)
+	if !ok {
+		fatal("Namer not a type name")
+	}
+	iface, ok := tn.Type().Underlying().(*types.Interface)
+	if !ok {
+		fatal("Namer not an interface")
+	}
+	var found *types.Func
+	for i := 0; i < iface.NumMethods(); i++ {
+		if iface.Method(i).Name() == "Name" {
+			found = iface.Method(i)
+		}
+	}
+	if found == nil {
+		fatal("Namer has no Name method")
+	}
+	sig, ok := found.Type().(*types.Signature)
+	if !ok {
+		fatal("Name not a signature")
+	}
+	if sig.Params().Len() != 0 || sig.Results().Len() != 1 {
+		fatal("Name has wrong arity")
+	}
+	if sig.Results().At(0).Type().String() != "string" {
+		fatal("Name result not string")
+	}
+	fmt.Println("importer ok: Namer-Name 0 1")
+}
+
+-- neg/go.mod --
+module example.com/neg
+
+go 1.27
+
+-- neg/c/c.lgo --
+package c
+
+type Namer interface {
+	const Name() string
+}
+
+func Greet(n Namer) string {
+	return n.Name()
+}
+
+-- neg/b/b.lgo --
+package b
+
+type Bad struct {
+	N int
+}
+
+func (m *Bad) Name() string {
+	m.N++
+	return "bad"
+}
+
+-- neg/u/u.lgo --
+package u
+
+import (
+	"example.com/neg/b"
+	"example.com/neg/c"
+)
+
+func ViaQualified(n c.Namer) string {
+	return n.Name()
+}
+
+func Touch(q const *b.Bad) string {
+	return q.Name()
+}
+
+-- re/go.mod --
+module example.com/re
+
+go 1.27
+
+-- re/c/c.lgo --
+package c
+
+type Namer interface {
+	const Name() string
+}
+
+func Greet(n Namer) string {
+	return n.Name()
+}
+
+-- re/p/p.lgo --
+package p
+
+import "example.com/re/c"
+
+type Good struct {
+	name string
+}
+
+func (g Good) Name() string {
+	return g.name
+}
+
+func Make(name string) Good {
+	return Good{name: name}
+}
+
+func MakeNamer(name string) c.Namer {
+	return Make(name)
+}
+
+-- re/badsrc/p.lgo.bad --
+package p
+
+// No MakeNamer here by design: the rewritten package must fail only at q's
+// const-view call site with the approved call-site diagnostic, never at a
+// conformance conversion whose string is parent-owned and unpinned.
+type Good struct {
+	name string
+	hits []int
+}
+
+func (g Good) Name() string {
+	g.hits[0] = 1
+	return g.name
+}
+
+func Make(name string) Good {
+	return Good{name: name}
+}
+
+-- re/q/q.lgo --
+package q
+
+import "example.com/re/p"
+
+func ViaConstView(g const p.Good) string {
+	return g.Name()
+}
+
+func Run() string {
+	g := p.Make("re")
+	if ViaConstView(g) != "re" {
+		return "bad-constview"
+	}
+	return "re-ok"
+}
+
+-- re/cmd/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/re/q"
+)
+
+func main() {
+	fmt.Println(q.Run())
+}

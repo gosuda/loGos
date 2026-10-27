@@ -10,22 +10,64 @@ import (
 	"cmd/compile/internal/types2"
 )
 
+// applyLogosReadonlyForGoImporter restores declaration-level facts
+// (readonly capabilities, generic assertion effects) for a Go importer
+// of an lgo package. The verified record f comes from the same decode
+// that read this package's export data. All records stamp in place on the
+// canonical objects: no clone, no packages replacement, so every importer
+// shares one nominal identity through Go wrappers. Option and ConstView
+// overlays stay lgo-only so Go keeps lowered semantics; only the readonly
+// bit is published. Distinct anonymous objects keep distinct indexes by
+// pointer-keyed export dedup, so in-place bits cannot leak across shapes.
+func applyLogosReadonlyForGoImporter(path string, pkg *types2.Package, packages map[string]*types2.Package, f *facts.Facts) (*types2.Package, error) {
+	if pkg == nil || f == nil {
+		return pkg, nil
+	}
+	if err := logos.ApplyFuncFacts(pkg, f.Fns); err != nil {
+		return nil, err
+	}
+	if err := logos.ApplyReadonlyFactsInPlace(pkg, f.Readonlys); err != nil {
+		return nil, err
+	}
+	return pkg, nil
+}
+
 // applyLogosOverlayForLgoImporter rebuilds an imported loGo/s package
-// with Option and ConstView types. Callers invoke it only for .lgo
-// importers; Go importers keep the lowered types without calling here.
-// It returns the package to use and updates the import cache so later
-// lookups in the same compilation see the same view.
-func applyLogosOverlayForLgoImporter(path string, pkg *types2.Package, packages map[string]*types2.Package) *types2.Package {
-	if pkg == nil {
-		return pkg
+// with Option and ConstView types. The verified record f comes from the
+// same decode. Declaration-only records are stamped in place (no clone,
+// no packages replacement); structural records keep the clone path,
+// which the dependency preload protects so both import orders share one
+// Named/alias/instance origin. Go packages never clone and never gain
+// Option/ConstView overlays: their verified assert/readonly effects stamp
+// in place so both Go and loGo/s importers fail closed on forgery.
+func applyLogosOverlayForLgoImporter(path string, pkg *types2.Package, packages map[string]*types2.Package, f *facts.Facts) (*types2.Package, error) {
+	if pkg == nil || f == nil {
+		return pkg, nil
 	}
-	f, ok := facts.Lookup(path)
-	if !ok || f == nil || (len(f.Opts) == 0 && len(f.Consts) == 0) {
-		return pkg
+	if f.GoPackage {
+		if err := logos.ApplyFuncFacts(pkg, f.Fns); err != nil {
+			return nil, err
+		}
+		if err := logos.ApplyReadonlyFactsInPlace(pkg, f.Readonlys); err != nil {
+			return nil, err
+		}
+		return pkg, nil
 	}
-	cloned := logos.CloneWithOverlays(pkg, f.Opts, f.Consts)
+	if !logosHasStructuralFacts(f) {
+		if err := logos.ApplyFuncFacts(pkg, f.Fns); err != nil {
+			return nil, err
+		}
+		if err := logos.ApplyReadonlyFactsInPlace(pkg, f.Readonlys); err != nil {
+			return nil, err
+		}
+		return pkg, nil
+	}
+	cloned, err := logos.CloneWithOverlaysAndReadonly(pkg, f.Opts, f.Consts, f.Fns, f.Readonlys)
+	if err != nil {
+		return nil, err
+	}
 	if cloned != pkg && packages != nil {
 		packages[path] = cloned
 	}
-	return cloned
+	return cloned, nil
 }

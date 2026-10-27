@@ -18,27 +18,106 @@ import (
 	"cmd/compile/internal/types2"
 )
 
-// This file holds the loGo/s facts-sidecar reader (M3-S1). Upstream files
-// carry only hook lines; all logic lives here.
-//
-// readLogosFacts scans the archive for the __.LOGOS member following
-// __.PKGDEF (re-seeking from the start, so readExportData keeps its
-// signature) and adopts its bytes into the importer overlay registry.
-// It reports whether the member was found: archives without it predate
-// the sidecar (plain-Go packages) and import as before, and the Go
-// union-import check runs only when it is present, so those scopes are
-// never resolved. A Go importer (go/importer) reads only __.PKGDEF and
-// never sees it.
-func readLogosFacts(f *os.File, path, data string) (bool, error) {
-	member, err := facts.FindMember(f)
+// logosDepVerifiedFacts returns dep's fingerprint-verified facts record, or
+// nil when dep is unresolvable or carries no sidecar. It is the one loader
+// for every preload predicate so probe and decode share verification:
+// unavailable importcfg entries skip, errors in present archives propagate,
+// a missing member means no facts, and a stale fingerprint fails. It reuses
+// facts.Import, the same fingerprint-bound decode the importer records, so
+// the two predicates below cannot diverge on stale archives. GoPackage
+// never implies absence.
+func logosDepVerifiedFacts(dep string) (*facts.Facts, error) {
+	if !logosDepResolvable(dep) {
+		return nil, nil
+	}
+	f, err := openPackage(dep)
 	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := readExportData(f)
+	if err != nil {
+		return nil, err
+	}
+	member, err := facts.FindMember(f)
+	if err != nil || member == nil {
+		return nil, err
+	}
+	rec, err := facts.Import(dep, data, member)
+	if err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+// logosDepWillStructurallyClone distinguishes an unavailable owner from
+// an available archive that fails verification. Only unavailable importcfg
+// entries may be skipped; errors in present archives propagate.
+func logosDepWillStructurallyClone(dep string) (bool, error) {
+	rec, err := logosDepVerifiedFacts(dep)
+	if err != nil || rec == nil {
 		return false, err
 	}
-	if member == nil {
-		return false, nil
+	return len(rec.Opts) != 0 || len(rec.Consts) != 0, nil
+}
+
+func logosDepResolvable(dep string) bool {
+	if base.Flag.Cfg.PackageFile == nil {
+		return true
 	}
-	_, err = facts.Import(path, data, member)
-	return true, err
+	return base.Flag.Cfg.PackageFile[dep] != ""
+}
+
+func logosHasStructuralFacts(f *facts.Facts) bool {
+	return f != nil && (len(f.Opts) > 0 || len(f.Consts) > 0)
+}
+
+// logosFnsNeedPreload reports whether fns carry declaration-only facts that
+// must be present before dependents decode: a readonly capability or a known
+// assertion effect. Records without either need nothing.
+func logosFnsNeedPreload(fns []facts.FnFact) bool {
+	for _, fn := range fns {
+		if fn.Readonly || fn.HasAssert {
+			return true
+		}
+	}
+	return false
+}
+
+// logosDepNeedsPreload reports whether dep must be imported before a
+// dependent decodes, even when it will not structurally clone. Structural
+// (Opts/Consts) deps clone for lgo views; readonly (Readonlys) and effect
+// (Fns.Readonly/HasAssert) deps stamp in place without cloning or packages
+// replacement, but the dependent must still decode against the annotated
+// canonical owner. Verification mirrors logosDepWillStructurallyClone:
+// unavailable entries skip, present-archive errors propagate, a missing
+// member means no facts, and a stale fingerprint fails. GoPackage never
+// implies absence: assert-only Go members still need preload.
+func logosDepNeedsPreload(dep string) (bool, error) {
+	rec, err := logosDepVerifiedFacts(dep)
+	if err != nil || rec == nil {
+		return false, err
+	}
+	return len(rec.Opts) != 0 || len(rec.Consts) != 0 || len(rec.Readonlys) != 0 || logosFnsNeedPreload(rec.Fns), nil
+}
+
+// readLogosFacts imports the package's verified facts record. The
+// returned record is the one fingerprint-bound to THIS decode; callers
+// pass it on so annotation never re-reads the global, overwritable
+// registry entry.
+func readLogosFacts(f *os.File, path, data string) (*facts.Facts, error) {
+	member, err := facts.FindMember(f)
+	if err != nil {
+		return nil, err
+	}
+	if member == nil {
+		return nil, nil
+	}
+	rec, err := facts.Import(path, data, member)
+	if err != nil {
+		return nil, err
+	}
+	return rec, nil
 }
 
 // logosImporterState records the importer configuration: isLogos preserves
@@ -86,7 +165,7 @@ func logosImportFrom(m *gcimports, path string) (*types2.Package, error) {
 // Generic instances also canonicalize because instantiation uses the
 // preloaded origin.
 func preloadLogosOwners(target *ir.Package, env *types2.Context, packages map[string]*types2.Package, pr *pkgbits.PkgDecoder, selfPath string, st logosImporterState) error {
-	if !st.restoreOverlay || packages == nil || pr == nil {
+	if packages == nil || pr == nil {
 		return nil
 	}
 	n := pr.NumElems(pkgbits.SectionPkg)
@@ -105,6 +184,18 @@ func preloadLogosOwners(target *ir.Package, env *types2.Context, packages map[st
 		seen[dep] = struct{}{}
 		if pkg, ok := packages[dep]; ok && pkg.Complete() {
 			continue
+		}
+		if !logosDepResolvable(dep) {
+			continue
+		}
+		if !st.restoreOverlay {
+			need, err := logosDepNeedsPreload(dep)
+			if err != nil {
+				return err
+			}
+			if !need {
+				continue
+			}
 		}
 		if _, _, err := readImportFileImpl(dep, target, env, packages, st.isLogos, st.restoreOverlay); err != nil {
 			return err
@@ -157,7 +248,7 @@ func readImportFileImpl(path string, target *ir.Package, env *types2.Context, pa
 	if err != nil {
 		return
 	}
-	var logosFacts bool
+	var logosFacts *facts.Facts
 	if logosFacts, err = readLogosFacts(f, path, data); err != nil {
 		return
 	}
@@ -175,9 +266,13 @@ func readImportFileImpl(path string, target *ir.Package, env *types2.Context, pa
 	// signatures (reverse order fails while forward works). Preloading
 	// every SectionPkg dependency with the same importer kind makes the
 	// canonical overlaid A the object B's lazy scopes resolve to, so
-	// both orders share one Named/alias/generic identity. Only the
-	// first-pass loGo/s view clones (restoreOverlay); Go importers keep
-	// the lowered package object, so they skip the preload.
+	// both orders share one Named/alias/generic identity. The first-pass
+	// loGo/s view (restoreOverlay) preloads every dependency; Go
+	// importers preload every dependency carrying facts
+	// (see logosDepNeedsPreload): structural deps clone for lgo views
+	// while declaration-only facts stamp metadata in place and never
+	// replace the package, but the dependent must still decode against
+	// the annotated canonical owner in both cases.
 	if err = preloadLogosOwners(target, env, packages, &pr, path, logosImporterState{isLogos: isLogos, restoreOverlay: restoreOverlay}); err != nil {
 		return
 	}
@@ -187,13 +282,19 @@ func readImportFileImpl(path string, target *ir.Package, env *types2.Context, pa
 	// export naming a loGo/s source file, which plain-Go archives
 	// never do; the sidecar check additionally requires the transport
 	// to be intact.
-	checkLogosUnion := !isLogos && logosFacts && logosExportHasLogosFile(&pr)
+	checkLogosUnion := !isLogos && logosFacts != nil && logosExportHasLogosFile(&pr)
 
 	// Read package descriptors for both types2 and compiler backend.
 	readPackage(newPkgReader(pr), pkg1, false)
 	pkg2 = importer.ReadPackage(env, packages, pr)
 	if pkg2 != nil && restoreOverlay {
-		pkg2 = applyLogosOverlayForLgoImporter(path, pkg2, packages) // logos M3-S7 hook: .lgo importers see Option types.
+		if pkg2, err = applyLogosOverlayForLgoImporter(path, pkg2, packages, logosFacts); err != nil {
+			return
+		} // logos M3-S7 hook: .lgo importers see Option types.
+	} else if pkg2 != nil && logosFacts != nil {
+		if pkg2, err = applyLogosReadonlyForGoImporter(path, pkg2, packages, logosFacts); err != nil {
+			return
+		}
 	}
 	if pkg2 != nil && checkLogosUnion {
 		checkLogosGoImport(pkg2)
