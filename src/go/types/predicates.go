@@ -448,6 +448,9 @@ func (c *comparer) identical(x, y Type, p *ifacePair) bool {
 					if f.Id() != g.Id() || !c.identical(f.typ, g.typ, q) {
 						return false
 					}
+					// loGo/s: readonly obligations are part of interface
+					// identity. An ordinary interface must not become
+					// identical to a qualified one by signature match alone.
 				}
 				return true
 			}
