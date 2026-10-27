@@ -12,7 +12,7 @@ import (
 	"unsafe"
 )
 
-// Generational collection for GOEXPERIMENT=logosgen (M19-S4).
+// Generational collection for GreenTea on amd64 (stable default).
 //
 // A span that survives logosGenMatureAge cycles is mature and closed to
 // allocation, so every object in it is old. A minor cycle marks from the
@@ -31,7 +31,7 @@ import (
 // a mature span is dirty if one of its slots may hold a pointer into a
 // span that is not mature. Promotion rebuilds the cards of a span from its
 // prospective survivors, and a card scan keeps a card dirty while a slot still
-// points into a span that has not survived a cycle.
+// points into a span that is not mature.
 
 const (
 	logosGenCardShift = 9
@@ -45,18 +45,18 @@ const (
 	logosGenSlotTag = uintptr(1) << (goarch.PtrSize*8 - 1)
 
 	logosGenHistoryCap = 256
-
-	// logosGenGate passed: `go test -short std` with GOEXPERIMENT=logosgen
-	// passes, so a -gc=greentea build with the experiment runs the
-	// generational collector. Without the experiment behavior is unchanged
-	// and the experiment stays opt-in.
-	logosGenGate = true
 )
 
+// logosGenBuild reports whether card support is built in: amd64 GreenTea
+// builds. Minor-cycle activation still requires an empty or greentea
+// logosGCMode (see logosGenEnable); batch, epsilon, wasm, none,
+// non-amd64, and nogreenteagc builds have no card path.
+const logosGenBuild = goexperiment.LogosGen
+
 // logosGenScratchLen is the entries of the buffer a store made without a P
-// writes into: the most one barrier call asks for. It is zero without the
-// experiment.
-const logosGenScratchLen = wbMaxEntriesPerCall * goexperiment.LogosGenInt
+// writes into: the most one barrier call asks for. It is zero without card
+// support.
+const logosGenScratchLen = wbMaxEntriesPerCall * goarch.IsAmd64 * goexperiment.LogosGenInt
 
 // logosGenScratch is the scratch write barrier buffer of an M.
 type logosGenScratch [logosGenScratchLen]uintptr
@@ -96,7 +96,7 @@ var logosGen logosGenState
 //
 //go:nosplit
 func wbCards() bool {
-	return goexperiment.LogosGen && writeBarrier.cards
+	return logosGenBuild && writeBarrier.cards
 }
 
 // wbActive reports whether pointer stores must run the barrier slow path:
@@ -108,18 +108,16 @@ func wbActive() bool {
 }
 
 // logosGenEnable starts card recording when this process runs the
-// generational collector: built with the experiment, and run without -gc or
-// under -gc=greentea with the gate passed.
+// generational collector: built with card support, and run without -gc or
+// under -gc=greentea. Any other mode leaves the collector non-generational,
+// though tag stripping stays enabled for amd64 GreenTea builds.
 func logosGenEnable() {
-	if !goexperiment.LogosGen {
+	if !logosGenBuild {
 		return
 	}
 	switch logosGCMode {
 	case "":
 	case "greentea":
-		if !logosGenGate {
-			return
-		}
 	default:
 		return
 	}
@@ -129,7 +127,7 @@ func logosGenEnable() {
 
 // logosGenInitArena gives a new heap arena its card table.
 func logosGenInitArena(ha *heapArena) {
-	if !goexperiment.LogosGen {
+	if !logosGenBuild {
 		return
 	}
 	ha.logosCards = (*logosGenCardTable)(persistentalloc(unsafe.Sizeof(logosGenCardTable{}), goarch.PtrSize, &memstats.gcMiscSys))
@@ -148,7 +146,7 @@ func logosGenTriggerFor(pacer, marked, minimum uint64) uint64 {
 // logosGenHeapTrigger returns the heap size that starts a cycle given the
 // pacer's trigger. A heap-triggered cycle is the one a minor cycle serves.
 func logosGenHeapTrigger(pacer uint64) uint64 {
-	if !goexperiment.LogosGen || !logosGen.active || gcController.gcPercent.Load() < 0 {
+	if !logosGenBuild || !logosGen.active || gcController.gcPercent.Load() < 0 {
 		return pacer
 	}
 	return logosGenTriggerFor(pacer, gcController.heapMarked, gcController.heapMinimum)
@@ -181,7 +179,7 @@ func logosGenMinorCycle(t gcTrigger) bool {
 //
 //go:nosplit
 func logosGenSkip(s *mspan) bool {
-	return goexperiment.LogosGen && logosGen.minor && s.logosAge >= logosGenMatureAge
+	return logosGenBuild && logosGen.minor && s.logosAge >= logosGenMatureAge
 }
 
 // logosGenSkipPointer reports whether p points into a span that
@@ -189,7 +187,7 @@ func logosGenSkip(s *mspan) bool {
 //
 //go:nosplit
 func logosGenSkipPointer(ha *heapArena, p uintptr) bool {
-	if !goexperiment.LogosGen || !logosGen.minor {
+	if !logosGenBuild || !logosGen.minor {
 		return false
 	}
 	s := ha.spans[(p/pageSize)%pagesPerArena]
@@ -198,7 +196,7 @@ func logosGenSkipPointer(ha *heapArena, p uintptr) bool {
 
 // logosGenClosed reports whether s is mature, and so closed to allocation.
 func logosGenClosed(s *mspan) bool {
-	return goexperiment.LogosGen && logosGen.active && s.logosAge >= logosGenMatureAge
+	return logosGenBuild && logosGen.active && s.logosAge >= logosGenMatureAge
 }
 
 // logosGenCardFor returns the card of the heap address addr, or nil when
@@ -267,7 +265,7 @@ func logosGenFlushCards(ptrs []uintptr) {
 //go:nosplit
 //go:nowritebarrierrec
 func logosGenFlush(pp *p, ptrs []uintptr) bool {
-	if !goexperiment.LogosGen {
+	if !logosGenBuild {
 		return false
 	}
 	logosGenFlushCards(ptrs)
@@ -284,7 +282,7 @@ func logosGenFlush(pp *p, ptrs []uintptr) bool {
 //go:nosplit
 //go:nowritebarrierrec
 func logosGenDrainCards(pp *p) {
-	if !goexperiment.LogosGen || !logosGen.active {
+	if !logosGenBuild || !logosGen.active {
 		return
 	}
 	start := uintptr(unsafe.Pointer(&pp.wbBuf.buf[0]))
@@ -293,6 +291,33 @@ func logosGenDrainCards(pp *p) {
 	}
 	n := (pp.wbBuf.next - start) / unsafe.Sizeof(pp.wbBuf.buf[0])
 	logosGenFlushCards(pp.wbBuf.buf[:n])
+}
+
+// logosGenDrainMScratch drains the no-P scratch buffer of mp: the tagged
+// entries become cards, and every scratch word is cleared. A no-P store
+// must not run while marking, so an untagged nonzero entry left with the
+// mark phase running throws instead of dropping a pointer.
+//
+//go:nosplit
+//go:nowritebarrierrec
+func logosGenDrainMScratch(mp *m) {
+	if !logosGenBuild {
+		return
+	}
+	if mp == nil {
+		return
+	}
+	logosGenFlushCards(mp.logosWbScratch[:])
+	bad := false
+	for i := range mp.logosWbScratch {
+		if mp.logosWbScratch[i] != 0 {
+			bad = true
+			mp.logosWbScratch[i] = 0
+		}
+	}
+	if bad && writeBarrier.enabled {
+		throw("logosGen: no-P store during marking")
+	}
 }
 
 // logosGenSlot dirties the card of slot after a pointer store of new to it.
@@ -322,7 +347,7 @@ func logosGenMarkRange(addr, size uintptr) {
 //
 //go:nosplit
 func logosGenGlobalDst() bool {
-	return goexperiment.LogosGen && !writeBarrier.enabled
+	return logosGenBuild && !writeBarrier.enabled
 }
 
 // logosGenBulk dirties the cards of a bulk pointer copy from src to dst into
@@ -333,7 +358,7 @@ func logosGenGlobalDst() bool {
 //go:nosplit
 //go:nowritebarrierrec
 func logosGenBulk(s *mspan, dst, src, size uintptr) bool {
-	if !goexperiment.LogosGen {
+	if !logosGenBuild {
 		return false
 	}
 	if src != 0 && !s.spanclass.noscan() {
@@ -348,7 +373,7 @@ func logosGenBulk(s *mspan, dst, src, size uintptr) bool {
 //go:nosplit
 //go:nowritebarrierrec
 func logosGenTypeBits(typ *_type, dst uintptr) bool {
-	if !goexperiment.LogosGen {
+	if !logosGenBuild {
 		return false
 	}
 	logosGenMarkRange(dst, typ.PtrBytes)
@@ -361,12 +386,15 @@ func logosGenTypeBits(typ *_type, dst uintptr) bool {
 // right after, so no later store can leave a pointer entry for the flush to
 // shade.
 func logosGenSettle() {
-	if !goexperiment.LogosGen || !logosGen.active {
+	if !logosGenBuild || !logosGen.active {
 		return
 	}
 	for _, pp := range allp {
 		logosGenDrainCards(pp)
 		pp.wbBuf.reset()
+	}
+	for mp := allm; mp != nil; mp = mp.alllink {
+		logosGenDrainMScratch(mp)
 	}
 }
 
@@ -374,7 +402,7 @@ func logosGenSettle() {
 // is stopped and the previous sweep is finished. A full cycle forgets all
 // cards, because every span is young after it.
 func logosGenBeginCycle(t gcTrigger) {
-	if !goexperiment.LogosGen || !logosGen.active {
+	if !logosGenBuild || !logosGen.active {
 		return
 	}
 	logosGen.minor = logosGenMinorCycle(t)
@@ -433,7 +461,7 @@ func logosGenClearCards() {
 // logosGenMatureBytes returns the live bytes the mature spans keep, which a
 // minor cycle does not mark.
 func logosGenMatureBytes() uint64 {
-	if !goexperiment.LogosGen || !logosGen.minor {
+	if !logosGenBuild || !logosGen.minor {
 		return 0
 	}
 	return uint64(logosGen.matureBytes.Load())
@@ -442,7 +470,7 @@ func logosGenMatureBytes() uint64 {
 // logosGenMarkCards marks from the dirty cards of the mature spans at the
 // start of a minor cycle. The world is stopped and the mark phase is set.
 func logosGenMarkCards() {
-	if !goexperiment.LogosGen || !logosGen.minor {
+	if !logosGenBuild || !logosGen.minor {
 		return
 	}
 	systemstack(func() {
@@ -455,7 +483,7 @@ func logosGenMarkCards() {
 }
 
 // logosGenScanArenaCards scans the dirty cards of one arena. A card stays
-// dirty while a slot in it points into a span that has not survived a cycle.
+// dirty while a slot in it points into a span that is not mature.
 func logosGenScanArenaCards(ha *heapArena, base uintptr, gcw *gcWork) {
 	cards := &ha.logosCards.cards
 	for c := range cards {
@@ -477,7 +505,7 @@ func logosGenSpanAt(ha *heapArena, a uintptr) *mspan {
 // logosGenScanCard greys the pointees of the card at lo and returns the new
 // card value. A card may overlap more than one span; every overlapping
 // mature scannable span is scanned, and the card stays dirty while any slot
-// in it points into a span that has not survived a cycle.
+// in it points into a span that is not mature.
 func logosGenScanCard(ha *heapArena, lo uintptr, gcw *gcWork) uint8 {
 	end := lo + logosGenCardBytes
 	young := false
@@ -501,7 +529,7 @@ func logosGenScanCard(ha *heapArena, lo uintptr, gcw *gcWork) uint8 {
 
 // logosGenScanSpanRange greys the pointees of the pointer slots of the
 // objects of s overlapping [from, to) and reports whether any points into
-// a span that has not survived a cycle.
+// a span that is not mature.
 func logosGenScanSpanRange(s *mspan, from, to uintptr, gcw *gcWork) bool {
 	young := false
 	for i := s.objIndex(from); i < uintptr(s.nelems); i++ {
@@ -521,7 +549,7 @@ func logosGenScanSpanRange(s *mspan, from, to uintptr, gcw *gcWork) bool {
 
 // logosGenScanObject greys the pointees of the pointer slots of the object
 // at obj, within [lo, hi) when the object is larger than a card, and
-// reports whether any points into a span that has not survived a cycle.
+// reports whether any points into a span that is not mature.
 func logosGenScanObject(s *mspan, obj, lo, hi uintptr, gcw *gcWork) bool {
 	from, to := obj, obj+s.elemsize
 	if s.elemsize > logosGenCardBytes {
@@ -541,7 +569,7 @@ func logosGenScanObject(s *mspan, obj, lo, hi uintptr, gcw *gcWork) bool {
 		if v < minLegalPointer {
 			continue
 		}
-		if t := spanOfHeap(v); t != nil && t.logosAge == 0 {
+		if t := spanOfHeap(v); t != nil && t.logosAge < logosGenMatureAge {
 			young = true
 		}
 		logosGenGrey(v, gcw)
@@ -563,7 +591,13 @@ func logosGenGrey(v uintptr, gcw *gcWork) {
 // the coming sweep makes mature, from the span's marked objects and the
 // unmarked objects its finalizers will retain.
 func logosGenEndCycle() {
-	if !goexperiment.LogosGen || !logosGen.minor {
+	if !logosGenBuild || !logosGen.active {
+		return
+	}
+	for mp := allm; mp != nil; mp = mp.alllink {
+		logosGenDrainMScratch(mp)
+	}
+	if !logosGen.minor {
 		return
 	}
 	for _, s := range mheap_.allspans {
@@ -576,7 +610,7 @@ func logosGenEndCycle() {
 // logosGenPromote makes the cards of s describe its prospective survivors:
 // marked objects, plus unmarked objects carrying finalizers, which the
 // coming sweep retains instead of freeing. A card is dirty when a slot in
-// it points into a span that has not survived a cycle. A card shared with
+// it points into a span that is not mature. A card shared with
 // another span stays dirty: only the owning span may clear it, and this
 // span does not own the shared edge.
 func logosGenPromote(s *mspan) {
@@ -613,7 +647,7 @@ func logosGenPromote(s *mspan) {
 }
 
 // logosGenPromoteObject dirties the card of every slot of the object at obj
-// that points into a span that has not survived a cycle.
+// that points into a span that is not mature.
 func logosGenPromoteObject(s *mspan, obj uintptr) {
 	tp := s.typePointersOfUnchecked(obj)
 	for {
@@ -625,7 +659,7 @@ func logosGenPromoteObject(s *mspan, obj uintptr) {
 		if v < minLegalPointer {
 			continue
 		}
-		if t := spanOfHeap(v); t != nil && t.logosAge == 0 {
+		if t := spanOfHeap(v); t != nil && t.logosAge < logosGenMatureAge {
 			logosGenMarkCard(addr)
 		}
 	}
@@ -666,7 +700,7 @@ func logosGenRelist(s *mspan) {
 // logosGenAge counts the cycle s survived. A full cycle returns every span
 // to age 1; a minor cycle ages a span until it is mature.
 func logosGenAge(s *mspan, nalloc uint16) {
-	if !goexperiment.LogosGen || !logosGen.active || s.isUserArenaChunk || nalloc == 0 {
+	if !logosGenBuild || !logosGen.active || s.isUserArenaChunk || nalloc == 0 {
 		return
 	}
 	if !logosGen.minor {

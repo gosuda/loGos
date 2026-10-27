@@ -85,3 +85,41 @@ func LogosGenCycles() int { return int(logosGen.histN) }
 
 // LogosGenResetHistory forgets the recorded cycle kinds.
 func LogosGenResetHistory() { logosGen.resetHistory() }
+
+// LogosGenPromoteObjectForTest clears obj's card, runs the generational
+// promote scan for the object at obj, and reports whether obj's card is
+// dirty afterwards. It exercises logosGenPromoteObject's young-pointer
+// predicate (logosAge < logosGenMatureAge): an age-1 pointee must dirty
+// the card, which fails under the old age==0 predicate.
+func LogosGenPromoteObjectForTest(obj unsafe.Pointer) bool {
+	addr := uintptr(obj)
+	if c := logosGenCardFor(addr); c != nil {
+		*c = 0
+	}
+	s := spanOf(addr)
+	if s == nil {
+		return false
+	}
+	logosGenPromoteObject(s, addr)
+	return logosGenCardDirty(addr)
+}
+
+// LogosGenDrainScratchForTest writes the tagged slot address obj into the
+// current M's no-P scratch buffer, drains it through the production
+// logosGenDrainMScratch path, and reports whether obj's card is dirty and
+// every scratch word is zero afterwards.
+func LogosGenDrainScratchForTest(obj unsafe.Pointer) bool {
+	mp := acquirem()
+	mp.logosWbScratch[0] = uintptr(obj) | logosGenSlotTag
+	logosGenDrainMScratch(mp)
+	dirty := logosGenCardDirty(uintptr(obj))
+	clean := true
+	for _, w := range mp.logosWbScratch {
+		if w != 0 {
+			clean = false
+			break
+		}
+	}
+	releasem(mp)
+	return dirty && clean
+}
