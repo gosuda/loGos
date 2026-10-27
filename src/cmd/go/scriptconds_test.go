@@ -52,16 +52,17 @@ func scriptConditions(t *testing.T) map[string]script.Cond {
 
 // hasWasmFx reports whether node in PATH runs WebAssembly stack switching:
 // node must accept --experimental-wasm-wasmfx and compile a module with a
-// cont type. When LOGOS_REQUIRE_WASMFX is set, a missing engine fails the
-// test instead of skipping it, so required proof never passes as a skip.
+// cont type and a cont.new instruction. When LOGOS_REQUIRE_WASMFX is set,
+// a missing engine fails the test instead of skipping it, so required proof
+// never passes as a skip.
 func hasWasmFx() (bool, error) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		return requireWasmFx("node not in PATH")
 	}
-	probe := `const bytes = new Uint8Array([0,97,115,109,1,0,0,0,1,6,2,96,0,0,93,0]); try { new WebAssembly.Module(bytes); } catch (e) { process.exit(1); }`
+	probe := `const bytes = new Uint8Array([0,97,115,109,1,0,0,0,1,9,3,96,0,0,96,0,0,93,1,3,2,1,0,10,9,1,7,0,208,1,224,2,26,11]); try { new WebAssembly.Module(bytes); } catch (e) { process.exit(1); }`
 	if err := exec.Command(node, "--experimental-wasm-wasmfx", "-e", probe).Run(); err != nil {
-		return requireWasmFx("node lacks --experimental-wasm-wasmfx stack switching")
+		return requireWasmFx("node lacks --experimental-wasm-wasmfx stack-switching instructions")
 	}
 	return true, nil
 }
