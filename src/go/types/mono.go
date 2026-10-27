@@ -63,6 +63,12 @@ type monoGraph struct {
 	// nameIdx maps a defined type or (canonical) type parameter to its
 	// vertex index.
 	nameIdx map[*TypeName]int
+
+	// cycle marks the TypeNames on the detected positive-weight
+	// instantiation cycle, if any. Logos assertion proofs consult it to
+	// cut only the invalid growing path; unrelated roots are still
+	// validated exactly. Nil when no cycle was detected.
+	cycle map[*TypeName]bool
 }
 
 type monoVertex struct {
@@ -84,6 +90,23 @@ type monoEdge struct {
 }
 
 func (check *Checker) monomorph() {
+	if v := check.findMonoCycle(); v >= 0 {
+		check.reportInstanceLoop(v)
+	}
+}
+
+// collectMonoCycle records the positive-cycle boundary silently without
+// reporting a diagnostic. Used when prior errors disable upstream cycle
+// reports, so Logos proofs still terminate on growing instantiations.
+func (check *Checker) collectMonoCycle() {
+	if v := check.findMonoCycle(); v >= 0 {
+		check.recordMonoCycle(v)
+	}
+}
+
+// findMonoCycle runs the Bellman-Ford scan shared by reporting and
+// silent collection, returning the cycle endpoint or -1 when finite.
+func (check *Checker) findMonoCycle() int {
 	// We detect unbounded instantiation cycles using a variant of
 	// Bellman-Ford's algorithm. Namely, instead of always running |V|
 	// iterations, we run until we either reach a fixed point or we've
@@ -108,12 +131,46 @@ func (check *Checker) monomorph() {
 			dst.pre = i
 			dst.len = src.len + 1
 			if dst.len == len(check.mono.vertices) {
-				check.reportInstanceLoop(edge.dst)
-				return
+				return edge.dst
 			}
 
 			dst.weight = w
 			again = true
+		}
+	}
+	return -1
+}
+
+// recordMonoCycle marks the positive-cycle vertices for Logos proof
+// boundaries without reporting a diagnostic. Used for silent collection
+// when upstream disables cycle reports due to prior errors.
+func (check *Checker) recordMonoCycle(v int) {
+	var stack []int
+	seen := make([]bool, len(check.mono.vertices))
+
+	// We have a path that contains a cycle and ends at v, but v may
+	// only be reachable from the cycle, not on the cycle itself. We
+	// start by walking backwards along the path until we find a vertex
+	// that appears twice.
+	for !seen[v] {
+		stack = append(stack, v)
+		seen[v] = true
+		v = check.mono.edges[check.mono.vertices[v].pre].src
+	}
+
+	// Trim any vertices we visited before visiting v the first
+	// time. Since v is the first vertex we found within the cycle, any
+	// vertices we visited earlier cannot be part of the cycle.
+	for stack[0] != v {
+		stack = stack[1:]
+	}
+
+	if check.mono.cycle == nil {
+		check.mono.cycle = make(map[*TypeName]bool)
+	}
+	for _, cv := range stack {
+		if obj := check.mono.vertices[cv].obj; obj != nil {
+			check.mono.cycle[obj] = true
 		}
 	}
 }
@@ -135,6 +192,20 @@ func (check *Checker) reportInstanceLoop(v int) {
 	// Trim any vertices we visited before visiting v the first
 	// time. Since v is the first vertex we found within the cycle, any
 	// vertices we visited earlier cannot be part of the cycle.
+	for stack[0] != v {
+		stack = stack[1:]
+	}
+
+	check.recordMonoCycle(v)
+	// Rebuild the reporting stack (recordMonoCycle already marked the
+	// boundary silently). Walk again for the diagnostic path.
+	stack = nil
+	seen = make([]bool, len(check.mono.vertices))
+	for !seen[v] {
+		stack = append(stack, v)
+		seen[v] = true
+		v = check.mono.edges[check.mono.vertices[v].pre].src
+	}
 	for stack[0] != v {
 		stack = stack[1:]
 	}
@@ -174,6 +245,12 @@ func (w *monoGraph) recordCanon(mpar, tpar *TypeParam) {
 // recordInstance records that the given type parameters were
 // instantiated with the corresponding type arguments.
 func (w *monoGraph) recordInstance(pkg *Package, pos token.Pos, tparams []*TypeParam, targs []Type, xlist []ast.Expr) {
+	// Partial/invalid instantiations keep their original diagnostic;
+	// skip graphing rather than indexing short argument lists. Named
+	// types require full arity.
+	if len(tparams) != len(targs) {
+		return
+	}
 	for i, tpar := range tparams {
 		pos := pos
 		if i < len(xlist) {
@@ -193,7 +270,13 @@ func (w *monoGraph) assign(pkg *Package, pos token.Pos, tpar *TypeParam, targ Ty
 	//
 	// TODO(mdempsky): Push this check up into recordInstance? All type
 	// parameters in a list will appear in the same package.
-	if tpar.Obj().Pkg() != pkg {
+	if tpar == nil || tpar.Obj() == nil || tpar.Obj().Pkg() != pkg {
+		return
+	}
+	// logos T-201: monomorph now runs even when prior errors exist, so
+	// skip invalid type arguments safely instead of flowing broken edges.
+	// Valid growing instantiations (e.g. Box[Box[A]]) remain fully graphed.
+	if targ == nil || !isValid(targ) {
 		return
 	}
 
@@ -211,12 +294,20 @@ func (w *monoGraph) assign(pkg *Package, pos token.Pos, tpar *TypeParam, targ Ty
 	// type parameters.
 	var do func(typ Type)
 	do = func(typ Type) {
+		if typ == nil || !isValid(typ) {
+			return
+		}
 		switch typ := Unalias(typ).(type) {
 		default:
-			panic("unexpected type")
+			// logos T-201: monomorph runs with prior errors present, so
+			// skip unmodelled kinds safely instead of panicking. Valid
+			// growing instantiations use only the kinds below.
+			return
 
 		case *TypeParam:
-			assert(typ.Obj().Pkg() == pkg)
+			if typ.Obj() == nil || typ.Obj().Pkg() != pkg {
+				return
+			}
 			flow(w.typeParamVertex(typ), typ)
 
 		case *Named:
@@ -258,6 +349,12 @@ func (w *monoGraph) assign(pkg *Package, pos token.Pos, tpar *TypeParam, targ Ty
 		case *Struct:
 			for i := 0; i < typ.NumFields(); i++ {
 				do(typ.Field(i).Type())
+			}
+		case *Union:
+			for i := range typ.Len() {
+				if tm := typ.Term(i); tm != nil {
+					do(tm.Type())
+				}
 			}
 		}
 	}
