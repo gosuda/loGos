@@ -55,7 +55,9 @@ func mallocgcSmallScanNoHeaderSC1(size uintptr, typ *_type, needzero bool) unsaf
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -208,7 +210,9 @@ func mallocgcSmallScanNoHeaderSC2(size uintptr, typ *_type, needzero bool) unsaf
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -361,7 +365,9 @@ func mallocgcSmallScanNoHeaderSC3(size uintptr, typ *_type, needzero bool) unsaf
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -514,7 +520,9 @@ func mallocgcSmallScanNoHeaderSC4(size uintptr, typ *_type, needzero bool) unsaf
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -667,7 +675,9 @@ func mallocgcSmallScanNoHeaderSC5(size uintptr, typ *_type, needzero bool) unsaf
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -820,7 +830,9 @@ func mallocgcSmallScanNoHeaderSC6(size uintptr, typ *_type, needzero bool) unsaf
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -973,7 +985,9 @@ func mallocgcSmallScanNoHeaderSC7(size uintptr, typ *_type, needzero bool) unsaf
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -1243,7 +1257,9 @@ func mallocgcSmallNoScanSC2(size uintptr, typ *_type, needzero bool) unsafe.Poin
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -1342,7 +1358,9 @@ func mallocgcSmallNoScanSC3(size uintptr, typ *_type, needzero bool) unsafe.Poin
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -1441,7 +1459,9 @@ func mallocgcSmallNoScanSC4(size uintptr, typ *_type, needzero bool) unsafe.Poin
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -1540,7 +1560,9 @@ func mallocgcSmallNoScanSC5(size uintptr, typ *_type, needzero bool) unsafe.Poin
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -1639,7 +1661,9 @@ func mallocgcSmallNoScanSC6(size uintptr, typ *_type, needzero bool) unsafe.Poin
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -1738,7 +1762,9 @@ func mallocgcSmallNoScanSC7(size uintptr, typ *_type, needzero bool) unsafe.Poin
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -1977,7 +2003,9 @@ func mallocgcSmallScanSlowPath(size uintptr, typ *_type, needzero bool, spc span
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {
@@ -2164,7 +2192,9 @@ func mallocgcSmallNoScanSlowPath(size uintptr, typ *_type, needzero bool, spc sp
 	{
 
 		var nextFreeFastResult gclinkptr
-		if span.allocCache != 0 {
+		if goexperiment.LogosGCMoving && span.logosImmixActive {
+			nextFreeFastResult = logosImmixNextFreeFast(span)
+		} else if span.allocCache != 0 {
 			theBit := sys.TrailingZeros64(span.allocCache)
 			result := span.freeindex + uint16(theBit)
 			if result < span.nelems {

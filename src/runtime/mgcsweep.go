@@ -25,6 +25,7 @@
 package runtime
 
 import (
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"unsafe"
 )
@@ -726,6 +727,15 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 
 	// Initialize alloc bits cache.
 	s.refillAllocCache(0)
+
+	if goexperiment.LogosGCMoving {
+		// Rebuild plane O from the post-swap freeindex OR allocBits
+		// composite and reset the bump/hole cursor. Re-cached partial
+		// spans re-enter mcaches with allocated lines covered, so hole
+		// reuse serves only genuinely free slots. Fully freed spans
+		// return to the heap below, where freeSpanLocked clears planes.
+		logosImmixRebuildOccupancy(s)
+	}
 
 	// The span must be in our exclusive ownership until we update sweepgen,
 	// check for potential races.

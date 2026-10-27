@@ -518,7 +518,9 @@ func nextFreeFastTiny(span *mspan) gclinkptr {
 
 func nextFreeFastStub(span *mspan, elemsize uintptr) gclinkptr {
 	var nextFreeFastResult gclinkptr
-	if span.allocCache != 0 {
+	if goexperiment.LogosGCMoving && span.logosImmixActive {
+		nextFreeFastResult = logosImmixNextFreeFast(span)
+	} else if span.allocCache != 0 {
 		theBit := sys.TrailingZeros64(span.allocCache) // Is there a free object in the allocCache?
 		result := span.freeindex + uint16(theBit)
 		if result < span.nelems {

@@ -721,6 +721,9 @@ func mallocinit() {
 	// Initialize the memory limit here because the allocator is going to look at it
 	// but we haven't called gcinit yet and we're definitely going to allocate memory before then.
 	gcController.memoryLimit.Store(math.MaxInt64)
+	if goexperiment.LogosGCMoving {
+		logosImmixSetEnabled()
+	}
 }
 
 // sysAlloc allocates heap arena space for at least n bytes. The
@@ -968,6 +971,12 @@ var zerobase uintptr
 // nextFreeFast returns the next free object if one is quickly available.
 // Otherwise it returns 0.
 func nextFreeFast(s *mspan) gclinkptr {
+	if goexperiment.LogosGCMoving && s.logosImmixActive {
+		// Active immix spans serve only through the immix helper so
+		// every slot sets plane O; 0 falls through to c.nextFree's
+		// bitmap scan (which sets occupancy there).
+		return logosImmixNextFreeFast(s)
+	}
 	theBit := sys.TrailingZeros64(s.allocCache) // Is there a free object in the allocCache?
 	if theBit < 64 {
 		result := s.freeindex + uint16(theBit)
@@ -1009,6 +1018,16 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, checkGCTrigger 
 		s = c.alloc[spc]
 
 		freeIndex = s.nextFreeIndex()
+	}
+
+	if goexperiment.LogosGCMoving && freeIndex < s.nelems {
+		// Bitmap-authoritative fallback: nextFreeIndex already counted
+		// the slot via its freeindex advance; record its lines here so
+		// plane O stays the freeindex OR allocBits composite. Guarded:
+		// on the defensive full-span path there is no slot to mark,
+		// and the address past the object area would phantom-occupy
+		// the heap-bits carve line.
+		logosImmixOccupySlot(s, s.base()+uintptr(freeIndex)*s.elemsize)
 	}
 
 	if freeIndex >= s.nelems {
@@ -1465,6 +1484,16 @@ func mallocgcSmallNoscanReuse(c *mcache, span *mspan, spc spanClass, size uintpt
 	// Maybe doesn't matter. gclinkptr might be for historical reasons.
 	v, span := c.nextReusableNoScan(span, spc)
 	x := unsafe.Pointer(v)
+
+	if goexperiment.LogosGCMoving && logosImmixEnabled() {
+		// Reuse bypasses nextFreeFast/c.nextFree: record the slot's
+		// lines idempotently. The reused slot may belong to a span
+		// other than the cached one, so resolve it from the pointer
+		// (spanOf is safe under acquirem; byte-gated when immix is off).
+		if rs := spanOf(uintptr(x)); rs != nil {
+			logosImmixOccupySlot(rs, uintptr(x))
+		}
+	}
 
 	// Compensate for the GC assist credit deducted in mallocgc (before calling us and
 	// after we return) because this is not a newly allocated object. We use the full slot

@@ -521,6 +521,11 @@ type mspan struct {
 	userArenaChunkFree    addrRange     // interval for managing chunk allocation
 	largeType             *_type        // malloc header for large objects.
 	logosAge              uint8         // cycles survived, saturating at logosGenMatureAge (GOEXPERIMENT=logosgen)
+	logosImmixBlock       *logosImmixBlock
+	logosImmixActive      bool
+	logosImmixCursor      uint32
+	logosImmixLimit       uint32
+	logosImmixNext        uint16
 }
 
 func (s *mspan) base() uintptr {
@@ -1231,12 +1236,19 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 	// allocations. Where the page size is less than the physical page
 	// size, we already manage to do this by default.
 	needPhysPageAlign := physPageAlignedStacks && typ == spanAllocStack && pageSize < physPageSize
+	needImmixAlign := false
+	if goexperiment.LogosGCMoving {
+		needImmixAlign = logosImmixNeedsAlignedSpan(spanclass, typ)
+		if needImmixAlign {
+			npages = logosPagesPerBlock
+		}
+	}
 
 	// If the allocation is small enough, try the page cache!
 	// The page cache does not support aligned allocations, so we cannot use
 	// it if we need to provide a physical page aligned stack allocation.
 	pp := gp.m.p.ptr()
-	if !needPhysPageAlign && pp != nil && npages < pageCachePages/4 {
+	if !needPhysPageAlign && !needImmixAlign && pp != nil && npages < pageCachePages/4 {
 		c := &pp.pcache
 
 		// If the cache is empty, refill it.
@@ -1288,6 +1300,25 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 			}
 		}
 		base = alignUp(base, physPageSize)
+		scav = h.pages.allocRange(base, npages)
+	}
+
+	if needImmixAlign && base == 0 {
+		extraPages := uintptr(logosImmixBlockBytes / pageSize)
+		base, _ = h.pages.find(npages + extraPages)
+		if base == 0 {
+			var ok bool
+			growth, ok = h.grow(npages + extraPages)
+			if !ok {
+				unlock(&h.lock)
+				return nil
+			}
+			base, _ = h.pages.find(npages + extraPages)
+			if base == 0 {
+				throw("grew heap, but no adequate free space found")
+			}
+		}
+		base = alignUp(base, logosImmixBlockBytes)
 		scav = h.pages.allocRange(base, npages)
 	}
 
@@ -1500,6 +1531,9 @@ func (h *mheap) initSpan(s *mspan, typ spanAllocType, spanclass spanClass, base,
 		// only ever updated with the world stopped and we run on the
 		// systemstack which blocks a STW transition.
 		atomic.Store(&s.sweepgen, h.sweepgen)
+		if goexperiment.LogosGCMoving {
+			logosImmixInitSpan(s)
+		}
 
 		// Now that the span is filled in, set its state. This
 		// is a publication barrier for the other fields in
@@ -1776,6 +1810,9 @@ func (h *mheap) freeSpanLocked(s *mspan, typ spanAllocType) {
 		atomic.Xaddint64(&stats.inWorkBufs, -int64(nbytes))
 	}
 	memstats.heapStats.release()
+	if goexperiment.LogosGCMoving {
+		logosImmixFreeSpan(s)
+	}
 
 	// Mark the space as free.
 	h.pages.free(s.base(), s.npages)
@@ -1833,6 +1870,11 @@ func (span *mspan) init(base uintptr, npages uintptr) {
 	span.logosPinned = false
 	span.logosFwd = 0
 	span.logosAge = 0
+	span.logosImmixBlock = nil
+	span.logosImmixActive = false
+	span.logosImmixCursor = 0
+	span.logosImmixLimit = 0
+	span.logosImmixNext = 0
 	span.needzero = 0
 	span.isLogosArenaChunk = false
 	span.freeindex = 0
