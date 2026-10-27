@@ -50,7 +50,8 @@ func logosCgocallFast(fn, arg unsafe.Pointer) int32 {
 	// behavior; foreign words pass through. The nested typed graph is
 	// canonicalized at the generated call site (the W2 emission), not
 	// here: this nosplit path cannot walk types.
-	arg = logosZgcUntagArg(arg)
+	arg = logosZgcForeignArg(arg)
+	logosZgcForeignHoldEnter(getg(), uintptr(arg))
 
 	mp := getg().m
 	if raceenabled {
@@ -61,7 +62,7 @@ func logosCgocallFast(fn, arg unsafe.Pointer) int32 {
 	if mp.cgoCallers != nil {
 		mp.cgoCallers[0] = 0
 	}
-	logosRecordFastCall(mp, arg, int64(nanotime()))
+	logosRecordFastCall(mp, arg, nanotime())
 
 	// N.B. getcallerfp cannot be written directly as an argument for
 	// the same spilling reason stated on entersyscall.
@@ -85,6 +86,7 @@ func logosCgocallFast(fn, arg unsafe.Pointer) int32 {
 	winsyscall := mp.winsyscall
 
 	exitsyscall()
+	logosZgcForeignHoldExit(getg())
 
 	getg().m.winsyscall = winsyscall
 
@@ -122,7 +124,7 @@ func logosCgocallFast(fn, arg unsafe.Pointer) int32 {
 //
 //go:nosplit
 func logosRecordFastCall(mp *m, arg unsafe.Pointer, now int64) {
-	mp.fastCgoFrame = [4]uintptr{uintptr(arg), 0, 0, 0}
+	mp.fastCgoFrame[0] = uintptr(arg)
 	mp.fastCallEnterNano = now
 	mp.inFastCall = true
 }
@@ -135,5 +137,5 @@ func logosRecordFastCall(mp *m, arg unsafe.Pointer, now int64) {
 func logosClearFastCall(mp *m) {
 	mp.inFastCall = false
 	mp.fastCallEnterNano = 0
-	mp.fastCgoFrame = [4]uintptr{}
+	mp.fastCgoFrame[0] = 0
 }
