@@ -606,6 +606,15 @@ type g struct {
 	// built with the "valgrind" build tag, otherwise it is unused.
 	valgrindStackID uintptr
 
+	// logosForeignG holds this goroutine's foreign-call frame state
+	// (stack top, spare frame, depth, transport count). The fields live
+	// in logos_foreign_g.go under goexperiment.logosgcmoving; the
+	// struct is empty otherwise, so off-experiment builds carry no
+	// per-g foreign state. Embedded so consumers keep the promoted
+	// gp.logosForeignTop spelling. It must stay ahead of a
+	// non-zero-sized field: a trailing empty struct would cost a full
+	// alignment word of padding.
+	logosForeignG
 	// logosErrSite holds the per-goroutine loGo/s error-trace ring: site
 	// pointers for the latest error, oldest first. Lowered code uses
 	// package-level sites, so retention is free.
