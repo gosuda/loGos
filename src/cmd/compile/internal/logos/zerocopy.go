@@ -5,7 +5,7 @@
 package logos
 
 import (
-	"fmt"
+	"strings"
 
 	"cmd/compile/internal/syntax"
 	"cmd/compile/internal/types2"
@@ -466,7 +466,8 @@ func (z *zeroCopy) unsafeConvert(call *syntax.CallExpr, arg syntax.Expr, outer, 
 			callOf(pos, selOf(pos, nameOf(pos, "unsafe"), inner), []syntax.Expr{arg}),
 			callOf(pos, nameOf(pos, "len"), []syntax.Expr{z.dupOf(pos, arg)}),
 		})
-	z.fl.add(start, end, fmt.Sprintf(form, text, text))
+	parts := strings.Split(form, "%s")
+	z.fl.addT(start, end, cat(gen(parts[0]), text, gen(parts[1]), text, gen(parts[2])))
 	z.rewrite = true
 	return out
 }

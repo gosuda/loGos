@@ -170,7 +170,7 @@ func groupNames(pos syntax.Pos, spellings []string) []syntax.Expr {
 
 // groupPlainTemps binds a non-receiving right-hand element to vals
 // temporaries, keeping its source text, so evaluation order is kept.
-func (fc *funcLower) groupPlainTemps(pos syntax.Pos, r syntax.Expr, vals int) (syntax.Stmt, string, []string) {
+func (fc *funcLower) groupPlainTemps(pos syntax.Pos, r syntax.Expr, vals int) (syntax.Stmt, otext, []string) {
 	fl := fc.fl
 	start := fl.off(leftmostOf(r))
 	elemText := fl.textOf(span{start: start, end: groupExprEnd(fl.src, start)})
@@ -178,13 +178,13 @@ func (fc *funcLower) groupPlainTemps(pos syntax.Pos, r syntax.Expr, vals int) (s
 	for i := range names {
 		names[i] = fc.groupTempName("t")
 	}
-	return defineOf(pos, groupNames(pos, names), []syntax.Expr{r}), strings.Join(names, ", ") + " := " + elemText, names
+	return defineOf(pos, groupNames(pos, names), []syntax.Expr{r}), cat(gen(strings.Join(names, ", ")+" := "), elemText), names
 }
 
 // groupRecvSelect declares the temporaries of a receiving element and
 // receives into them through a select with the cancel arm. It returns
 // the native statements, the text lines, and the temporary spellings.
-func (fc *funcLower) groupRecvSelect(pos syntax.Pos, top groupFrame, e *groupRecvElem) ([]syntax.Stmt, []string, []string) {
+func (fc *funcLower) groupRecvSelect(pos syntax.Pos, top groupFrame, e *groupRecvElem) ([]syntax.Stmt, []otext, []string) {
 	fl := fc.fl
 	ch := e.recv.X
 	chStart := fl.off(leftmostOf(ch))
@@ -193,20 +193,20 @@ func (fc *funcLower) groupRecvSelect(pos syntax.Pos, top groupFrame, e *groupRec
 	e.tmp = fc.groupTempName("t")
 	names := []string{e.tmp}
 	native := []syntax.Stmt{typedVarDecl(pos, nameOf(pos, e.tmp), fc.groupSpellType(elemT, pos))}
-	text := []string{"var " + e.tmp + " " + types2.TypeString(elemT, fc.yieldQualifier)}
+	text := []otext{gen("var " + e.tmp + " " + types2.TypeString(elemT, fc.yieldQualifier))}
 	caseLHS := e.tmp
 	if e.vals == 2 {
 		e.otmp = fc.groupTempName("o")
 		names = append(names, e.otmp)
 		native = append(native, typedVarDecl(pos, nameOf(pos, e.otmp), nameOf(pos, "bool")))
-		text = append(text, "var "+e.otmp+" bool")
+		text = append(text, gen("var "+e.otmp+" bool"))
 		caseLHS += ", " + e.otmp
 	}
 	recvN := assignOf(pos, groupNames(pos, names), []syntax.Expr{at(&syntax.Operation{Op: syntax.Recv, X: ch}, pos)})
 	native = append(native, at(&syntax.SelectStmt{
 		Body: []*syntax.CommClause{at(&syntax.CommClause{Comm: recvN}, pos), groupDoneClause(pos, top.gctx)},
 	}, pos))
-	text = append(text, "select { case "+caseLHS+" = <-"+chText+": "+groupDoneText(top.gctx)+" }")
+	text = append(text, cat(gen("select { case "+caseLHS+" = <-"), chText, gen(": "+groupDoneText(top.gctx)+" }")))
 	return native, text, names
 }
 
@@ -214,9 +214,10 @@ func (fc *funcLower) groupRecvSelect(pos syntax.Pos, top groupFrame, e *groupRec
 // in source order: receives go through a cancel select, everything else
 // binds plainly. It returns the native statements, the text lines, and
 // the temporary spellings in target order.
-func (fc *funcLower) groupRecvTemps(pos syntax.Pos, top groupFrame, rhs []syntax.Expr, elems []groupRecvElem) ([]syntax.Stmt, []string, []string) {
+func (fc *funcLower) groupRecvTemps(pos syntax.Pos, top groupFrame, rhs []syntax.Expr, elems []groupRecvElem) ([]syntax.Stmt, []otext, []string) {
 	var native []syntax.Stmt
-	var text, temps []string
+	var text []otext
+	var temps []string
 	for i := range elems {
 		if elems[i].recv == nil {
 			n, t, names := fc.groupPlainTemps(pos, rhs[i], elems[i].vals)
@@ -258,8 +259,15 @@ func (fc *funcLower) lowerGroupRecv(s *syntax.AssignStmt, top groupFrame) []synt
 	native, text, temps := fc.groupRecvTemps(pos, top, rhs, elems)
 	finalN, sep := groupAssignFinal(s, lhs, groupNames(pos, temps))
 	start := fl.off(leftmostOf(lhs[0]))
-	text = append(text, fl.textOf(span{start: start, end: fl.off(pos)})+sep+strings.Join(temps, ", "))
-	fl.add(start, stmtEnd(fl.src, start), strings.Join(text, "\n"))
+	text = append(text, cat(fl.textOf(span{start: start, end: fl.off(pos)}), gen(sep+strings.Join(temps, ", "))))
+	parts := make([]otext, 0, 2*len(text))
+	for i, line := range text {
+		if i > 0 {
+			parts = append(parts, gen("\n"))
+		}
+		parts = append(parts, line)
+	}
+	fl.addT(start, stmtEnd(fl.src, start), cat(parts...))
 	return append(native, finalN)
 }
 
@@ -319,9 +327,16 @@ func (fc *funcLower) lowerGroupVarRecv(s *syntax.DeclStmt, d *syntax.VarDecl, to
 	pos := s.Pos()
 	native, text, temps := fc.groupRecvTemps(pos, top, rhs, elems)
 	start := fl.off(pos)
-	head := strings.TrimRight(fl.textOf(span{start: start, end: groupAssignOffset(fl.src, start)}), " \t\n")
-	text = append(text, head+" = "+strings.Join(temps, ", "))
-	fl.add(start, stmtEnd(fl.src, start), strings.Join(text, "\n"))
+	head := fl.textOf(span{start: start, end: groupAssignOffset(fl.src, start)}).trimRight(" \t\n")
+	text = append(text, cat(head, gen(" = "+strings.Join(temps, ", "))))
+	parts := make([]otext, 0, 2*len(text))
+	for i, line := range text {
+		if i > 0 {
+			parts = append(parts, gen("\n"))
+		}
+		parts = append(parts, line)
+	}
+	fl.addT(start, stmtEnd(fl.src, start), cat(parts...))
 	return append(native, groupVarDeclOf(pos, d, groupNames(pos, temps)))
 }
 
@@ -399,7 +414,7 @@ func (fc *funcLower) lowerGroupRecvExpr(s *syntax.ExprStmt, op *syntax.Operation
 	}, pos)
 	start := fl.off(leftmostOf(op))
 	end := stmtEnd(fl.src, start)
-	fl.add(start, end, "select { case "+recvText+": "+groupDoneText(top.gctx)+" }")
+	fl.addT(start, end, cat(gen("select { case "), recvText, gen(": "+groupDoneText(top.gctx)+" }")))
 	return []syntax.Stmt{native}
 }
 
@@ -422,7 +437,7 @@ func (fc *funcLower) lowerGroupSend(s *syntax.SendStmt, top groupFrame) []syntax
 	}, pos)
 	start := fl.off(leftmostOf(s.Chan))
 	end := groupExprEnd(fl.src, vStart)
-	fl.add(start, end, "select { case "+chText+" <- "+vText+": "+groupDoneText(top.gctx)+" }")
+	fl.addT(start, end, cat(gen("select { case "), chText, gen(" <- "), vText, gen(": "+groupDoneText(top.gctx)+" }")))
 	return []syntax.Stmt{native}
 }
 
@@ -446,7 +461,7 @@ func (fc *funcLower) lowerGroupRange(s *syntax.ForStmt, rc *syntax.RangeClause, 
 	pos := s.Pos()
 	scanForLiterals(fl, rc.X)
 	chStart := fl.off(leftmostOf(rc.X))
-	chText := strings.TrimRight(string(fl.src[chStart:fl.off(s.Body.Pos())]), " \t\n")
+	chText := fl.srcUser(chStart, fl.off(s.Body.Pos())).trimRight(" \t\n")
 	fl.needRT = true
 	adapter := callOf(pos, selOf(pos, nameOf(pos, rtAlias), "Chan"), []syntax.Expr{
 		nameOf(pos, top.gctx), rc.X,
@@ -455,19 +470,19 @@ func (fc *funcLower) lowerGroupRange(s *syntax.ForStmt, rc *syntax.RangeClause, 
 	scanForLiterals(fl, s.Cond)
 	scanForLiterals(fl, s.Post)
 	s.Body.List = fc.lowerList(s.Body.List)
-	lhsPart := ""
+	var lhsPart otext
 	if rc.Lhs != nil {
 		lhsStart := fl.off(leftmostOf(rc.Lhs))
-		lhsPart = strings.TrimRight(string(fl.src[lhsStart:fl.off(rc.Pos())]), " \t\n:=")
+		lhsPart = fl.srcUser(lhsStart, fl.off(rc.Pos())).trimRight(" \t\n:=")
 		if rc.Def {
-			lhsPart += " := "
+			lhsPart = cat(lhsPart, gen(" := "))
 		} else {
-			lhsPart += " = "
+			lhsPart = cat(lhsPart, gen(" = "))
 		}
 	}
 	headStart := fl.off(pos)
 	braceOff := fl.off(s.Body.Pos())
-	fl.add(headStart, braceOff, "for "+lhsPart+"range "+rtAlias+".Chan("+top.gctx+", "+chText+") ")
+	fl.addT(headStart, braceOff, cat(gen("for "), lhsPart, gen("range "+rtAlias+".Chan("+top.gctx+", "), chText, gen(") ")))
 	// The post-loop check is emitted after the loop, so it carries the
 	// loop body's closing position, not the loop's head position: scope
 	// marks are recorded in emission order and the head position would
@@ -485,7 +500,7 @@ func (fc *funcLower) lowerGroupRange(s *syntax.ForStmt, rc *syntax.RangeClause, 
 			}),
 		})
 	end := fl.off(s.Body.Rbrace) + 1
-	fl.add(end, end, "\n"+renderText([]syntax.Stmt{checkN}, nil))
+	fl.addT(end, end, cat(gen("\n"), renderText([]syntax.Stmt{checkN}, nil)))
 	return []syntax.Stmt{s, checkN}
 }
 

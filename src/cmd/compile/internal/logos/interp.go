@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
-	"strings"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/syntax"
@@ -230,7 +229,7 @@ func replaceInterpField(f reflect.Value, repl func(*syntax.InterpExpr) syntax.Ex
 // node is replaced in the tree by the matching native call. kinds holds
 // the pre-lowering operand kinds; operand texts drain from the live
 // tree, absorbing whatever inner splices earlier passes recorded.
-func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosInterpKind) (bool, string) {
+func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosInterpKind) (bool, otext) {
 	pos := e.Pos()
 	start := fl.off(pos)
 	end := start + len(e.Raw)
@@ -238,13 +237,13 @@ func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosI
 		text := fmt.Sprintf("%q", e.Parts[0])
 		fl.add(start, end, text)
 		fl.replaceInterpLit(e, litOf(pos, text, syntax.StringLit))
-		return false, text
+		return false, gen(text)
 	}
 	if len(kinds) != len(e.Exprs) || len(e.Opens) != len(e.Exprs) || len(e.Closes) != len(e.Exprs) {
 		base.Fatalf("logos: interpolation at %s has %d operands but %d kinds, %d opens, %d closes",
 			pos.String(), len(e.Exprs), len(kinds), len(e.Opens), len(e.Closes))
 	}
-	opTexts := make([]string, len(e.Exprs))
+	opTexts := make([]otext, len(e.Exprs))
 	for i := range e.Exprs {
 		opTexts[i] = fl.interpOperandText(e.Opens[i], e.Closes[i])
 	}
@@ -260,7 +259,7 @@ func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosI
 	valName := func(i int) string { return fmt.Sprintf(interpVal, i) }
 	strName := func(i int) string { return fmt.Sprintf(interpStr, i) }
 	var stmts []syntax.Stmt
-	var lines []string
+	var lines []otext
 	for i := range e.Exprs {
 		// The node comes from the live tree (earlier passes may have
 		// rewritten it, and an inner literal already swapped its
@@ -268,7 +267,7 @@ func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosI
 		op := e.Exprs[i]
 		v := valName(i)
 		stmts = append(stmts, defineOf(pos, []syntax.Expr{nameOf(pos, v)}, []syntax.Expr{op}))
-		lines = append(lines, v+" := "+opTexts[i])
+		lines = append(lines, cat(gen(v+" := "), opTexts[i]))
 		if kinds[i] == types2.LogosInterpError || kinds[i] == types2.LogosInterpStringer {
 			method := "Error"
 			if kinds[i] == types2.LogosInterpStringer {
@@ -278,7 +277,7 @@ func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosI
 			stmts = append(stmts, defineOf(pos,
 				[]syntax.Expr{nameOf(pos, s)},
 				[]syntax.Expr{callOf(pos, selOf(pos, nameOf(pos, v), method), nil)}))
-			lines = append(lines, s+" := "+v+"."+method+"()")
+			lines = append(lines, gen(s+" := "+v+"."+method+"()"))
 		}
 	}
 	static := 0
@@ -319,30 +318,39 @@ func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosI
 			bound,
 		}),
 	}))
-	lines = append(lines, interpBuf+" := make([]byte, 0, "+boundText+")")
-	emitAppend := func(arg syntax.Expr, argText string, spread bool) {
+	lines = append(lines, gen(interpBuf+" := make([]byte, 0, "+boundText+")"))
+	emitAppend := func(arg syntax.Expr, argText otext, spread bool) {
 		call := callOf(pos, nameOf(pos, "append"), []syntax.Expr{nameOf(pos, interpBuf), arg})
 		call.HasDots = spread
 		stmts = append(stmts, assignOf(pos, []syntax.Expr{nameOf(pos, interpBuf)}, []syntax.Expr{call}))
 		if spread {
-			argText += "..."
+			argText = cat(argText, gen("..."))
 		}
-		lines = append(lines, interpBuf+" = append("+interpBuf+", "+argText+")")
+		lines = append(lines, cat(gen(interpBuf+" = append("+interpBuf+", "), argText, gen(")")))
 	}
-	emitConv := func(name string, args []syntax.Expr, argTexts []string) {
+	emitConv := func(name string, args []syntax.Expr, argTexts []otext) {
 		call := callOf(pos, selOf(pos, nameOf(pos, interpConvPkg), name), args)
 		stmts = append(stmts, assignOf(pos, []syntax.Expr{nameOf(pos, interpBuf)}, []syntax.Expr{call}))
-		lines = append(lines, interpBuf+" = "+interpConvPkg+"."+name+"("+strings.Join(argTexts, ", ")+")")
+		cparts := make([]otext, 0, 2*len(argTexts)+1)
+		cparts = append(cparts, gen(interpBuf+" = "+interpConvPkg+"."+name+"("))
+		for i, a := range argTexts {
+			if i > 0 {
+				cparts = append(cparts, gen(", "))
+			}
+			cparts = append(cparts, a)
+		}
+		cparts = append(cparts, gen(")"))
+		lines = append(lines, cat(cparts...))
 	}
 	conv1 := func(name, conv, v, last string) {
 		emitConv(name,
 			[]syntax.Expr{nameOf(pos, interpBuf), callOf(pos, nameOf(pos, conv), []syntax.Expr{nameOf(pos, v)}), litOf(pos, last, syntax.IntLit)},
-			[]string{interpBuf, conv + "(" + v + ")", last})
+			[]otext{gen(interpBuf), gen(conv + "(" + v + ")"), gen(last)})
 	}
 	for i, part := range e.Parts {
 		if part != "" {
 			quoted := fmt.Sprintf("%q", part)
-			emitAppend(litOf(pos, quoted, syntax.StringLit), quoted, true)
+			emitAppend(litOf(pos, quoted, syntax.StringLit), gen(quoted), true)
 		}
 		if i >= len(e.Exprs) {
 			continue
@@ -350,10 +358,10 @@ func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosI
 		v := valName(i)
 		switch kinds[i] {
 		case types2.LogosInterpString, types2.LogosInterpBytes:
-			emitAppend(nameOf(pos, v), v, true)
+			emitAppend(nameOf(pos, v), gen(v), true)
 		case types2.LogosInterpError, types2.LogosInterpStringer:
 			s := strName(i)
-			emitAppend(nameOf(pos, s), s, true)
+			emitAppend(nameOf(pos, s), gen(s), true)
 		case types2.LogosInterpInt:
 			conv1("AppendInt", "int64", v, "10")
 		case types2.LogosInterpUint:
@@ -371,14 +379,14 @@ func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosI
 					at(&syntax.Operation{Op: syntax.Sub, X: litOf(pos, "1", syntax.IntLit)}, pos),
 					litOf(pos, bits, syntax.IntLit),
 				},
-				[]string{interpBuf, "float64(" + v + ")", "'g'", "-1", bits})
+				[]otext{gen(interpBuf), gen("float64(" + v + ")"), gen("'g'"), gen("-1"), gen(bits)})
 		case types2.LogosInterpBool:
 			emitConv("AppendBool",
 				[]syntax.Expr{nameOf(pos, interpBuf), nameOf(pos, v)},
-				[]string{interpBuf, v})
+				[]otext{gen(interpBuf), gen(v)})
 		}
 	}
-	lines = append(lines, "return "+interpUnsafePkg+".String("+interpUnsafePkg+".SliceData("+interpBuf+"), len("+interpBuf+"))")
+	lines = append(lines, gen("return "+interpUnsafePkg+".String("+interpUnsafePkg+".SliceData("+interpBuf+"), len("+interpBuf+"))"))
 	stmts = append(stmts, returnOf(pos, []syntax.Expr{
 		callOf(pos, selOf(pos, nameOf(pos, interpUnsafePkg), "String"), []syntax.Expr{
 			callOf(pos, selOf(pos, nameOf(pos, interpUnsafePkg), "SliceData"), []syntax.Expr{nameOf(pos, interpBuf)}),
@@ -399,8 +407,17 @@ func (fl *fileLower) lowerInterpExpr(e *syntax.InterpExpr, kinds []types2.LogosI
 		fl.optBodyType = make(map[syntax.Expr]types2.Type)
 	}
 	fl.optBodyType[native] = types2.Typ[types2.String]
-	text := "func() string {\n" + strings.Join(lines, "\n") + "\n}()"
-	fl.add(start, end, text)
+	parts := make([]otext, 0, 2*len(lines)+2)
+	parts = append(parts, gen("func() string {\n"))
+	for i, line := range lines {
+		if i > 0 {
+			parts = append(parts, gen("\n"))
+		}
+		parts = append(parts, line)
+	}
+	parts = append(parts, gen("\n}()"))
+	text := cat(parts...)
+	fl.addT(start, end, text)
 	return needConv, text
 }
 
@@ -429,9 +446,9 @@ func (fl *fileLower) replaceInterpLit(e *syntax.InterpExpr, native syntax.Expr) 
 // nodes (notably lowerOptions), but the braces never move. Zero-width
 // boundary inserts sitting exactly at an operand edge land strictly
 // inside and are absorbed.
-func (fl *fileLower) interpOperandText(open, close syntax.Pos) string {
+func (fl *fileLower) interpOperandText(open, close syntax.Pos) otext {
 	text := fl.textOf(span{fl.off(open), fl.off(close) + 1})
-	return text[1 : len(text)-1]
+	return text.slice(1, len(text.s)-1)
 }
 
 // flushInterpImports prepends the synthesized strconv and unsafe imports

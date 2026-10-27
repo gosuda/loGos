@@ -25,7 +25,7 @@ type twin struct {
 
 // mark returns a placeholder standing for text, positioned at pos so the
 // printer sees known positions while rendering the eject text.
-func (tw *twin) mark(pos syntax.Pos, text string) *syntax.Name {
+func (tw *twin) mark(pos syntax.Pos, text otext) *syntax.Name {
 	return markerText(&tw.subs, &tw.seq, pos, text)
 }
 
@@ -346,13 +346,13 @@ func (fc *funcLower) lowerCases(body []*syntax.CaseClause) {
 }
 
 // initCore is one lowering core for a try init clause.
-type initCore func() (native []syntax.Stmt, text string, spanStart, spanEnd int)
+type initCore func() (native []syntax.Stmt, text otext, spanStart, spanEnd int)
 
 // initCoreOf matches a try statement in init position.
 func (fc *funcLower) initCoreOf(init syntax.SimpleStmt) (initCore, bool) {
 	if s, isAssign := init.(*syntax.AssignStmt); isAssign {
 		if t, call, matched := tryAssignOf(s); matched {
-			return func() ([]syntax.Stmt, string, int, int) {
+			return func() ([]syntax.Stmt, otext, int, int) {
 				return fc.tryAssignCore(s, t, call)
 			}, true
 		}
@@ -360,7 +360,7 @@ func (fc *funcLower) initCoreOf(init syntax.SimpleStmt) (initCore, bool) {
 	}
 	if s, isExpr := init.(*syntax.ExprStmt); isExpr {
 		if t, call, matched := tryExprOf(s); matched {
-			return func() ([]syntax.Stmt, string, int, int) {
+			return func() ([]syntax.Stmt, otext, int, int) {
 				return fc.tryExprCore(s, t, call)
 			}, true
 		}
@@ -385,7 +385,7 @@ func (fc *funcLower) wrapInitStmt(host syntax.Stmt, init syntax.SimpleStmt, kw s
 	semi := skipSemi(fl.src, spanEnd)
 	clearInit(host)
 	end := blockEndOff(fl, host)
-	fl.add(kwOff, semi, "{ "+text+kw+" ")
+	fl.addT(kwOff, semi, cat(gen("{ "), text, gen(kw+" ")))
 	fl.add(end, end, "} ")
 	wrapper := blockOf(host.Pos(), append(native, host))
 	wrapper.Rbrace = hostRbrace(host)
@@ -499,13 +499,13 @@ func skipSemi(src []byte, from int) int {
 func (fc *funcLower) lowerTryAssign(s *syntax.AssignStmt, t *syntax.TryExpr, call *syntax.CallExpr) []syntax.Stmt {
 	fl := fc.fl
 	native, text, spanStart, spanEnd := fc.tryAssignCore(s, t, call)
-	fl.add(spanStart, spanEnd, text)
+	fl.addT(spanStart, spanEnd, text)
 	return native
 }
 
 // tryAssignCore builds the native and text forms of a try assignment and
 // returns them with the replaced span.
-func (fc *funcLower) tryAssignCore(s *syntax.AssignStmt, t *syntax.TryExpr, call *syntax.CallExpr) ([]syntax.Stmt, string, int, int) {
+func (fc *funcLower) tryAssignCore(s *syntax.AssignStmt, t *syntax.TryExpr, call *syntax.CallExpr) ([]syntax.Stmt, otext, int, int) {
 	fl := fc.fl
 	src := fl.src
 	tpos := t.Pos()
@@ -515,7 +515,7 @@ func (fc *funcLower) tryAssignCore(s *syntax.AssignStmt, t *syntax.TryExpr, call
 	qOff := fl.off(tpos)
 	spanEnd := skipCloseParens(src, qOff+1)
 	lhs := syntax.UnpackListExpr(s.Lhs)
-	lhsText := string(trimSpanBytes(src[spanStart:opOff]))
+	lhsText := fl.srcUser(spanStart, opOff).trim()
 	callText := fl.textOf(span{start: fl.off(leftmostOf(call.Fun)), end: qOff})
 	errSpelling := fc.nextErr()
 	siteSpelling := fl.newSite(tpos, tpos.Line())
@@ -558,13 +558,13 @@ func (fc *funcLower) tryAssignCore(s *syntax.AssignStmt, t *syntax.TryExpr, call
 func (fc *funcLower) lowerTryExpr(s *syntax.ExprStmt, t *syntax.TryExpr, call *syntax.CallExpr) []syntax.Stmt {
 	fl := fc.fl
 	native, text, spanStart, spanEnd := fc.tryExprCore(s, t, call)
-	fl.add(spanStart, spanEnd, text)
+	fl.addT(spanStart, spanEnd, text)
 	return native
 }
 
 // tryExprCore builds the native and text forms of an expression try and
 // returns them with the replaced span.
-func (fc *funcLower) tryExprCore(s *syntax.ExprStmt, t *syntax.TryExpr, call *syntax.CallExpr) ([]syntax.Stmt, string, int, int) {
+func (fc *funcLower) tryExprCore(s *syntax.ExprStmt, t *syntax.TryExpr, call *syntax.CallExpr) ([]syntax.Stmt, otext, int, int) {
 	fl := fc.fl
 	tpos := t.Pos()
 	stmtPos := leftmostOf(call.Fun)
@@ -580,7 +580,7 @@ func (fc *funcLower) tryExprCore(s *syntax.ExprStmt, t *syntax.TryExpr, call *sy
 	callMark := tw.mark(tpos, callText)
 	n := fc.callResults(call)
 	var native []syntax.Stmt
-	var text string
+	var text otext
 	if n == 0 {
 		native = []syntax.Stmt{errCheckInitOf(stmtPos, nil, call, nameOf(tpos, errSpelling), exitNative)}
 		text = renderText([]syntax.Stmt{errCheckInitOf(stmtPos, nil, callMark, nameOf(tpos, errSpelling), exitText)}, tw.subs)

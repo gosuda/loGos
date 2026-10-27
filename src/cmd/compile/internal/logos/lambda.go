@@ -77,10 +77,10 @@ func (fl *fileLower) lowerLambdaExpr(lam *syntax.LambdaExpr) {
 		return
 	}
 	pos := lam.Pos()
-	var params strings.Builder
+	var params []otext
 	for i, name := range lam.Params {
 		if i > 0 {
-			params.WriteString(", ")
+			params = append(params, gen(", "))
 		}
 		spelled, ok := fl.spellLowered(sig.Params().At(i).Type())
 		if !ok {
@@ -89,7 +89,7 @@ func (fl *fileLower) lowerLambdaExpr(lam *syntax.LambdaExpr) {
 				return
 			}
 		}
-		params.WriteString(name.Value + " " + spelled)
+		params = append(params, fl.srcUser(fl.off(name.Pos()), fl.off(name.Pos())+len(name.Value)), gen(" "+spelled))
 	}
 	results, resultsText := fl.lambdaResultSpell(pos, sig)
 	if resultsText == "" && sig.Results().Len() > 0 {
@@ -98,14 +98,14 @@ func (fl *fileLower) lowerLambdaExpr(lam *syntax.LambdaExpr) {
 	_ = results
 	if block, ok := lam.Body.(*syntax.BlockStmt); ok {
 		var ok2 bool
-		resultsText, ok2 = fl.lowerLambdaScopeDefers(lam, pos, sig, block, params.String(), resultsText)
+		resultsText, ok2 = fl.lowerLambdaScopeDefers(lam, pos, sig, block, cat(params...).s, resultsText)
 		if !ok2 {
 			return
 		}
 	}
 	body, bodyText := fl.lambdaBody(lam, sig, pos)
-	fullText := "func(" + params.String() + ")" + resultsText + " { " + bodyText + " }"
-	ft, ok := typeExprAt("func("+params.String()+")"+resultsText, pos)
+	fullText := cat(gen("func("), cat(params...), gen(")"+resultsText+" { "), bodyText, gen(" }"))
+	ft, ok := typeExprAt("func("+cat(params...).s+")"+resultsText, pos)
 	if !ok {
 		return
 	}
@@ -125,7 +125,7 @@ func (fl *fileLower) lowerLambdaExpr(lam *syntax.LambdaExpr) {
 		// source (see lambdaCaptureSpan).
 		end = fl.lambdaCaptureSpan(lam, expr).end
 	}
-	fl.add(fl.off(syntax.StartPos(lam)), end, fullText)
+	fl.addT(fl.off(syntax.StartPos(lam)), end, fullText)
 	replaceTupleExpr(fl.file, lam, lit)
 }
 
@@ -196,7 +196,7 @@ func (fl *fileLower) lambdaCaptureSpan(lam *syntax.LambdaExpr, body syntax.Expr)
 }
 
 // lambdaBody builds the function body and its text for a lambda.
-func (fl *fileLower) lambdaBody(lam *syntax.LambdaExpr, sig *types2.Signature, pos syntax.Pos) (*syntax.BlockStmt, string) {
+func (fl *fileLower) lambdaBody(lam *syntax.LambdaExpr, sig *types2.Signature, pos syntax.Pos) (*syntax.BlockStmt, otext) {
 	// D7: pre-lower captures in the body (interpolations, property
 	// reads) before baking eject text, so the splice and the tree
 	// agree. Scope-defer splices from lowerLambdaExpr land strictly
@@ -208,7 +208,7 @@ func (fl *fileLower) lambdaBody(lam *syntax.LambdaExpr, sig *types2.Signature, p
 	}
 	expr, ok := lam.Body.(syntax.Expr)
 	if !ok {
-		return blockOf(pos, nil), ""
+		return blockOf(pos, nil), otext{}
 	}
 	if t, ok := syntax.Unparen(expr).(*syntax.TryExpr); ok {
 		return fl.lambdaTryBody(sig, pos, t)
@@ -220,16 +220,16 @@ func (fl *fileLower) lambdaBody(lam *syntax.LambdaExpr, sig *types2.Signature, p
 	// D7: a top-level `??`/`?.` wrapper records its boundary inserts
 	// exactly on the capture edges; drain them here.
 	text := fl.drainBodyWrapper(expr, fl.textOf(espan))
-	return blockOf(pos, []syntax.Stmt{returnOf(pos, []syntax.Expr{expr})}), "return " + text
+	return blockOf(pos, []syntax.Stmt{returnOf(pos, []syntax.Expr{expr})}), cat(gen("return "), text)
 }
 
 // lambdaTryBody expands a `?` lambda body to an explicit error branch:
 // `r, e := call(); if e != nil { return zeros, e }; return r`.
-func (fl *fileLower) lambdaTryBody(sig *types2.Signature, pos syntax.Pos, t *syntax.TryExpr) (*syntax.BlockStmt, string) {
+func (fl *fileLower) lambdaTryBody(sig *types2.Signature, pos syntax.Pos, t *syntax.TryExpr) (*syntax.BlockStmt, otext) {
 	call, ok := syntax.Unparen(t.X).(*syntax.CallExpr)
 	if !ok {
 		text := fl.textOf(span{fl.off(syntax.StartPos(t)), fl.off(syntax.EndPos(t))})
-		return blockOf(pos, []syntax.Stmt{returnOf(pos, []syntax.Expr{t})}), "return " + text
+		return blockOf(pos, []syntax.Stmt{returnOf(pos, []syntax.Expr{t})}), cat(gen("return "), text)
 	}
 	nres := sig.Results().Len()
 	var names []string
@@ -238,7 +238,7 @@ func (fl *fileLower) lambdaTryBody(sig *types2.Signature, pos syntax.Pos, t *syn
 	}
 	errName := fmt.Sprintf("_logos_lam%d_%d_e", pos.Line(), pos.Col())
 	callText := fl.textOf(fl.tupleCallSpan(call))
-	var text strings.Builder
+	var parts []otext
 	var lhs []syntax.Expr
 	var lhsTexts []string
 	for _, nm := range names {
@@ -247,7 +247,7 @@ func (fl *fileLower) lambdaTryBody(sig *types2.Signature, pos syntax.Pos, t *syn
 	}
 	lhs = append(lhs, nameOf(pos, errName))
 	lhsTexts = append(lhsTexts, errName)
-	text.WriteString(strings.Join(lhsTexts, ", ") + " := " + callText + "; ")
+	parts = append(parts, cat(gen(strings.Join(lhsTexts, ", ")+" := "), callText, gen("; ")))
 	as := defineOf(pos, lhs, []syntax.Expr{call})
 	var zeros []syntax.Expr
 	var zeroTexts []string
@@ -259,7 +259,7 @@ func (fl *fileLower) lambdaTryBody(sig *types2.Signature, pos syntax.Pos, t *syn
 	zeros = append(zeros, nameOf(pos, errName))
 	zeroTexts = append(zeroTexts, errName)
 	branch := ifOf(pos, nil, notNil(pos, nameOf(pos, errName)), []syntax.Stmt{returnOf(pos, zeros)})
-	text.WriteString("if " + errName + " != nil { return " + strings.Join(zeroTexts, ", ") + " }; ")
+	parts = append(parts, gen("if "+errName+" != nil { return "+strings.Join(zeroTexts, ", ")+" }; "))
 	var retVals []syntax.Expr
 	var retTexts []string
 	for _, nm := range names {
@@ -267,11 +267,11 @@ func (fl *fileLower) lambdaTryBody(sig *types2.Signature, pos syntax.Pos, t *syn
 		retTexts = append(retTexts, nm)
 	}
 	ret := returnOf(pos, retVals)
-	text.WriteString("return")
+	parts = append(parts, gen("return"))
 	if len(retTexts) > 0 {
-		text.WriteString(" " + strings.Join(retTexts, ", "))
+		parts = append(parts, gen(" "+strings.Join(retTexts, ", ")))
 	}
-	return blockOf(pos, []syntax.Stmt{as, branch, ret}), text.String()
+	return blockOf(pos, []syntax.Stmt{as, branch, ret}), cat(parts...)
 }
 
 // lowerLambdaScopeDefers runs the M6-S10 scope-defer pre-pass over a block

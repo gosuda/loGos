@@ -213,7 +213,10 @@ func (fc *funcLower) lowerYieldStmt(s *syntax.YieldStmt) syntax.Stmt {
 	native := ifOf(pos, nil, cond, []syntax.Stmt{returnOf(pos, nil)})
 	valStart := fl.off(syntax.StartPos(s.Value))
 	valEnd := fl.off(syntax.EndPos(s.Value))
-	fl.add(fl.off(pos), valEnd, "if !"+yieldParam+"("+fl.textOf(span{start: valStart, end: valEnd})+") { return }")
+	fl.addT(fl.off(pos), valEnd, cat(
+		gen("if !"+yieldParam+"("),
+		fl.textOf(span{start: valStart, end: valEnd}),
+		gen(") { return }")))
 	return native
 }
 

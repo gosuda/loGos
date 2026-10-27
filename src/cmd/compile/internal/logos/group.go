@@ -341,7 +341,7 @@ func (fc *funcLower) lowerGroupInline(s *syntax.GroupStmt) []syntax.Stmt {
 	ctxSpan := span{start: fl.off(leftmostOf(s.Ctx)), end: groupExprEnd(fl.src, fl.off(leftmostOf(s.Ctx)))}
 	ctxText := fl.textOf(ctxSpan)
 	pieces := []span{ctxSpan}
-	limitText := "0"
+	limitText := gen("0")
 	limitNode := syntax.Expr(litOf(pos, "0", syntax.IntLit))
 	if s.Limit != nil {
 		limitSpan := span{start: fl.off(leftmostOf(s.Limit)), end: groupExprEnd(fl.src, fl.off(leftmostOf(s.Limit)))}
@@ -363,7 +363,15 @@ func (fc *funcLower) lowerGroupInline(s *syntax.GroupStmt) []syntax.Stmt {
 				}),
 		}), nil)),
 	}, nil)
-	fl.add(headStart, braceOff+1, kept+g+", "+gctx+" := "+rtAlias+".NewGroup("+ctxText+", "+limitText+")\n_ = "+gctx+"\n"+guardText)
+	fl.addT(headStart, braceOff+1, cat(
+		kept,
+		gen(g+", "+gctx+" := "+rtAlias+".NewGroup("),
+		ctxText,
+		gen(", "),
+		limitText,
+		gen(")\n_ = "+gctx+"\n"),
+		guardText,
+	))
 	header := defineOf(pos,
 		[]syntax.Expr{nameOf(pos, g), nameOf(pos, gctx)},
 		[]syntax.Expr{callOf(pos, rtSel(pos, "NewGroup"), []syntax.Expr{s.Ctx, limitNode})})
@@ -383,7 +391,7 @@ func (fc *funcLower) lowerGroupInline(s *syntax.GroupStmt) []syntax.Stmt {
 	rbrace := s.Body.Rbrace
 	joinNative, joinText, joinSubs := fc.groupJoinCheck(rbrace, top)
 	rbraceOff := fl.off(rbrace)
-	fl.add(rbraceOff, rbraceOff, renderText(joinText, joinSubs))
+	fl.addT(rbraceOff, rbraceOff, renderText(joinText, joinSubs))
 	fl.add(rbraceOff, rbraceOff+1, "")
 	out := append([]syntax.Stmt{header, blankUse, flagDef, guardDef}, s.Body.List...)
 	return append(out, joinNative...)
@@ -395,7 +403,7 @@ func (fc *funcLower) lowerGroupInline(s *syntax.GroupStmt) []syntax.Stmt {
 // keeping their own splices untouched in separate records.
 func (fc *funcLower) groupPrefixJoin(pos syntax.Pos, top groupFrame, off int) []syntax.Stmt {
 	joinNative, joinText, joinSubs := fc.groupJoinCheck(pos, top)
-	fc.fl.add(off, off, renderText(joinText, joinSubs))
+	fc.fl.addT(off, off, renderText(joinText, joinSubs))
 	return joinNative
 }
 
@@ -510,13 +518,18 @@ func (fc *funcLower) lowerGroupBranch(s *syntax.BranchStmt, top groupFrame) []sy
 	return append(prefix, s)
 }
 
-// lowerGroupGo lowers a `go f(args)` child: the call keeps its source
-// in place between a Go-closure prefix and an error-check suffix, while
-// the native tree carries the same call node, so argument splices land
-// in the uncovered span on both sides. The text wrapper renders with a
-// reserved dummy name where the call sits and splits there; the dummy
-// spelling cannot collide with user code, since `_logos_` names are
-// rejected in .lgo, so the split lands exactly around the call span.
+// lowerGroupGo lowers a `go f(args)` child: the callee or receiver and
+// every argument bind in the calling goroutine, in source order, before
+// Group.Go (groupCapture), and the child closure calls the bound
+// temporaries. The bindings and Group.Go share one block, so labels,
+// gotos, and the temporaries' scope see a single statement, as they
+// saw the go statement. The call keeps its source in place between a Go-closure
+// prefix and an error-check suffix, while the native tree carries the
+// same call node, so argument splices land in the uncovered span on
+// both sides. The text wrapper renders with a reserved dummy name where
+// the call sits and splits there; the dummy spelling cannot collide
+// with user code, since `_logos_` names are rejected in .lgo, so the
+// split lands exactly around the call span.
 func (fc *funcLower) lowerGroupGo(s *syntax.CallStmt) []syntax.Stmt {
 	top, ok := fc.groupOf()
 	if !ok {
@@ -535,6 +548,7 @@ func (fc *funcLower) lowerGroupGo(s *syntax.CallStmt) []syntax.Stmt {
 	ft := groupChildFuncType(pos, top.gctx, cr)
 	callStart := fl.off(leftmostOf(call))
 	callEnd := groupExprEnd(fl.src, callStart)
+	capNative, capText := fc.groupCapture(pos, call)
 	var checkN syntax.Stmt
 	if hasErr {
 		eName := nameOf(pos, errSpelling)
@@ -559,12 +573,12 @@ func (fc *funcLower) lowerGroupGo(s *syntax.CallStmt) []syntax.Stmt {
 	}
 	retT := returnOf(pos, []syntax.Expr{nilOf(pos)})
 	text := renderText([]syntax.Stmt{checkT, retT}, nil)
-	parts := strings.SplitN(text, "_logos_CALL", 2)
+	parts := strings.SplitN(text.s, "_logos_CALL", 2)
 	if len(parts) != 2 {
 		base.Fatalf("logos: group call text misses its call at %s", pos.String())
 	}
-	fl.add(fl.off(pos), callStart, top.g+".Go(func("+top.gctx+" "+rtAlias+".Context) ("+cr+" error) { "+parts[0])
-	fl.add(callEnd, callEnd, parts[1]+"})")
+	fl.add(fl.off(pos), callStart, "{ "+capText+top.g+".Go(func("+top.gctx+" "+rtAlias+".Context) ("+cr+" error) { "+parts[0])
+	fl.add(callEnd, callEnd, parts[1]+"}) }")
 	native := exprStmtOf(pos, callOf(pos, selOf(pos, nameOf(pos, top.g), "Go"), []syntax.Expr{lit}))
-	return []syntax.Stmt{native}
+	return []syntax.Stmt{blockOf(pos, append(capNative, native))}
 }

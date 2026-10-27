@@ -269,8 +269,8 @@ func (fl *fileLower) spreadValueComposite(c *syntax.CompositeLit) syntax.Expr {
 		}, b.pos),
 		Body: blockOf(b.pos, b.native),
 	}, b.pos), nil)
-	text := "func() " + b.typeText() + " {\n" + renderText(b.text, b.tw.subs) + "}()"
-	fl.add(fl.off(syntax.StartPos(c)), fl.off(c.Rbrace)+1, text)
+	text := cat(gen("func() "), b.typeText(), gen(" {\n"), renderText(b.text, b.tw.subs), gen("}()"))
+	fl.addT(fl.off(syntax.StartPos(c)), fl.off(c.Rbrace)+1, text)
 	return native
 }
 
@@ -291,8 +291,8 @@ func (fl *fileLower) spreadAddrComposite(c *syntax.CompositeLit) syntax.Expr {
 		}, b.pos),
 		Body: blockOf(b.pos, b.native),
 	}, b.pos), nil)
-	text := "func() *" + b.typeText() + " {\n" + renderText(b.text, b.tw.subs) + "}()"
-	fl.add(fl.off(syntax.StartPos(c)), fl.off(c.Rbrace)+1, text)
+	text := cat(gen("func() *"), b.typeText(), gen(" {\n"), renderText(b.text, b.tw.subs), gen("}()"))
+	fl.addT(fl.off(syntax.StartPos(c)), fl.off(c.Rbrace)+1, text)
 	return native
 }
 
@@ -308,7 +308,7 @@ func (fl *fileLower) spreadAddrOp(op *syntax.Operation, c *syntax.CompositeLit) 
 	// The drained span starts just after the operator, so a comment in
 	// that gap stays while only the `&` itself is dropped.
 	inner := fl.textOf(span{start: start + len("&"), end: fl.off(c.Rbrace) + 1})
-	fl.add(start, skipCloseParens(fl.src, fl.off(c.Rbrace)+1), inner)
+	fl.addT(start, skipCloseParens(fl.src, fl.off(c.Rbrace)+1), inner)
 	return native
 }
 
@@ -330,14 +330,14 @@ func (fl *fileLower) spreadOpen(c *syntax.CompositeLit) *spreadBuilder {
 // typeText spells the literal type for the eject text, substituting
 // every inner lowering. A type elided in source (`[]T{{..s}}`
 // elements) spells from the checked type.
-func (b *spreadBuilder) typeText() string {
+func (b *spreadBuilder) typeText() otext {
 	c := b.c
 	if c.Type == nil {
 		text, ok := b.fl.spellType(b.fl.pkg.info.TypeOf(c))
 		if !ok {
 			base.Fatalf("logos: cannot spell spread literal type %s", b.fl.pkg.info.TypeOf(c))
 		}
-		return text
+		return gen(text)
 	}
 	return b.fl.textOf(span{start: b.fl.off(syntax.StartPos(c.Type)), end: b.fl.exprEndOf(c.Type)})
 }
@@ -481,7 +481,7 @@ func (fl *fileLower) spreadSelfUpdate(s *syntax.AssignStmt) (*syntax.AssignStmt,
 	var values []syntax.Expr
 	tw := &twin{}
 	var ltexts []string
-	var vtexts []string
+	var vtexts []otext
 	for _, el := range c.ElemList {
 		kv, ok := el.(*syntax.KeyValueExpr)
 		if !ok {
@@ -507,12 +507,12 @@ func (fl *fileLower) spreadSelfUpdate(s *syntax.AssignStmt) (*syntax.AssignStmt,
 	textVals := make([]syntax.Expr, len(values))
 	for i, name := range fields {
 		nativeLhs[i] = selOf(pos, nameOf(pos, target.Value), name)
-		textLhs[i] = tw.mark(pos, ltexts[i])
+		textLhs[i] = tw.mark(pos, gen(ltexts[i]))
 		textVals[i] = tw.mark(pos, vtexts[i])
 	}
 	native := assignOf(pos, nativeLhs, values)
 	text := renderText([]syntax.Stmt{assignOf(pos, textLhs, textVals)}, tw.subs)
-	fl.add(fl.stmtSpanStart(s, lhs[0]), fl.spanEndOf(rhs[0]), text)
+	fl.addT(fl.stmtSpanStart(s, lhs[0]), fl.spanEndOf(rhs[0]), text)
 	return native, true
 }
 

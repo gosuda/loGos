@@ -65,7 +65,6 @@ type cfRegion struct {
 	end     int
 	line    int
 	owner   syntax.Pos
-	text    []byte
 	splices []splice
 	host    *cfHost
 }
@@ -287,7 +286,7 @@ func (fl *fileLower) unrollConstFor(cf *syntax.ConstForStmt, info *types2.LogosC
 func (fl *fileLower) unrollConstForTop(cf *syntax.ConstForStmt, fields []cfField, run *cfRun, fctx cfFuncCtx) ([]syntax.Stmt, *cfHost) {
 	bodyOff := offAt(run.ctx.starts, syntax.StartPos(cf.Body))
 	bodyEnd := offAt(run.ctx.starts, syntax.EndPos(cf.Body)) + 1
-	bodySrc := string(run.ctx.src[bodyOff:bodyEnd])
+	bodySrc := run.ctx.buf.sliceO(bodyOff, bodyEnd)
 	var out []syntax.Stmt
 	host := &cfHost{sep: "\n"}
 	for ord, fd := range fields {
@@ -330,10 +329,10 @@ func (fl *fileLower) regionAt(start, end int) *cfRegion {
 // reparseTopCopy parses one unrolled iteration as statements, checks
 // them on their own, and moves them into a region of their own. The
 // parse wraps the text so that it begins on line 3.
-func (fl *fileLower) reparseTopCopy(text string, cf *syntax.ConstForStmt, fctx cfFuncCtx) ([]syntax.Stmt, *cfRegion) {
+func (fl *fileLower) reparseTopCopy(text otext, cf *syntax.ConstForStmt, fctx cfFuncCtx) ([]syntax.Stmt, *cfRegion) {
 	fbase := syntax.NewFileBase(fl.baseName + ".cf")
 	var errs []error
-	f, _ := syntax.Parse(fbase, strings.NewReader("package cfreparse\nfunc cfreparse() {\n"+text+"\n}\n"), func(err error) {
+	f, _ := syntax.Parse(fbase, strings.NewReader("package cfreparse\nfunc cfreparse() {\n"+text.s+"\n}\n"), func(err error) {
 		errs = append(errs, err)
 	}, nil, syntax.CheckBranches|syntax.LogosMode)
 	fn := cfFirstFunc(f)
@@ -397,12 +396,19 @@ func (fl *fileLower) cfAliases() map[*types2.Package]string {
 // starts on line textLine of the parsed file base, onto the region's own
 // virtual lines. owner is the position the region's nodes take back
 // after lowering.
-func (fl *fileLower) adoptRegion(text string, owner syntax.Pos, parsed *syntax.PosBase, textLine int, roots []syntax.Node) *cfRegion {
+func (fl *fileLower) adoptRegion(text otext, owner syntax.Pos, parsed *syntax.PosBase, textLine int, roots []syntax.Node) *cfRegion {
 	fl.src = append(fl.src, '\n')
-	r := &cfRegion{start: len(fl.src), line: len(lineStarts(fl.src)), owner: owner, text: []byte(text)}
-	fl.src = append(fl.src, text...)
+	r := &cfRegion{start: len(fl.src), line: len(lineStarts(fl.src)), owner: owner}
+	fl.src = append(fl.src, text.s...)
 	r.end = len(fl.src)
 	fl.src = append(fl.src, '\n')
+	fl.srcMap.b = fl.src
+	for _, c := range text.chunks {
+		if c.n == 0 {
+			continue
+		}
+		fl.srcMap.chunks = append(fl.srcMap.chunks, chunk{out: r.start + c.out, orig: c.orig, n: c.n})
+	}
 	fl.start = lineStarts(fl.src)
 	fl.regions = append(fl.regions, r)
 	virtual := func(p syntax.Pos) syntax.Pos {
@@ -454,29 +460,28 @@ func cfMapPositions(root syntax.Node, fn func(syntax.Pos) syntax.Pos) {
 
 // composeHost returns the finished text of a host: its head, each
 // region's text with the region's edits applied followed by sep, and its
-// tail.
-func (fl *fileLower) composeHost(h *cfHost) string {
-	var b strings.Builder
-	b.WriteString(h.head)
+// tail. The region bytes live in the working buffer with their origin
+// mapping, so the composed text keeps the origin of every copied byte.
+func (fl *fileLower) composeHost(h *cfHost) otext {
+	parts := []otext{gen(h.head)}
 	for _, r := range h.regions {
 		adj := make([]splice, len(r.splices))
 		for i, sp := range r.splices {
-			adj[i] = splice{start: sp.start - r.start, end: sp.end - r.start, text: sp.text, owner: sp.owner}
+			adj[i] = splice{start: sp.start - r.start, end: sp.end - r.start, text: sp.text, chunks: sp.chunks, owner: sp.owner}
 		}
-		out, err := applySplices(r.text, adj)
+		out, err := applyChunks(fl.srcMap.sliceO(r.start, r.end), adj)
 		if err != nil {
 			base.Fatalf("logos: overlapping edits at %s", r.owner.String())
 		}
-		b.Write(out)
-		b.WriteString(h.sep)
+		parts = append(parts, out, gen(h.sep))
 	}
-	b.WriteString(h.tail)
-	return b.String()
+	parts = append(parts, gen(h.tail))
+	return cat(parts...)
 }
 
 // retireHost composes the text of h for the enclosing span that
 // consumes it and closes its regions to further edits.
-func (fl *fileLower) retireHost(h *cfHost) string {
+func (fl *fileLower) retireHost(h *cfHost) otext {
 	h.retired = true
 	return fl.composeHost(h)
 }
@@ -491,10 +496,10 @@ func (fl *fileLower) finalizeConstFor() {
 }
 
 // setHostText sets the text of the outer splice that stands for h.
-func (fl *fileLower) setHostText(h *cfHost, text string) {
+func (fl *fileLower) setHostText(h *cfHost, text otext) {
 	for i := range fl.splices {
 		if fl.splices[i].host == h {
-			fl.splices[i].text = text
+			fl.splices[i].text, fl.splices[i].chunks = text.s, text.chunks
 			return
 		}
 	}
@@ -554,7 +559,7 @@ type cfRun struct {
 func (fl *fileLower) cfRunFor(cf *syntax.ConstForStmt) *cfRun {
 	sites := fl.cfSitesFor()
 	return &cfRun{
-		ctx:      cfCtx{src: fl.src, starts: fl.start, stamp: cf.Pos()},
+		ctx:      cfCtx{buf: fl.srcMap, starts: fl.start, stamp: cf.Pos()},
 		fieldsOf: fl.cfFieldsResolver(sites),
 		sites:    sites,
 	}
@@ -563,12 +568,12 @@ func (fl *fileLower) cfRunFor(cf *syntax.ConstForStmt) *cfRun {
 // unrollConstForFields expands cf over fields. src/starts locate the cf
 // positions; stamp is the position every new node takes so traces name
 // the .lgo const for line. chain carries outer bindings for nesting.
-func (fl *fileLower) unrollConstForFields(cf *syntax.ConstForStmt, fields []cfField, run *cfRun) ([]syntax.Stmt, string) {
+func (fl *fileLower) unrollConstForFields(cf *syntax.ConstForStmt, fields []cfField, run *cfRun) ([]syntax.Stmt, otext) {
 	bodyOff := offAt(run.ctx.starts, syntax.StartPos(cf.Body))
 	bodyEnd := offAt(run.ctx.starts, syntax.EndPos(cf.Body)) + 1
-	bodySrc := string(run.ctx.src[bodyOff:bodyEnd])
+	bodySrc := run.ctx.buf.sliceO(bodyOff, bodyEnd)
 	var out []syntax.Stmt
-	var text strings.Builder
+	var parts []otext
 	for ord, fd := range fields {
 		active := cfChain{{name: cf.Field.Value, field: fd, body: cf.Body}}
 		if cf.Index != nil && cf.Index.Value != "_" {
@@ -576,10 +581,9 @@ func (fl *fileLower) unrollConstForFields(cf *syntax.ConstForStmt, fields []cfFi
 		}
 		iter, itext := fl.unrollIteration(cf, active, bodySrc, bodyOff, run)
 		out = append(out, iter...)
-		text.WriteString(itext)
-		text.WriteByte('\n')
+		parts = append(parts, itext, gen("\n"))
 	}
-	return out, text.String()
+	return out, cat(parts...)
 }
 
 // offAt converts a valid file position to a byte offset.
@@ -589,7 +593,7 @@ func offAt(starts []int, pos syntax.Pos) int {
 
 // cfCtx bundles the source coordinates one expansion works with.
 type cfCtx struct {
-	src    []byte
+	buf    srcBuf
 	starts []int
 	stamp  syntax.Pos
 }
@@ -666,17 +670,17 @@ func (v cfParentVisitor) Visit(n syntax.Node) syntax.Visitor {
 // unrollIteration expands one field iteration: substitute the active
 // bindings in the body source, recursively unroll nested const fors in
 // the result, and re-parse the final text for the native tree.
-func (fl *fileLower) unrollIteration(cf *syntax.ConstForStmt, active cfChain, bodySrc string, bodyOff int, run *cfRun) ([]syntax.Stmt, string) {
+func (fl *fileLower) unrollIteration(cf *syntax.ConstForStmt, active cfChain, bodySrc otext, bodyOff int, run *cfRun) ([]syntax.Stmt, otext) {
 	m := &cfMapper{start: bodyOff}
 	text := fl.expandLevel(cf.Body, active, bodySrc, 0, m, run)
-	stmts := fl.reparseStmts(text, run.ctx.stamp)
+	stmts := fl.reparseStmts(text.s, run.ctx.stamp)
 	return stmts, text
 }
 
 // expandLevel substitutes the active bindings in the body text slice and
 // recursively expands nested const fors right to left. sliceStart is the
 // mapped offset of text[0]; m maps base offsets to the evolving text.
-func (fl *fileLower) expandLevel(body *syntax.BlockStmt, active cfChain, text string, sliceStart int, m *cfMapper, run *cfRun) string {
+func (fl *fileLower) expandLevel(body *syntax.BlockStmt, active cfChain, text otext, sliceStart int, m *cfMapper, run *cfRun) otext {
 	ctx := run.ctx
 	ls := fl.cfLeafSubs(body, active, m.covered(), run)
 	rel := make([]splice, 0, len(ls))
@@ -684,11 +688,11 @@ func (fl *fileLower) expandLevel(body *syntax.BlockStmt, active cfChain, text st
 		ms, me := m.mapSpan(x.start, x.end)
 		rel = append(rel, splice{start: ms - sliceStart, end: me - sliceStart, text: x.text})
 	}
-	out, err := applySplices([]byte(text), rel)
+	out, err := applyChunks(text, rel)
 	if err != nil {
 		base.Fatalf("logos: overlapping const for substitutions")
 	}
-	text = string(out)
+	text = out
 	m.subs = append(m.subs, ls...)
 	inners := fl.cfInnerConstFors(body, active, run.sites)
 	slices.Reverse(inners)
@@ -703,18 +707,17 @@ func (fl *fileLower) expandLevel(body *syntax.BlockStmt, active cfChain, text st
 		bstart := offAt(ctx.starts, syntax.StartPos(inner.Body))
 		bend := offAt(ctx.starts, syntax.EndPos(inner.Body)) + 1
 		bs, be := m.mapSpan(bstart, bend)
-		var innerText strings.Builder
+		var innerParts []otext
 		for ord, fd := range fields {
 			sub := append(slices.Clone(active), cfActive{name: inner.Field.Value, field: fd, body: inner.Body})
 			if inner.Index != nil && inner.Index.Value != "_" {
 				sub = append(sub, cfActive{name: inner.Index.Value, index: true, idx: ord, body: inner.Body})
 			}
 			iterMap := &cfMapper{start: m.start, subs: slices.Clone(m.subs)}
-			one := fl.expandLevel(inner.Body, sub, text[bs-sliceStart:be-sliceStart], bs, iterMap, run)
-			innerText.WriteString(one)
-			innerText.WriteByte('\n')
+			one := fl.expandLevel(inner.Body, sub, text.slice(bs-sliceStart, be-sliceStart), bs, iterMap, run)
+			innerParts = append(innerParts, one, gen("\n"))
 		}
-		text = text[:s-sliceStart] + innerText.String() + text[e-sliceStart:]
+		text = cat(text.slice(0, s-sliceStart), cat(innerParts...), text.slice(e-sliceStart, len(text.s)))
 	}
 	return text
 }
@@ -992,7 +995,7 @@ func cfExactEnd(ctx cfCtx, n syntax.Node) int {
 	start := offAt(ctx.starts, syntax.StartPos(n))
 	end := offAt(ctx.starts, syntax.EndPos(n))
 	open := 0
-	scanSegment(ctx.src, start, end, func(t tok) bool {
+	scanSegment(ctx.buf.b, start, end, func(t tok) bool {
 		switch t.kind {
 		case token.LPAREN, token.LBRACK, token.LBRACE:
 			open++
@@ -1004,7 +1007,7 @@ func cfExactEnd(ctx cfCtx, n syntax.Node) int {
 	if open <= 0 {
 		return end
 	}
-	scanSegment(ctx.src, end, len(ctx.src), func(t tok) bool {
+	scanSegment(ctx.buf.b, end, len(ctx.buf.b), func(t tok) bool {
 		switch t.kind {
 		case token.RPAREN, token.RBRACK, token.RBRACE:
 			open--

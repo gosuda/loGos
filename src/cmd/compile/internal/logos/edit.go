@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	"cmd/compile/internal/syntax"
 )
@@ -19,12 +20,19 @@ import (
 type Edit struct {
 	Start, End syntax.Pos
 	Text       string
+	// Chunks carry the origin of Text: nil means the whole text is
+	// generated, non-nil chunks say which bytes are verbatim copies of
+	// which original byte ranges (offsets into the original file).
+	Chunks []chunk
 }
 
 // splice is an Edit resolved to byte offsets of one source text.
 type splice struct {
 	start, end int
 	text       string
+	// chunks carry the origin of text: nil means the whole text is
+	// generated. applyChunks rebase-checks them like the offsets.
+	chunks []chunk
 	// owner is the wrapper ID of boundary inserts (heads, tails)
 	// that a later wrap of the same wrapper drains into fused text;
 	// zero for ordinary splices.
@@ -86,7 +94,7 @@ func resolve(src []byte, starts []int, base *syntax.PosBase, e Edit) (splice, er
 	if end < start {
 		return splice{}, fmt.Errorf("edit at %v ends before it starts", e.Start)
 	}
-	return splice{start: start, end: end, text: e.Text}, nil
+	return splice{start: start, end: end, text: e.Text, chunks: e.Chunks}, nil
 }
 
 // EditSpan records one applied edit in byte offsets: the bytes of the
@@ -111,21 +119,33 @@ func ApplyEdits(src []byte, base *syntax.PosBase, edits []Edit) ([]byte, error) 
 // ApplyEditsMapped applies edits like ApplyEdits and also returns the
 // applied edits as spans of byte offsets, in the order they took effect.
 func ApplyEditsMapped(src []byte, base *syntax.PosBase, edits []Edit) ([]byte, []EditSpan, error) {
+	out, spans, _, err := ApplyEditsSegments(src, base, edits)
+	return out, spans, err
+}
+
+// ApplyEditsSegments applies edits like ApplyEdits and also returns the
+// applied edits as spans and the origin segments of the whole output:
+// every byte of the edited text is either a verbatim copy of an original
+// byte range or generated, so a reader maps any output offset to its
+// exact original offset or learns it has none.
+func ApplyEditsSegments(src []byte, base *syntax.PosBase, edits []Edit) ([]byte, []EditSpan, []Segment, error) {
 	want := base.Pos().FileBase()
 	starts := lineStarts(src)
 	splices := make([]splice, len(edits))
 	for i, e := range edits {
 		s, err := resolve(src, starts, want, e)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		splices[i] = s
 	}
-	out, err := applySplices(src, splices)
+	text, err := applyChunks(otext{s: string(src)}, splices)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return out, spansOf(splices), nil
+	text.checkChunks(src)
+	out := []byte(text.s)
+	return out, spansOf(splices), segmentsOf(splices, len(out)), nil
 }
 
 // spansOf converts splices, already sorted by applySplices, to spans.
@@ -148,18 +168,52 @@ func sortSplices(splices []splice) {
 // applySplices applies byte-offset splices to src. It sorts splices in
 // place and reports an error when two of them overlap.
 func applySplices(src []byte, splices []splice) ([]byte, error) {
+	t, err := applyChunks(otext{s: string(src)}, splices)
+	return []byte(t.s), err
+}
+
+// applyChunks applies byte-offset splices to src and returns the
+// composed text with origin chunks: gap bytes inherit src's mapping and
+// splice text carries its own. The bytes of the result equal
+// applySplices'; only the origin is added. Splices are sorted in place;
+// overlapping splices are an error.
+func applyChunks(src otext, splices []splice) (otext, error) {
 	sortSplices(splices)
-	out := make([]byte, 0, len(src))
+	var sb strings.Builder
+	var chunks []chunk
+	out := 0
 	prev := 0
+	gap := func(upto int) {
+		if upto <= prev {
+			return
+		}
+		sb.WriteString(src.s[prev:upto])
+		for _, c := range src.slice(prev, upto).chunks {
+			chunks = append(chunks, chunk{out: out + c.out, orig: c.orig, n: c.n})
+		}
+		out += upto - prev
+	}
 	for _, s := range splices {
 		if s.start < prev {
-			return nil, fmt.Errorf("overlapping edits at byte offset %d", s.start)
+			return otext{}, fmt.Errorf("overlapping edits at byte offset %d", s.start)
 		}
-		out = append(out, src[prev:s.start]...)
-		out = append(out, s.text...)
+		gap(s.start)
+		sb.WriteString(s.text)
+		for _, c := range s.chunks {
+			if c.n == 0 {
+				continue
+			}
+			chunks = append(chunks, chunk{out: out + c.out, orig: c.orig, n: c.n})
+		}
+		out += len(s.text)
 		prev = s.end
 	}
-	return append(out, src[prev:]...), nil
+	gap(len(src.s))
+	res := otext{s: sb.String(), chunks: chunks}
+	if res.s == "" {
+		return otext{}, nil
+	}
+	return res, nil
 }
 
 // editsOf converts splices of one file to Edits positioned on base.
@@ -173,7 +227,7 @@ func editsOf(src []byte, base *syntax.PosBase, splices []splice) []Edit {
 	sortSplices(sorted)
 	edits := make([]Edit, len(sorted))
 	for i, s := range sorted {
-		edits[i] = Edit{Start: posAt(s.start), End: posAt(s.end), Text: s.text}
+		edits[i] = Edit{Start: posAt(s.start), End: posAt(s.end), Text: s.text, Chunks: s.chunks}
 	}
 	return edits
 }

@@ -170,7 +170,7 @@ func (fc *funcLower) cutConstSpan(start, end int) {
 		return
 	}
 	_ = fc.fl.dropInner(span{start, end})
-	fc.fl.add(start, end, leftoverComments(fc.fl, span{start, end}, nil))
+	fc.fl.addT(start, end, leftoverComments(fc.fl, span{start, end}, nil))
 }
 
 // deleteConstSpan discards the splices strictly inside [start, end) and

@@ -119,7 +119,8 @@ func (fl *fileLower) spliceMakeLen(op *syntax.Operation) {
 	yEnd := fl.operandEnd(yStart)
 	x := fl.textOf(span{start, opOff})
 	y := fl.textOf(span{opOff + len("*"), yEnd})
-	fl.add(start, yEnd, "_logos_rt.MulLen("+x+", "+y+", "+strconv.Quote(renderExpr(op))+")")
+	fl.addT(start, yEnd, cat(
+		gen("_logos_rt.MulLen("), x, gen(", "), y, gen(", "+strconv.Quote(renderExpr(op))+")")))
 }
 
 // operandEnd returns the offset just past the right operand of a product

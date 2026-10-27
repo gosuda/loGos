@@ -1076,16 +1076,16 @@ func (fl *fileLower) wrapKnown(v syntax.Expr, rec, target types2.Type) syntax.Ex
 		id = fl.nextWrapID()
 	} else {
 		head, tail := fl.drainOwned(vs, id)
-		text = head + text + tail
+		text = cat(head, text, tail)
 	}
 	// One fused replacement for the whole tower: boundary inserts for
 	// outer layers would interleave with an enclosing wrapper's head at
 	// a shared offset, while a single span composes by position.
 	fused := text
 	for i := len(ejectTexts) - 1; i >= 0; i-- {
-		fused = ejectTexts[i] + "{Value: " + fused + ", Present: true}"
+		fused = cat(gen(ejectTexts[i]+"{Value: "), fused, gen(", Present: true}"))
 	}
-	fl.add(vs.start, vs.end, fused)
+	fl.addT(vs.start, vs.end, fused)
 	native := v
 	for i := len(nativeNodes) - 1; i >= 0; i-- {
 		typ := nativeNodes[i]
@@ -1121,7 +1121,7 @@ func (fl *fileLower) wrapSpanOf(v syntax.Expr) span {
 // Inserts owned by other wrappers at the same offsets stay pending. A
 // span inside a const for copy drains the splices of its region, where
 // appendSplice recorded them.
-func (fl *fileLower) drainOwned(vs span, id int) (head, tail string) {
+func (fl *fileLower) drainOwned(vs span, id int) (head, tail otext) {
 	// Each end drains from the list holding insertions at it: the
 	// narrowest moved region strictly holding the endpoint, else its
 	// const for region, else the file. Ends in different lists drain
@@ -1140,9 +1140,9 @@ func (fl *fileLower) drainOwned(vs span, id int) (head, tail string) {
 			continue
 		}
 		if sp.start == vs.start {
-			head += sp.text
+			head = cat(head, otext{s: sp.text, chunks: sp.chunks})
 		} else {
-			tail += sp.text
+			tail = cat(tail, otext{s: sp.text, chunks: sp.chunks})
 		}
 	}
 	*ls = rest
@@ -1151,15 +1151,15 @@ func (fl *fileLower) drainOwned(vs span, id int) (head, tail string) {
 
 // drainOwnedAt removes the boundary inserts owned by id at off from list
 // and returns their texts.
-func drainOwnedAt(list *[]splice, off, id int) string {
-	var text string
+func drainOwnedAt(list *[]splice, off, id int) otext {
+	var text otext
 	var rest []splice
 	for _, sp := range *list {
 		if sp.owner != id || sp.start != sp.end || sp.start != off {
 			rest = append(rest, sp)
 			continue
 		}
-		text += sp.text
+		text = cat(text, otext{s: sp.text, chunks: sp.chunks})
 	}
 	*list = rest
 	return text
@@ -1172,7 +1172,7 @@ func drainOwnedAt(list *[]splice, off, id int) string {
 // pending. A wrapper strictly inside the span already drained through
 // textOf, so drainOwned finds nothing and the text passes through
 // unchanged. Bodies that are not wrapper tops pass through too.
-func (fl *fileLower) drainBodyWrapper(body syntax.Node, text string) string {
+func (fl *fileLower) drainBodyWrapper(body syntax.Node, text otext) otext {
 	expr, ok := body.(syntax.Expr)
 	if !ok {
 		return text
@@ -1190,7 +1190,7 @@ func (fl *fileLower) drainBodyWrapper(body syntax.Node, text string) string {
 		return text
 	}
 	head, tail := fl.drainOwned(vs, id)
-	return head + text + tail
+	return cat(head, text, tail)
 }
 
 // lowerMapIndex lowers one single-value map read: a kept read stays,
@@ -1729,7 +1729,7 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 				ifOf(pos, init, cond, []syntax.Stmt{exprStmtOf(pos, call)}),
 			}),
 		}, pos)
-		fl.add(xEnd, rparen+1, "; "+condT+" { v"+accSuffix+argsText+" } }()")
+		fl.addT(xEnd, rparen+1, cat(gen("; "+condT+" { v"+accSuffix), argsText, gen(" } }()")))
 		out := callOf(pos, lit, nil)
 		fl.wrapSpan[out] = span{start: xStart, end: rparen + 1}
 		fl.wrapOwner[out] = id
@@ -1760,7 +1760,11 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 			returnOf(pos, []syntax.Expr{none}),
 		}
 		lit := at(&syntax.FuncLit{Type: signature, Body: blockOf(pos, body)}, pos)
-		fl.add(xEnd, rparen+1, "; "+condT+" { return "+someHead+"v"+accSuffix+argsText+someTail+" }; return "+noneT+" }()")
+		fl.addT(xEnd, rparen+1, cat(
+			gen("; "+condT+" { return "+someHead+"v"+accSuffix),
+			argsText,
+			gen(someTail+" }; return "+noneT+" }()"),
+		))
 		out := callOf(pos, lit, nil)
 		fl.wrapSpan[out] = span{start: xStart, end: rparen + 1}
 		fl.wrapOwner[out] = id
@@ -1818,7 +1822,11 @@ func (fl *fileLower) lowerOptCall(e *syntax.CallExpr, osel *syntax.OptSelectExpr
 			returnOf(pos, fl.noneExprs(pos, rs, nrNodes)),
 		}
 		lit := at(&syntax.FuncLit{Type: signature, Body: blockOf(pos, body)}, pos)
-		fl.add(xEnd, rparen+1, "; "+condT+" { "+strings.Join(headNames, ", ")+" := v"+accSuffix+argsText+"; return "+strings.Join(retWraps, ", ")+" }; return "+strings.Join(noneList, ", ")+" }()")
+		fl.addT(xEnd, rparen+1, cat(
+			gen("; "+condT+" { "+strings.Join(headNames, ", ")+" := v"+accSuffix),
+			argsText,
+			gen("; return "+strings.Join(retWraps, ", ")+" }; return "+strings.Join(noneList, ", ")+" }()"),
+		))
 		out := callOf(pos, lit, nil)
 		fl.wrapSpan[out] = span{start: xStart, end: rparen + 1}
 		fl.wrapOwner[out] = id
