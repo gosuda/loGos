@@ -38,7 +38,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 			{Object: "New", Source: []byte("line1\nline2\n")},
 		},
 	}
-	want := "logos-facts 1\n" +
+	want := "logos-facts 3\n" +
 		"fingerprint 0001020304050607\n" +
 		"comptime New 12\n" +
 		"line1\nline2\n" +
@@ -85,7 +85,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 func TestEncodeNilHeaderOnly(t *testing.T) {
 	fp := goobj.FingerprintType{7, 6, 5, 4, 3, 2, 1, 0}
 	got := facts.Encode(fp, nil)
-	if string(got) != "logos-facts 1\nfingerprint 0706050403020100\n" {
+	if string(got) != "logos-facts 3\nfingerprint 0706050403020100\n" {
 		t.Fatalf("header-only Encode mismatch: %q", got)
 	}
 	back, err := facts.Decode(got)
@@ -108,7 +108,7 @@ func TestEncodeSkipsVacuousRecords(t *testing.T) {
 		Comptimes:   []facts.ComptimeFact{{Object: "New"}, {Source: []byte("x")}},
 	}
 	got := facts.Encode(fp, in)
-	if string(got) != "logos-facts 1\nfingerprint 0100000000000000\n" {
+	if string(got) != "logos-facts 3\nfingerprint 0100000000000000\n" {
 		t.Fatalf("vacuous records not skipped: %q", got)
 	}
 	if _, err := facts.Decode(got); err != nil {
@@ -117,12 +117,12 @@ func TestEncodeSkipsVacuousRecords(t *testing.T) {
 }
 
 func TestDecodeRejects(t *testing.T) {
-	head := "logos-facts 1\nfingerprint 0001020304050607\n"
+	head := "logos-facts 3\nfingerprint 0001020304050607\n"
 	cases := []struct{ name, input, line string }{
 		{"empty", "", "line 1"},
 		{"wrong version", "logos-facts 2\nfingerprint 0001020304050607\n", "line 1"},
 		{"bad magic", "hello\n", "line 1"},
-		{"missing fingerprint", "logos-facts 1\n", "line 2"},
+		{"missing fingerprint", "logos-facts 3\n", "line 2"},
 		{"bad fingerprint", head[:14] + "fingerprint zz\n", "line 2"},
 		{"short fingerprint", head[:14] + "fingerprint 00\n", "line 2"},
 		{"fingerprint missing hex", head[:14] + "fingerprint\n", "line 2"},
@@ -186,7 +186,7 @@ func TestDPathRoundTrip(t *testing.T) {
 			{Object: "C", Path: "R0.D.K"},
 		},
 	}
-	want := "logos-facts 1\n" +
+	want := "logos-facts 3\n" +
 		"fingerprint 0300000000000000\n" +
 		"const C R0.D.K\n" +
 		"opt (*S).Get R0.D.FName\n" +
@@ -216,7 +216,7 @@ func TestDPathRoundTrip(t *testing.T) {
 }
 
 func TestDPathQualifierVsContainer(t *testing.T) {
-	in := "logos-facts 1\nfingerprint 0001020304050607\n" +
+	in := "logos-facts 3\nfingerprint 0001020304050607\n" +
 		"opt H R0.D\n" +
 		"opt H R0.E\n" +
 		"opt S.F R0.FD\n"
@@ -238,7 +238,7 @@ func TestDPathQualifierVsContainer(t *testing.T) {
 }
 
 func TestDecodeLineNumbersAfterComptimeBody(t *testing.T) {
-	in := "logos-facts 1\nfingerprint 0001020304050607\ncomptime New 5\nab\ncd\nopt H Q1\n"
+	in := "logos-facts 3\nfingerprint 0001020304050607\ncomptime New 5\nab\ncd\nopt H Q1\n"
 	_, err := facts.Decode([]byte(in))
 	if err == nil || !strings.Contains(err.Error(), "line 6") {
 		t.Fatalf("Decode error = %v, want error naming line 6", err)
@@ -253,7 +253,7 @@ func TestGoPackageRecord(t *testing.T) {
 		Fns:         []facts.FnFact{{Object: "F", MayYield: true, HasMayYield: true}},
 	}
 	got := string(facts.Encode(fp, in))
-	want := "logos-facts 1\nfingerprint 0102030405060708\nfn F MayYield=1\nlang go\n"
+	want := "logos-facts 3\nfingerprint 0102030405060708\nfn F MayYield=1\nlang go\n"
 	if got != want {
 		t.Fatalf("Encode mismatch:\n got %q\nwant %q", got, want)
 	}
@@ -289,7 +289,7 @@ func TestMayYieldOnly(t *testing.T) {
 }
 
 func TestFnFlagNormalization(t *testing.T) {
-	back, err := facts.Decode([]byte("logos-facts 1\nfingerprint 0001020304050607\nfn S MayYield=0,ParamMutated=00AB\n"))
+	back, err := facts.Decode([]byte("logos-facts 3\nfingerprint 0001020304050607\nfn S MayYield=0,ParamMutated=00AB\n"))
 	if err != nil {
 		t.Fatalf("Decode failed: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestConformsRoundTrip(t *testing.T) {
 			{Type: "Wisp", IfacePath: "example.com/l/p", Iface: ""},
 		},
 	}
-	want := "logos-facts 1\n" +
+	want := "logos-facts 3\n" +
 		"fingerprint 0200000000000000\n" +
 		"conforms Monster example.com/l/p Creature\n" +
 		"conforms Orc example.com/l/p Creature\n" +
@@ -461,5 +461,113 @@ func TestFindMember(t *testing.T) {
 	truncated := append([]byte("!<arch>\n"+hdr), 'x', 'y', 'z')
 	if _, err := facts.FindMember(writeArchive(t, truncated)); err == nil {
 		t.Fatalf("FindMember(truncated) succeeded, want error")
+	}
+}
+
+func TestAssertEffectsWire(t *testing.T) {
+	fp := goobj.FingerprintType{1, 2, 3, 4, 5, 6, 7, 8}
+	in := &facts.Facts{Fns: []facts.FnFact{{
+		Object:    "F",
+		Readonly:  true,
+		HasAssert: true,
+		AssertTP:  "0",
+		AssertRTP: "800000000000000000", // bit 71: no 64-param limit
+	}}}
+	out := string(facts.Encode(fp, in))
+	if !strings.Contains(out, "fn F Readonly,AssertTP=0,AssertRTP=800000000000000000\n") {
+		t.Fatalf("assert flags not canonical (after Readonly, arbitrary width): %q", out)
+	}
+	back, err := facts.Decode([]byte(out))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	fn := back.Fns[0]
+	if !fn.HasAssert || fn.AssertTP != "0" || fn.AssertRTP != "800000000000000000" {
+		t.Fatalf("assert fields lost: %+v", fn)
+	}
+	if !fn.MayYieldOnly() && fn.HasMayYield {
+		t.Fatal("unexpected MayYield")
+	}
+	// Assert flags are not mutation facts: a yield record carrying only
+	// assert flags stays mutation-unanalyzed.
+	ay := facts.FnFact{Object: "G", MayYield: true, HasMayYield: true, HasAssert: true, AssertTP: "0", AssertRTP: "0"}
+	if !ay.MayYieldOnly() {
+		t.Fatal("assert-only record must stay MayYieldOnly (mutation unknown)")
+	}
+}
+
+func TestAssertKnownZeroVsUnknown(t *testing.T) {
+	knownZero := "logos-facts 3\nfingerprint 0001020304050607\nfn F AssertTP=0,AssertRTP=0\n"
+	back, err := facts.Decode([]byte(knownZero))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if len(back.Fns) != 1 || !back.Fns[0].HasAssert || back.Fns[0].AssertTP != "0" || back.Fns[0].AssertRTP != "0" {
+		t.Fatalf("proven zero must survive as Known: %+v", back.Fns)
+	}
+	legacy := "logos-facts 3\nfingerprint 0001020304050607\nfn F Readonly\n"
+	back, err = facts.Decode([]byte(legacy))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if len(back.Fns) != 1 || back.Fns[0].HasAssert {
+		t.Fatalf("record without assert flags must decode unknown: %+v", back.Fns)
+	}
+}
+
+func TestFactsVersion3Cutover(t *testing.T) {
+	for _, v := range []string{"logos-facts 1", "logos-facts 2", "logos-facts 4"} {
+		_, err := facts.Decode([]byte(v + "\nfingerprint 0001020304050607\n"))
+		if err == nil || !strings.Contains(err.Error(), "unsupported version") {
+			t.Fatalf("Decode(%q) err = %v, want unsupported version", v, err)
+		}
+	}
+}
+
+func TestAssertPairCompleteness(t *testing.T) {
+	head := "logos-facts 3\nfingerprint 0001020304050607\n"
+	cases := []struct{ name, line string }{
+		{"tp only", head + "fn F AssertTP=0\n"},
+		{"rtp only", head + "fn F AssertRTP=1\n"},
+		{"tp only nonzero", head + "fn F AssertTP=1\n"},
+	}
+	for _, c := range cases {
+		if _, err := facts.Decode([]byte(c.line)); err == nil || !strings.Contains(err.Error(), "incomplete assertion-effect pair") {
+			t.Errorf("%s: Decode err = %v, want incomplete-pair rejection", c.name, err)
+		}
+	}
+	for _, ok := range []string{
+		head + "fn F AssertTP=0,AssertRTP=0\n",
+		head + "fn F AssertTP=1,AssertRTP=0\n",
+		head + "fn F Readonly\n",
+	} {
+		if _, err := facts.Decode([]byte(ok)); err != nil {
+			t.Errorf("valid member rejected: %v (%q)", err, ok)
+		}
+	}
+}
+
+func TestHighestAssertBit(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want int
+		ok   bool
+	}{
+		{"0", -1, true},
+		{"00", -1, true},
+		{"1", 0, true},
+		{"2", 1, true},
+		{"3", 1, true},
+		{"ab", 7, true},
+		{"800000000000000000", 71, true},
+		{"", 0, false},
+		{"xyz", 0, false},
+		{"10Z", 0, false},
+		{"0010", 4, true},
+	} {
+		got, ok := facts.HighestAssertBit(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("HighestAssertBit(%q) = %d, %v; want %d, %v", c.in, got, ok, c.want, c.ok)
+		}
 	}
 }

@@ -30,7 +30,7 @@ func TestConstFnEncodeDecodeRoundTrip(t *testing.T) {
 	}
 	got := facts.Encode(fp, in)
 	// Records sort byte-wise: comptime sorts before constfn.
-	want := "logos-facts 1\n" +
+	want := "logos-facts 3\n" +
 		"fingerprint 0001020304050607\n" +
 		"comptime Gen 14\n" +
 		"func Gen() {}\n" +
@@ -64,7 +64,7 @@ func TestConstFnEncodeDecodeRoundTrip(t *testing.T) {
 // trailing newlines, and duplicate objects all fail with the record's
 // line number.
 func TestConstFnDecodeRejects(t *testing.T) {
-	head := "logos-facts 1\nfingerprint 0001020304050607\n"
+	head := "logos-facts 3\nfingerprint 0001020304050607\n"
 	body := "package p\n\nconst func F() int {\n\treturn 1\n}\n"
 	cases := []struct{ name, input, line string }{
 		{"bad length", head + "constfn F xyz\n", "line 3"},
@@ -128,7 +128,7 @@ func TestConstFnVacuousRecordSkipped(t *testing.T) {
 		ConstFuncs:  []facts.ConstFuncFact{{Object: "F"}, {Source: []byte("x")}},
 	}
 	got := facts.Encode(fp, in)
-	if string(got) != "logos-facts 1\nfingerprint 0100000000000000\n" {
+	if string(got) != "logos-facts 3\nfingerprint 0100000000000000\n" {
 		t.Fatalf("vacuous constfn records not skipped: %q", got)
 	}
 	if _, err := facts.Decode(got); err != nil {
@@ -165,7 +165,7 @@ func TestConstFnMixedRecordsRoundTrip(t *testing.T) {
 }
 
 func head() string {
-	return "logos-facts 1\nfingerprint 0001020304050607\n"
+	return "logos-facts 3\nfingerprint 0001020304050607\n"
 }
 
 func itoa(n int) string {
