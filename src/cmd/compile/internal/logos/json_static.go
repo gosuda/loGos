@@ -56,12 +56,14 @@ const (
 )
 
 // jsonShape classifies one field type: its static kind, the scalar it
-// carries (the value, the pointee, or the slice element), and whether the
-// declared type is a non-nil pointer.
+// carries (the value, the pointee, or the slice element), whether the
+// declared type is a non-nil pointer, and whether omitzero consults a
+// signature-checked IsZero method (value or pointer receiver).
 type jsonShape struct {
-	kind   shapeKind
-	scalar scalarKind
-	nonNil bool
+	kind        shapeKind
+	scalar      scalarKind
+	nonNil      bool
+	needsIsZero bool
 }
 
 // jsonField is one JSON-visible field of an eligible struct.
@@ -233,7 +235,7 @@ func (fl *fileLower) buildJSONStruct(name string, st *types2.Struct, fields []*t
 			typ:       fld.Type(),
 		}
 		f.shape = fl.classifyJSONField(fld.Type())
-		f.quoted = info.StringOpt && f.shape.kind != shapeFallback && f.shape.kind != shapeSlice && f.shape.kind != shapeUnion
+		f.quoted = info.StringOpt && isQuotableForString(f.typ, f.shape)
 		if f.shape.nonNil {
 			f.required = len(js.required)
 			js.required = append(js.required, f.goName)
@@ -288,13 +290,19 @@ func (fl *fileLower) classifyShape(t types2.Type) jsonShape {
 }
 
 // scalarShape returns the shape of kind k over element type elem, or the
-// fallback shape when elem is not a modeled scalar.
+// fallback shape when elem is not a modeled scalar. Scalar and pointer
+// shapes record whether omitzero consults IsZero; slices never do (the
+// slice itself is unnamed, so no method can fire).
 func (fl *fileLower) scalarShape(elem types2.Type, k shapeKind) jsonShape {
 	kind, ok := fl.scalarOf(elem)
 	if !ok || (k == shapeSlice && kind == scalarUint && isByteSized(elem)) {
 		return jsonShape{kind: shapeFallback}
 	}
-	return jsonShape{kind: k, scalar: kind}
+	shape := jsonShape{kind: k, scalar: kind}
+	if k == shapeScalar || k == shapePointer {
+		shape.needsIsZero = needsIsZero(elem)
+	}
+	return shape
 }
 
 // isByteSized reports whether t is an 8-bit unsigned integer, the element
@@ -305,10 +313,12 @@ func isByteSized(t types2.Type) bool {
 }
 
 // jsonMethodNames lists the methods that change how encoding/json treats
-// a scalar type; a type with any of them is not modeled.
+// a scalar type; a type with any of them is not modeled. IsZero alone
+// never changes encoding (it only decides omitzero), so it is checked
+// separately by needsIsZero with an exact signature match.
 var jsonMethodNames = []string{
 	"MarshalJSON", "UnmarshalJSON", "MarshalJSONTo", "UnmarshalJSONFrom",
-	"MarshalText", "UnmarshalText", "AppendText", "IsZero",
+	"MarshalText", "UnmarshalText", "AppendText",
 }
 
 // scalarOf returns the scalar class of t when encoding/json treats it as a
@@ -341,6 +351,247 @@ func hasJSONMethods(named *types2.Named) bool {
 		}
 	}
 	return false
+}
+
+// marshalMethodNames lists the methods that change JSON marshaling;
+// Unmarshal-only methods do not affect the encoder, so a type with only
+// UnmarshalJSON still marshals as a plain scalar and must honor ,string.
+var marshalMethodNames = []string{
+	"MarshalJSON", "MarshalJSONTo", "MarshalText", "AppendText",
+}
+
+// unmarshalMethodNames lists the methods that change JSON unmarshaling;
+// Marshal-only methods do not affect the decoder, so a type with only
+// MarshalJSON still decodes as a plain scalar and must honor ,string.
+var unmarshalMethodNames = []string{
+	"UnmarshalJSON", "UnmarshalJSONFrom", "UnmarshalText",
+}
+
+// namedOfField returns the named type underlying t for method checks,
+// unwrapping pointers and const views. It reports nil for options,
+// slices, and other wrappers whose methods do not decide scalar quoting.
+func namedOfField(t types2.Type) *types2.Named {
+	u := types2.Unalias(t)
+	if cv, ok := u.(*types2.ConstView); ok {
+		u = types2.Unalias(cv.Elem)
+	}
+	if _, ok := u.(*types2.Option); ok {
+		return nil
+	}
+	if p, ok := u.(*types2.Pointer); ok {
+		e := types2.Unalias(p.Elem())
+		if cv, ok := e.(*types2.ConstView); ok {
+			e = types2.Unalias(cv.Elem)
+		}
+		if _, ok := e.(*types2.Option); ok {
+			return nil
+		}
+		if n, ok := e.(*types2.Named); ok {
+			return n
+		}
+		return nil
+	}
+	if n, ok := u.(*types2.Named); ok {
+		return n
+	}
+	return nil
+}
+
+// hasMarshalMethods reports whether t carries a marshal-side JSON method.
+func hasMarshalMethods(t types2.Type) bool {
+	if isExactNumber(t) {
+		return true
+	}
+	named := namedOfField(t)
+	if named == nil || named.Obj() == nil {
+		return false
+	}
+	ptr := types2.NewPointer(named)
+	for _, name := range marshalMethodNames {
+		if m, _, _ := types2.LookupFieldOrMethod(ptr, false, named.Obj().Pkg(), name); m != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// hasUnmarshalMethods reports whether t carries an unmarshal-side JSON method.
+func hasUnmarshalMethods(t types2.Type) bool {
+	if isExactNumber(t) {
+		return true
+	}
+	named := namedOfField(t)
+	if named == nil || named.Obj() == nil {
+		return false
+	}
+	ptr := types2.NewPointer(named)
+	for _, name := range unmarshalMethodNames {
+		if m, _, _ := types2.LookupFieldOrMethod(ptr, false, named.Obj().Pkg(), name); m != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// isExactNumber reports whether t is encoding/json.Number or a pointer to
+// it. Number is fallback-classified but has special ,string handling: the
+// option quotes the number literal instead of being ignored like other
+// method types, matching the reflective walker.
+func isExactNumber(t types2.Type) bool {
+	u := types2.Unalias(t)
+	if cv, ok := u.(*types2.ConstView); ok {
+		u = types2.Unalias(cv.Elem)
+	}
+	if p, ok := u.(*types2.Pointer); ok {
+		u = types2.Unalias(p.Elem())
+		if cv, ok := u.(*types2.ConstView); ok {
+			u = types2.Unalias(cv.Elem)
+		}
+	}
+	named, ok := u.(*types2.Named)
+	if !ok || named.Obj() == nil || named.Obj().Name() != "Number" {
+		return false
+	}
+	b, ok := named.Underlying().(*types2.Basic)
+	if !ok || b.Kind() != types2.String {
+		return false
+	}
+	if pkg := named.Obj().Pkg(); pkg != nil {
+		return pkg.Path() == "encoding/json"
+	}
+	// Test importers may resolve encoding/json without a package path;
+	// only then fall back to the Number method set (String, Float64,
+	// Int64) which exact json.Number carries in both v1 and v2.
+	// A user type named Number in another package must not take the
+	// json.Number path.
+	ptr := types2.NewPointer(named)
+	var pkg *types2.Package
+	if named.Obj() != nil {
+		pkg = named.Obj().Pkg()
+	}
+	has := func(name string) bool {
+		m, _, _ := types2.LookupFieldOrMethod(ptr, false, pkg, name)
+		return m != nil
+	}
+	return has("String") && has("Float64") && has("Int64")
+}
+
+// fallbackScalarKind returns the scalar class of t when t is a quotable
+// scalar for the `string` option even though it is fallback-classified:
+// a bool, integer, float, or string (including a named type with an
+// underlying Basic, a pointer to such, and exact json.Number). It reports
+// false for slices, maps, structs, options, and other non-scalars.
+func fallbackScalarKind(t types2.Type) (scalarKind, bool) {
+	u := types2.Unalias(t)
+	if cv, ok := u.(*types2.ConstView); ok {
+		u = types2.Unalias(cv.Elem)
+	}
+	if _, ok := u.(*types2.Option); ok {
+		return 0, false
+	}
+	if p, ok := u.(*types2.Pointer); ok {
+		e := types2.Unalias(p.Elem())
+		if cv, ok := e.(*types2.ConstView); ok {
+			e = types2.Unalias(cv.Elem)
+		}
+		if _, ok := e.(*types2.Option); ok {
+			return 0, false
+		}
+		return scalarOfNamedOrBasic(e)
+	}
+	return scalarOfNamedOrBasic(u)
+}
+
+// scalarOfNamedOrBasic returns the scalar class of t when t is a Basic or
+// a Named with a Basic underlying, including exact json.Number as a string.
+func scalarOfNamedOrBasic(t types2.Type) (scalarKind, bool) {
+	if named, ok := t.(*types2.Named); ok && named.Obj() != nil && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "encoding/json" && named.Obj().Name() == "Number" {
+		return scalarString, true
+	}
+	switch c := t.(type) {
+	case *types2.Basic:
+		return basicScalar(c)
+	case *types2.Named:
+		b, ok := c.Underlying().(*types2.Basic)
+		if !ok {
+			return 0, false
+		}
+		return basicScalar(b)
+	}
+	return 0, false
+}
+
+// isQuotableForString reports whether a field of type t and shape may carry
+// the `string` option: slices and unions never quote; scalar and pointer
+// shapes always quote when tagged; fallback shapes quote only when the
+// underlying type is a quotable scalar (bool, integer, float, string,
+// including Number and pointers to such). This preserves tag-aware quoting
+// for fallback-classified scalars instead of dropping the option.
+func isQuotableForString(t types2.Type, shape jsonShape) bool {
+	if shape.kind == shapeSlice || shape.kind == shapeUnion {
+		return false
+	}
+	if shape.kind != shapeFallback {
+		return true
+	}
+	_, ok := fallbackScalarKind(t)
+	return ok
+}
+
+// isIsZeroSignature reports whether obj is a method with signature
+// func() bool, the only form encoding/json consults for omitzero.
+func isIsZeroSignature(obj types2.Object) bool {
+	fn, ok := obj.(*types2.Func)
+	if !ok {
+		return false
+	}
+	sig, ok := fn.Type().(*types2.Signature)
+	if !ok {
+		return false
+	}
+	if sig.Params().Len() != 0 || sig.Results().Len() != 1 {
+		return false
+	}
+	b, ok := types2.Unalias(sig.Results().At(0).Type()).(*types2.Basic)
+	return ok && b.Kind() == types2.Bool
+}
+
+// needsIsZero reports whether omitzero on a field of type t consults an
+// IsZero() bool method under encoding/json: the method may sit on the
+// value or the pointer (the runtime re-boxes a copy into an addressable
+// temporary, so pointer receivers count even for value fields), but its
+// signature must match exactly. A wrong signature is ignored, like the
+// reflective encoder ignores it.
+func needsIsZero(t types2.Type) bool {
+	u := types2.Unalias(t)
+	if cv, ok := u.(*types2.ConstView); ok {
+		u = types2.Unalias(cv.Elem)
+	}
+	if o, ok := u.(*types2.Option); ok {
+		u = types2.Unalias(o.Elem)
+		if cv, ok := u.(*types2.ConstView); ok {
+			u = types2.Unalias(cv.Elem)
+		}
+	} else if n, ok := u.(*types2.Named); ok {
+		if n.Underlying() != nil {
+			if o, ok := n.Underlying().(*types2.Option); ok {
+				u = types2.Unalias(o.Elem)
+			}
+		}
+	}
+	if p, ok := u.(*types2.Pointer); ok {
+		u = types2.Unalias(p.Elem())
+		if cv, ok := u.(*types2.ConstView); ok {
+			u = types2.Unalias(cv.Elem)
+		}
+	}
+	named, ok := u.(*types2.Named)
+	if !ok || named.Obj() == nil {
+		return false
+	}
+	ptr := types2.NewPointer(named)
+	obj, _, _ := types2.LookupFieldOrMethod(ptr, false, named.Obj().Pkg(), "IsZero")
+	return obj != nil && isIsZeroSignature(obj)
 }
 
 // basicScalar maps a basic type to its scalar class.
