@@ -246,10 +246,7 @@ func (s *Walk) appendValue(buf []byte, rv reflect.Value) ([]byte, error) {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		return AppendUint(buf, rv.Uint()), nil
 	case reflect.Float32, reflect.Float64:
-		bits := 64
-		if rv.Kind() == reflect.Float32 {
-			bits = 32
-		}
+		bits := int(t.Size()) * 8
 		f := rv.Float()
 		if f-f != 0 {
 			return buf, FloatErr(rv.Interface(), f, bits)
@@ -356,10 +353,7 @@ func (s *Walk) appendStringOptionValue(buf []byte, rv reflect.Value) ([]byte, er
 		buf = AppendUint(buf, rv.Uint())
 		return append(buf, '"'), nil
 	case reflect.Float32, reflect.Float64:
-		bits := 64
-		if rv.Kind() == reflect.Float32 {
-			bits = 32
-		}
+		bits := int(rv.Type().Size()) * 8
 		f := rv.Float()
 		if f-f != 0 {
 			return buf, FloatErr(rv.Interface(), f, bits)
