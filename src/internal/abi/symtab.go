@@ -57,6 +57,14 @@ const (
 
 	// FuncFlagAsm indicates that a function was implemented in assembly.
 	FuncFlagAsm
+
+	// FuncFlagUintptrForeign indicates a function that may receive
+	// uintptr-erased pointers: it carries //go:uintptrescapes or
+	// //go:uintptrkeepalive, or is a compiler-generated ABI wrapper of
+	// such a declaration. Consulted only by the moving-GC foreign
+	// admission path to authorize dynamic rows for the actual call
+	// target; it never means integer arguments are pointers.
+	FuncFlagUintptrForeign
 )
 
 // A FuncID identifies particular functions that need to be treated
@@ -141,3 +149,36 @@ const (
 const MINFUNC = 16 // minimum size for a function
 
 const FuncTabBucketSize = 256 * MINFUNC // size of bucket in the pc->func lookup table
+
+// loGo/s clone suffix rule (SPEC T-203.4, T-205, red-team #9, #74).
+//
+// Compiler clones carry a terminal suffix with a nonempty decimal sequence
+// number:
+//
+//	<f>·logosspec<N>   clone specialization (M13-S3)
+//	<f>·logosct<N>      comptime generic expansion (M7-S3), middle-dot form
+//	<f>_logosct<N>      comptime generic expansion (M7-S3), source-level form
+//
+// Comptime copies are built by splicing source text that the parser reads
+// back, so the copy symbol keeps the ASCII spelling <f>_logosct<N>: U+00B7
+// MIDDLE DOT is not a source identifier character and can never appear in
+// spliced text. A clone of a comptime copy chains both spellings
+// (<f>_logosct<M>·logosspec<N>); base matching strips repeatedly to a
+// fixpoint.
+//
+// Naming rule: the link symbol and the symbol table (go tool nm) keep the
+// full canonical suffix, so every clone stays stable, unique, and
+// resolvable by name across shared, plugin, and internal links (one
+// generateFuncnametab path serves every mode). The pclntab funcnametab
+// copy strips the suffixes to the base (SPEC T-203.4, T-205, red-team #9,
+// #74) so traces print <f>; capability sink matching strips the same
+// suffixes to the base for sink identity. The spellings must stay in sync
+// with cfCopyInfix in cmd/compile/internal/logos/comptime.go, the linker
+// helpers in cmd/link/internal/ld/pcln_logos.go, capSinkName in
+// cmd/link/internal/ld/capabilities_logos.go, and logosCloneBaseName in
+// src/runtime/symtab_logos.go.
+const (
+	LogosSpecDisplayInfix = "·logosspec"
+	LogosCtDisplayInfix   = "·logosct"
+	LogosCtASCIIInfix     = "_logosct"
+)
