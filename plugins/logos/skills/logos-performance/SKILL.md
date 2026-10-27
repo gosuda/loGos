@@ -99,7 +99,7 @@ Collector selection is controlled by `-gc=MODE` or `logos.toml [build] gc`. Prov
 
 | Mode | Collector behavior |
 |---|---|
-| `greentea` | Default under `logos` on native architectures. Elastic worker pacing based on heap utilization. |
+| `greentea` | Default under `logos` on native architectures. Elastic worker pacing based on heap utilization; elastic pacing is also the default for an empty production-controller mode. Generational cards use GOEXPERIMENT=logosgen on amd64; their stable-default migration remains blocked. Span deck is default on except on wasm; `nologosspandeck` retains the FIFO comparison path. |
 | `batch` | Stops the world for collections; triggers collection at 90% of `GOMEMLIMIT`. Packages compile with `-wb=false`. |
 | `epsilon` | No automatic collection. Only explicit `runtime.GC()` collects. |
 | `wasm` | Default under `logos` on `GOARCH=wasm`. Runs incremental mark work during browser idle periods. |
@@ -108,9 +108,9 @@ Collector selection is controlled by `-gc=MODE` or `logos.toml [build] gc`. Prov
 
 Rules:
 
-* Plain `go` without `-gc` keeps the upstream Go collector.
+* Plain `go` without `-gc` keeps the upstream Go collector; an empty production-controller mode still uses elastic pacing.
 * `batch` and `epsilon` ignore environment `GOGC` settings and disable write barriers outside package `runtime`.
-* Generational collection via `GOEXPERIMENT=logosgen` enables card-table tracking (1 byte per 512 bytes of heap arena) with mature span skips.
+* Generational collection uses GOEXPERIMENT=logosgen on amd64: card-table tracking (1 byte per 512 bytes of heap arena) with mature span skips. Its stable-default migration remains blocked.
 
 ## Fast cgo (M20)
 

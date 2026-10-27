@@ -1047,7 +1047,7 @@ Scan-region objects MUST carry a type word. [T-301.1]
 The collector MUST scan them with the goroutine stack. [T-301.1]
 Greentea MUST scale background workers by heap use. [T-301.2]
 It MUST keep mark assist as backstop when heap use reaches 95% of goal. [T-301.2]
-Under `GOEXPERIMENT=logosgen`, greentea MUST use a generational card table. [T-301.2]
+Under GOEXPERIMENT=logosgen, amd64 greentea MUST use a generational card table. [T-301.2]
 Batch MUST collect stop-the-world only. [T-301.2]
 It MUST start with `GOGC` off. [T-301.2]
 It MUST trigger collection at 90% of `GOMEMLIMIT`. [T-301.2]
@@ -1319,7 +1319,7 @@ After a frame exit, collection MUST find no stale pointers in popped scan memory
 ### 8.4 Pluggable GC write and load barrier dispatch
 
 The `-gc` flag MUST select the barrier emitter at compile time. [T-301.2]
-Under greentea built with `GOEXPERIMENT=logosgen`, pointer stores into mature spans MUST mark the card table. [T-301.2]
+On amd64 greentea, pointer stores into mature spans MUST mark the card table. [T-301.2]
 Under greentea, pointer loads MUST be plain loads with no barrier instructions. [T-301.2][T-PERF]
 Under zgc, pointer loads MUST test the color and heal or remap on mismatch. [T-301.2]
 Under zgc, pointer stores MUST be plain. [T-301.2]
@@ -1893,7 +1893,7 @@ The build MUST select the collector with `-gc=MODE` on `logos build` or `go buil
 MODE MUST be one of `greentea`, `zgc`, `immix`, `wasm`, `batch`, or `epsilon`. [T-301.2]
 Any other mode MUST fail with `logos build: unknown -gc mode "x" (want greentea, zgc, immix, wasm, batch, epsilon)`. [T-301.2]
 Under `logos`, the default MUST be `greentea`, or `wasm` when `GOARCH` equals `wasm`. [T-301.2]
-Plain `go` MUST keep the upstream collector and pacing until `./run.bash` passes with a changed default, as the flip rule of Sec 0.1 states. [T-301.2][T-0.1]
+Elastic pacing MUST be the default for `greentea` and for an empty production-controller mode; empty test-controller modes MUST keep upstream pacing. [T-301.2]
 Until phase 1 passes `go test -short std` with the experiment on, `-gc=immix` MUST fail with `logos build: -gc=immix requires GOEXPERIMENT=logosgcmoving phase 1, which is not complete`. [T-301.2]
 Until phase 2 passes, `-gc=zgc` MUST fail with `logos build: -gc=zgc requires GOEXPERIMENT=logosgcmoving phase 2, which is not complete`. [T-301.2]
 Batch MUST run no collection until heap use reaches 90% of `GOMEMLIMIT`. [T-301.2]
@@ -1910,16 +1910,16 @@ Mark slices MUST run during idle time of the JS event loop. [T-301.2]
 The heap MUST split into a low permanent region and a high scratch region. [T-301.2]
 Growth MUST extend only the high region. [T-301.2]
 The modes of this section MUST apply to Go packages and to loGo/s packages. [T-301.2][R-U1]
-The plain `go` default MUST keep the upstream pacing until `./run.bash` passes with the `logos` default. [T-301.2][T-0.1][R-U1]
 Under plain `go`, each `logos build:` message above MUST use the prefix `go build:`. [T-301.2]
 
 ### 19.1 Engine 1: Enhanced Green Tea GC
 
 A pointer store into a span MUST set the mark bit and the dirty flag without dereferencing the pointer. [T-301.2]
-Workers MUST drain dirty spans in monotonic address order. [T-301.2]
+Workers MUST drain dirty spans in monotonic address order, except on GOARCH=wasm where the span deck stays off. [T-301.2]
+`nologosspandeck` MUST retain the FIFO comparison path. [T-301.2]
 A single-page 8KB span MUST scan its grey objects sequentially in one pass. [T-301.2]
 The sequential span scan MUST use hardware prefetch on amd64. [T-301.2]
-Under `GOEXPERIMENT=logosgen`, the card table MUST hold one byte per 512 bytes of heap. [T-301.2]
+Under greentea built with GOEXPERIMENT=logosgen, the card table MUST hold one byte per 512 bytes of heap. [T-301.2]
 A minor cycle MUST trigger when the heap grows 50% since the last cycle. [T-301.2]
 A span MUST count as mature after surviving 2 cycles. [T-301.2]
 A minor cycle MUST skip clean mature spans without reading their mark bits. [T-301.2]
@@ -1929,8 +1929,7 @@ It MUST rise linearly from 0.25 to 0.75 when u is at least 0.80 and below 0.95. 
 It MUST stay 0.75 when u is at or above 0.95. [T-301.2]
 Here u means live heap over heap goal. [T-301.2]
 Assists MUST still run when u reaches 0.95 or more. [T-301.2]
-The generational gate has passed: `-gc=greentea` builds with `GOEXPERIMENT=logosgen` MUST run the generational collector. [T-301.2]
-Without the experiment, `-gc=greentea` behavior is unchanged, and `logosgen` stays opt-in (never a global default). [T-301.2]
+Under GOEXPERIMENT=logosgen, amd64 greentea MUST use a generational card table. [T-301.2]
 
 ### 19.2 Engine 2: Colored-pointer compactor
 
