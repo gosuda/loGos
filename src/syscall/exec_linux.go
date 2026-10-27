@@ -138,11 +138,12 @@ func runtime_AfterForkInChild()
 func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr *ProcAttr, sys *SysProcAttr, pipe int) (pid int, err Errno) {
 	// Set up and fork. This returns immediately in the parent or
 	// if there's an error.
-	upid, pidfd, err, mapPipe, locked := forkAndExecInChild1(argv0, argv, envv, chroot, dir, attr, sys, pipe)
+	upid, pidfd, err, mapPipe, locked, forkTok := forkAndExecInChild1(argv0, argv, envv, chroot, dir, attr, sys, pipe)
 	if locked {
 		runtime_AfterFork()
 	}
 	if err != 0 {
+		logosForkEnd(forkTok)
 		return 0, err
 	}
 
@@ -166,6 +167,7 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 		Close(mapPipe[1])
 	}
 
+	logosForkEnd(forkTok)
 	return pid, 0
 }
 
@@ -218,7 +220,7 @@ type cloneArgs struct {
 //go:noinline
 //go:norace
 //go:nocheckptr
-func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr *ProcAttr, sys *SysProcAttr, pipe int) (pid uintptr, pidfd int32, err1 Errno, mapPipe [2]int, locked bool) {
+func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr *ProcAttr, sys *SysProcAttr, pipe int) (pid uintptr, pidfd int32, err1 Errno, mapPipe [2]int, locked bool, forkTok logosForeignToken) {
 	// Defined in linux/prctl.h starting with Linux 4.3.
 	const (
 		PR_CAP_AMBIENT       = 0x2f
@@ -326,6 +328,54 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 		}
 	}
 
+	var uidMap, gidMap, cloneObj logosForkExtent
+	if len(sys.UidMappings) > 0 {
+		uidMap = logosForkExtent{
+			Base: unsafe.Pointer(&sys.UidMappings[0]),
+			Size: uintptr(len(sys.UidMappings)) * unsafe.Sizeof(sys.UidMappings[0]),
+			Elem: logosTypeOf(sys.UidMappings[0]),
+		}
+	}
+	if len(sys.GidMappings) > 0 {
+		gidMap = logosForkExtent{
+			Base: unsafe.Pointer(&sys.GidMappings[0]),
+			Size: uintptr(len(sys.GidMappings)) * unsafe.Sizeof(sys.GidMappings[0]),
+			Elem: logosTypeOf(sys.GidMappings[0]),
+		}
+	}
+	if clone3 != nil {
+		cloneObj = logosForkExtent{
+			Base: unsafe.Pointer(clone3),
+			Size: unsafe.Sizeof(*clone3),
+			Elem: logosTypeOf(*clone3),
+		}
+	}
+	forkTok = logosForkBegin(&logosForkCells{
+		Argv0:      &argv0,
+		Chroot:     &chroot,
+		Dir:        &dir,
+		Argv:       &argv,
+		Envv:       &envv,
+		Attr:       &attr,
+		SysSlot:    unsafe.Pointer(&sys),
+		SysType:    logosTypeOf(sys),
+		SysCred:    &sys.Credential,
+		Cred:       &cred,
+		Caps:       &sys.AmbientCaps,
+		UidMap:     uidMap,
+		GidMap:     gidMap,
+		CloneSlot:  unsafe.Pointer(&clone3),
+		CloneType:  logosTypeOf(clone3),
+		CloneObj:   cloneObj,
+		Rlim:       &rlim,
+		Fd:         &fd,
+		Puid:       &puid,
+		Psetgroups: &psetgroups,
+		Pgid:       &pgid,
+		Uidmap:     &uidmap,
+		Setgroups:  &setgroups,
+		Gidmap:     &gidmap,
+	})
 	// About to call fork.
 	// No more allocation or calls of non-assembly functions.
 	runtime_BeforeFork()

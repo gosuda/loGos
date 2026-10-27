@@ -196,11 +196,23 @@ func forkExec(argv0 string, argv []string, attr *ProcAttr) (pid int, err error) 
 		return 0, errorspkg.New("Setctty set but Ctty not valid in child")
 	}
 
+	outerTok := logosForkOuterBegin(&logosForkOuterCells{
+		Argv0:   &argv0p,
+		Chroot:  &chroot,
+		Dir:     &dir,
+		Argv:    &argvp,
+		Envv:    &envvp,
+		Attr:    &attr,
+		SysSlot: unsafe.Pointer(&sys),
+		SysType: logosTypeOf(sys),
+	})
+
 	acquireForkLock()
 
 	// Allocate child status pipe close on exec.
 	if err = forkExecPipe(p[:]); err != nil {
 		releaseForkLock()
+		logosForkOuterEnd(outerTok)
 		return 0, err
 	}
 
@@ -210,6 +222,7 @@ func forkExec(argv0 string, argv []string, attr *ProcAttr) (pid int, err error) 
 		Close(p[0])
 		Close(p[1])
 		releaseForkLock()
+		logosForkOuterEnd(outerTok)
 		return 0, Errno(err1)
 	}
 	releaseForkLock()
@@ -241,10 +254,12 @@ func forkExec(argv0 string, argv []string, attr *ProcAttr) (pid int, err error) 
 		// OS-specific cleanup on failure.
 		forkAndExecFailureCleanup(attr, sys)
 
+		logosForkOuterEnd(outerTok)
 		return 0, err
 	}
 
 	// Read got EOF, so pipe closed on exec, so exec succeeded.
+	logosForkOuterEnd(outerTok)
 	return pid, nil
 }
 
@@ -281,6 +296,7 @@ func Exec(argv0 string, argv []string, envv []string) (err error) {
 	if err != nil {
 		return err
 	}
+	execTok := logosExecBegin(&argv0p, &argvp, &envvp)
 	runtime_BeforeExec()
 
 	rlim := origRlimitNofile.Load()
@@ -301,5 +317,6 @@ func Exec(argv0 string, argv []string, envv []string) (err error) {
 			uintptr(unsafe.Pointer(&envvp[0])))
 	}
 	runtime_AfterExec()
+	logosExecEnd(execTok)
 	return err1
 }
