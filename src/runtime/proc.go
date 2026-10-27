@@ -4733,6 +4733,9 @@ func reentersyscall(pc, sp, bp uintptr) {
 		// systemstack clobbered gp.sched, so restore it.
 		save(pc, sp, bp)
 	}
+	// Publish foreign hold before pending STW checks or transitioning to _Gsyscall,
+	// so the collector's foreign closure observes this execution context.
+	logosZgcForeignHoldEnter(gp, 0)
 	if sched.gcwaiting.Load() {
 		// Optimization: If there's a pending STW, do the equivalent of
 		// entersyscallblock here at the last minute and immediately give
@@ -5054,6 +5057,7 @@ func exitsyscall() {
 			gp.stackguard0 = gp.stack.lo + stackGuard
 		}
 		gp.throwsplit = false
+		logosZgcForeignHoldExit(gp)
 
 		if sched.disable.user && !schedEnabled(gp) {
 			// Scheduling of this goroutine is disabled.
@@ -5076,6 +5080,7 @@ func exitsyscall() {
 	gp.syscallsp = 0
 	gp.m.p.ptr().syscalltick++
 	gp.throwsplit = false
+	logosZgcForeignHoldExit(gp)
 }
 
 // exitsyscall's attempt to try to get any P, if it's missing one.
@@ -5416,7 +5421,21 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		// Only user goroutines inherit synctest groups and pprof labels.
 		newg.bubble = callergp.bubble
 		if mp.curg != nil {
-			newg.labels = mp.curg.labels
+			if goexperiment.LogosGCMoving && prof.hz.Load() != 0 {
+				// Unitizing inherit: share the parent pointer verbatim,
+				// no clone, no allocation. Held under cpuprof.lock so the
+				// value is stable against the buffer identity sweep in
+				// cpuprof.go. Taken only while profiling is active, so
+				// the common path stays identical to upstream and no
+				// system stack waiter can strand a world stop. The
+				// signal writer never takes this lock. The unlock pairs
+				// with the acquire load for the fenced handoff.
+				lock(&cpuprof.lock)
+				newg.labels = logosAcquireProfLabel(mp.curg)
+				unlock(&cpuprof.lock)
+			} else {
+				newg.labels = mp.curg.labels
+			}
 		}
 		if goroutineProfile.active {
 			// A concurrent goroutine profile is running. It should include
@@ -6628,7 +6647,6 @@ func sysmon() {
 		// Update now in case we blocked on sysmonnote or spent a long time
 		// blocked on schedlock or sysmonlock above.
 		now = nanotime()
-
 		// trigger libc interceptors if needed
 		if *cgo_yield != nil {
 			asmcgocall(*cgo_yield, nil)
