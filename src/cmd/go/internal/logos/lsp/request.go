@@ -12,6 +12,22 @@ import (
 // nullResult is the JSON result of a request the proxy declines to map.
 var nullResult = json.RawMessage("null")
 
+// codeRequestFailed is the LSP error code (RequestFailed) of a request
+// that was well formed and names a method the server knows, but that the
+// server declines to answer.
+const codeRequestFailed = -32803
+
+// formattingMethods are the requests that answer text edits computed over
+// a whole document or a part of it. gopls computes them on the lowered Go
+// text, so the edits would write generated statements into a loGo/s
+// source; the proxy declines them for loGo/s documents, and forwards them
+// unchanged for Go documents.
+var formattingMethods = map[string]bool{
+	"textDocument/formatting":       true,
+	"textDocument/rangeFormatting":  true,
+	"textDocument/onTypeFormatting": true,
+}
+
 // clientRequest handles one request from the client.
 func (p *Proxy) clientRequest(ctx context.Context, m *message) {
 	switch m.Method {
@@ -88,7 +104,9 @@ func (p *Proxy) target(path string) (*lowered, bool) {
 // packages whose documents changed, so the request sees every edit the
 // client made before it. A request on a loGo/s document with no current
 // lowering gets a null result, except for textDocument/codeAction, which
-// answers the compiler autofix candidates of the source itself.
+// answers the compiler autofix candidates of the source itself. A
+// formatting request on a loGo/s document fails with codeRequestFailed,
+// see formattingMethods.
 func (p *Proxy) request(ctx context.Context, m *message) {
 	params, err := decode(m.Params)
 	if err != nil {
@@ -96,6 +114,10 @@ func (p *Proxy) request(ctx context.Context, m *message) {
 		return
 	}
 	path := requestPath(params)
+	if formattingMethods[m.Method] && isLogosPath(path) {
+		p.declineFormatting(m)
+		return
+	}
 	p.work.Lock()
 	defer p.work.Unlock()
 	p.refreshLocked(ctx)
@@ -128,6 +150,16 @@ func (p *Proxy) request(ctx context.Context, m *message) {
 	}
 	p.addPending(m.ID, pend)
 	p.send(p.server, out)
+}
+
+// declineFormatting answers the formatting request m on a loGo/s document
+// with an error response. No compile or gopls request is needed: the
+// answer does not depend on the lowering of the document.
+func (p *Proxy) declineFormatting(m *message) {
+	reason := m.Method + " is not supported for loGo/s sources: gopls would format the lowered Go text, not the source"
+	if err := p.client.fail(m.ID, codeRequestFailed, reason); err != nil {
+		p.logf("write: %v", err)
+	}
 }
 
 // fromServer handles one message from gopls.
