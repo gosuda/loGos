@@ -163,16 +163,24 @@ var filemap = map[string]action{
 		renameIdents(f, "syntax->ast")
 		renameSelectors(f, "ElemList->Elts")
 	},
-	"lookup.go":    fixTokenPos,
+	"lookup.go": func(f *ast.File) {
+		stripLogosHooks(f)
+		fixTokenPos(f)
+	},
 	"main_test.go": nil,
 	"map.go":       nil,
 	"mono.go": func(f *ast.File) {
+		stripLogosHooks(f)
 		fixTokenPos(f)
 		insertImportPath(f, `"go/ast"`)
 		renameSelectorExprs(f, "syntax.Expr->ast.Expr")
 	},
-	"named.go":  func(f *ast.File) { fixTokenPos(f); renameSelectors(f, "Trace->_Trace") },
-	"object.go": func(f *ast.File) { fixTokenPos(f); renameIdents(f, "NewTypeNameLazy->_NewTypeNameLazy") },
+	"named.go": func(f *ast.File) { fixTokenPos(f); renameSelectors(f, "Trace->_Trace") },
+	"object.go": func(f *ast.File) {
+		stripLogosHooks(f)
+		fixTokenPos(f)
+		renameIdents(f, "NewTypeNameLazy->_NewTypeNameLazy")
+	},
 	// TODO(gri) needs adjustments for TestObjectString - disabled for now
 	// "object_test.go": func(f *ast.File) { renameImportPath(f, `"cmd/compile/internal/types2"->"go/types"`) },
 	"objset.go": nil,
@@ -218,7 +226,11 @@ var filemap = map[string]action{
 	"trie_test.go":     nil,
 	"tuple.go":         nil,
 	"typelists.go":     nil,
-	"typeset.go":       func(f *ast.File) { fixTokenPos(f); renameSelectors(f, "Trace->_Trace") },
+	"typeset.go": func(f *ast.File) {
+		stripLogosHooks(f)
+		fixTokenPos(f)
+		renameSelectors(f, "Trace->_Trace")
+	},
 	"typeparam.go":     nil,
 	"typeterm_test.go": nil,
 	"typeterm.go":      nil,
@@ -587,11 +599,21 @@ func stripLogosHooks(f *ast.File) {
 			}
 		}
 		f.Comments = groups
+		if last == tf.LineCount() {
+			if first > 1 {
+				for range last - first + 1 {
+					tf.MergeLine(first - 1)
+				}
+			}
+			return
+		}
 		for range last - first + 1 {
 			tf.MergeLine(first)
 		}
 	}
 
+	stripLogosDecls(f, drop)
+	stripLogosFields(f, drop)
 	// isHook reports whether s is a guard, bare call, or return of a hook.
 	isHook := func(s ast.Stmt) bool {
 		switch s := s.(type) {
@@ -600,7 +622,7 @@ func stripLogosHooks(f *ast.File) {
 		case *ast.ReturnStmt:
 			return len(s.Results) == 1 && isLogosCall(s.Results[0])
 		case *ast.IfStmt:
-			return isLogosCall(s.Cond)
+			return isLogosGuardCond(s.Cond)
 		}
 		return false
 	}
@@ -620,7 +642,7 @@ func stripLogosHooks(f *ast.File) {
 				if s.Init != nil || s.Else != nil {
 					break
 				}
-				if isLogosCall(s.Cond) {
+				if isLogosGuardCond(s.Cond) {
 					drop(s.Pos(), s.End())
 					list = slices.Delete(list, i, i+1)
 					continue
@@ -646,6 +668,17 @@ func stripLogosHooks(f *ast.File) {
 		return len(list) > 0 && !slices.ContainsFunc(list, func(e ast.Expr) bool { return !isLogosType(e) })
 	}
 
+	usesConstMutation := func(cc *ast.CaseClause) bool {
+		found := false
+		ast.Inspect(cc, func(n ast.Node) bool {
+			if id, _ := n.(*ast.Ident); id != nil && id.Name == "logosConstMutation" {
+				found = true
+				return false
+			}
+			return true
+		})
+		return found
+	}
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.BlockStmt:
@@ -653,7 +686,7 @@ func stripLogosHooks(f *ast.File) {
 			// A block holding case clauses is the body of a switch.
 			for i := 0; i < len(n.List); {
 				cc, _ := n.List[i].(*ast.CaseClause)
-				if cc != nil && (logosOnlyCase(cc.List) || (len(cc.Body) > 0 && !slices.ContainsFunc(cc.Body, func(s ast.Stmt) bool { return !isHook(s) }))) {
+				if cc != nil && (logosOnlyCase(cc.List) || usesConstMutation(cc) || (len(cc.Body) > 0 && !slices.ContainsFunc(cc.Body, func(s ast.Stmt) bool { return !isHook(s) }))) {
 					drop(cc.Pos(), cc.End())
 					n.List = slices.Delete(n.List, i, i+1)
 					continue
@@ -671,13 +704,25 @@ func stripLogosHooks(f *ast.File) {
 			if len(n.List) != before {
 				dropLogosComment(f, tf, drop, tf.Line(n.Case))
 			}
+		case *ast.IfStmt:
+			if c := stripLogosOr(n.Cond); c != nil && c != n.Cond {
+				n.Cond = c
+			}
+		case *ast.ReturnStmt:
+			if len(n.Results) == 1 {
+				if call, _ := n.Results[0].(*ast.CallExpr); call != nil && isLogosCall(call) {
+					if logosCallName(call) == "logosAssertReadonly" {
+						n.Results[0] = newIdent(call.Pos(), "true")
+					}
+				}
+			}
 		}
 		return true
 	})
 
 	ast.Inspect(f, func(n ast.Node) bool {
 		if call, _ := n.(*ast.CallExpr); call != nil && isLogosCall(call) {
-			panic("unhandled logos hook: " + call.Fun.(*ast.SelectorExpr).Sel.Name)
+			panic("unhandled logos hook: " + logosCallName(call))
 		}
 		return true
 	})
@@ -694,14 +739,226 @@ func dropLogosComment(f *ast.File, tf *token.File, drop func(pos, end token.Pos)
 	}
 }
 
-// isLogosCall reports whether x is a call of the form check.logosXxx(...).
+// isLogosCall reports whether x is a Logos-only call: the existing
+// check.logosXxx shape plus exact Logos-only names (no blanket prefix).
 func isLogosCall(x ast.Node) bool {
-	if call, _ := x.(*ast.CallExpr); call != nil {
-		if selx, _ := call.Fun.(*ast.SelectorExpr); selx != nil && isIdent(selx.X, "check") {
-			return strings.HasPrefix(strings.ToLower(selx.Sel.Name), "logos")
+	call, _ := x.(*ast.CallExpr)
+	if call == nil {
+		return false
+	}
+	if sel, _ := call.Fun.(*ast.SelectorExpr); sel != nil {
+		if isIdent(sel.X, "check") && strings.HasPrefix(strings.ToLower(sel.Sel.Name), "logos") {
+			return true
 		}
+		return logosMethods[sel.Sel.Name]
+	}
+	if id, _ := call.Fun.(*ast.Ident); id != nil {
+		return logosFuncs[id.Name]
 	}
 	return false
+}
+
+var logosMethods = map[string]bool{
+	"LogosReadonly":         true,
+	"LogosAssertEffects":    true,
+	"SetLogosAssertEffects": true,
+	"SetLogosReadonly":      true,
+}
+var logosFuncs = map[string]bool{
+	"logosInterfaceReadonlyMismatch": true,
+	"logosConcreteAssertErasable":    true,
+	"logosEmbedReadonlyConflict":     true,
+	"logosAssertReadonly":            true,
+}
+
+func logosCallName(call *ast.CallExpr) string {
+	if sel, _ := call.Fun.(*ast.SelectorExpr); sel != nil {
+		return sel.Sel.Name
+	}
+	if id, _ := call.Fun.(*ast.Ident); id != nil {
+		return id.Name
+	}
+	return ""
+}
+func isLogosGuardCond(e ast.Expr) bool {
+	if isLogosCall(e) {
+		return true
+	}
+	if bin, _ := e.(*ast.BinaryExpr); bin != nil && bin.Op == token.NEQ {
+		xc, _ := bin.X.(*ast.CallExpr)
+		yc, _ := bin.Y.(*ast.CallExpr)
+		if xc == nil || yc == nil {
+			return false
+		}
+		xs, _ := xc.Fun.(*ast.SelectorExpr)
+		ys, _ := yc.Fun.(*ast.SelectorExpr)
+		if xs == nil || ys == nil {
+			return false
+		}
+		return xs.Sel.Name == "LogosReadonly" && ys.Sel.Name == "LogosReadonly" && len(xc.Args) == 0 && len(yc.Args) == 0
+	}
+	return false
+}
+func stripLogosOr(e ast.Expr) ast.Expr {
+	if e == nil {
+		return nil
+	}
+	if call, _ := e.(*ast.CallExpr); call != nil && logosCallName(call) == "logosEmbedReadonlyConflict" {
+		return nil
+	}
+	if bin, _ := e.(*ast.BinaryExpr); bin != nil && bin.Op == token.LOR {
+		l := stripLogosOr(bin.X)
+		r := stripLogosOr(bin.Y)
+		if l == nil && r == nil {
+			return nil
+		}
+		if l == nil {
+			return r
+		}
+		if r == nil {
+			return l
+		}
+		bin.X = l
+		bin.Y = r
+		return bin
+	}
+	return e
+}
+
+var logosDecls = map[string]bool{
+	"LogosReadonly":         true,
+	"LogosAssertEffects":    true,
+	"SetLogosAssertEffects": true,
+	"SetLogosReadonly":      true,
+	"logosAssertEffects":    true,
+	"logosAssertZero":       true,
+	"logosMonoCyclicParam":  true,
+	"logosMonoCyclicDecl":   true,
+	"logosMonoCyclicNamed":  true,
+}
+var logosFields = map[string]map[string]bool{
+	"Func": {"logosReadonly": true, "logosAssert": true},
+}
+
+func stripLogosDecls(f *ast.File, drop func(from, to token.Pos)) {
+	var kept []ast.Decl
+	for _, d := range f.Decls {
+		if fn, _ := d.(*ast.FuncDecl); fn != nil {
+			if logosDecls[fn.Name.Name] {
+				if fn.Doc != nil {
+					drop(fn.Doc.Pos(), fn.End())
+				} else {
+					drop(fn.Pos(), fn.End())
+				}
+				continue
+			}
+		}
+		if gd, _ := d.(*ast.GenDecl); gd != nil && len(gd.Specs) == 1 {
+			var name string
+			if ts, _ := gd.Specs[0].(*ast.TypeSpec); ts != nil {
+				name = ts.Name.Name
+			}
+			if vs, _ := gd.Specs[0].(*ast.ValueSpec); vs != nil && len(vs.Names) == 1 {
+				name = vs.Names[0].Name
+			}
+			if name != "" && logosDecls[name] {
+				if gd.Doc != nil {
+					drop(gd.Doc.Pos(), gd.End())
+				} else {
+					drop(gd.Pos(), gd.End())
+				}
+				continue
+			}
+		}
+		kept = append(kept, d)
+	}
+	f.Decls = kept
+}
+func stripLogosFields(f *ast.File, drop func(from, to token.Pos)) {
+	type finfo struct {
+		orig int
+		del  []int
+	}
+	info := map[string]*finfo{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		ts, _ := n.(*ast.TypeSpec)
+		if ts == nil {
+			return true
+		}
+		want, ok := logosFields[ts.Name.Name]
+		if !ok {
+			return true
+		}
+		st, _ := ts.Type.(*ast.StructType)
+		if st == nil {
+			return true
+		}
+		fl := st.Fields
+		var kept []*ast.Field
+		var del []int
+		for idx, fd := range fl.List {
+			hit := false
+			for _, nm := range fd.Names {
+				if want[nm.Name] {
+					hit = true
+					break
+				}
+			}
+			if hit {
+				if len(fd.Names) != 1 {
+					panic("shared logos field decl")
+				}
+				if fd.Doc != nil {
+					drop(fd.Doc.Pos(), fd.End())
+				} else {
+					drop(fd.Pos(), fd.End())
+				}
+				del = append(del, idx)
+				continue
+			}
+			kept = append(kept, fd)
+		}
+		fl.List = kept
+		info[ts.Name.Name] = &finfo{orig: len(fl.List) + len(del), del: del}
+		return true
+	})
+	if len(info) == 0 {
+		return
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		lit, _ := n.(*ast.CompositeLit)
+		if lit == nil {
+			return true
+		}
+		var tname string
+		if id, _ := lit.Type.(*ast.Ident); id != nil {
+			tname = id.Name
+		}
+		fi, ok := info[tname]
+		if !ok {
+			return true
+		}
+		if len(lit.Elts) == 0 {
+			return true
+		}
+		keyed := false
+		for _, e := range lit.Elts {
+			if _, ok := e.(*ast.KeyValueExpr); ok {
+				keyed = true
+				break
+			}
+		}
+		if keyed {
+			return true
+		}
+		if len(lit.Elts) != fi.orig {
+			panic("unexpected logos struct literal arity")
+		}
+		for i := len(fi.del) - 1; i >= 0; i-- {
+			lit.Elts = slices.Delete(lit.Elts, fi.del[i], fi.del[i]+1)
+		}
+		return true
+	})
 }
 
 // isLogosType reports whether e names a types2-only type that go/types
