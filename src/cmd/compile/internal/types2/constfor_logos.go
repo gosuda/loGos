@@ -39,19 +39,23 @@ type LogosConstFor struct {
 // comptime-generic copies emitted so far, which later copies may call,
 // and the file's synthesized package aliases (the `_logos_tN` qualifiers
 // that spell a type of a package the file does not import), each bound to
-// the package object it names, and the importer and canonical context
+// the package object it names, the importer and canonical context
 // the main check recorded, so copied const evaluation opens the same
-// packages and shares instance identity instead of failing closed.
+// packages and shares instance identity instead of failing closed,
+// and the same-package const-func bodies plus the declared-const proof
+// the main check recorded, so copies resolve their callees without a
+// package-level global. Explicit entries win over the Info proof.
 type LogosCopyContext struct {
-	Scope    *Scope
-	Sig      *Signature
-	Version  string
-	Disqual  []map[string]bool
-	Funcs    []*Func
-	Aliases  map[*Package]string
-	MaxSteps int
-	Importer Importer
-	Context  *Context
+	Scope      *Scope
+	Sig        *Signature
+	Version    string
+	Disqual    []map[string]bool
+	Funcs      []*Func
+	Aliases    map[*Package]string
+	MaxSteps   int
+	Importer   Importer
+	Context    *Context
+	ConstFuncs map[string]LogosConstFunc
 }
 
 // logosCopyChecker builds the throwaway checker one copy check runs on.
@@ -98,7 +102,45 @@ func (ctx LogosCopyContext) logosCopyChecker(pkg *Package, info *Info, errs *[]E
 	}
 	mc.sig = ctx.Sig
 	mc.logosDisqual = slices.Clone(ctx.Disqual)
+	mc.logosSeedConstFuncs(info, ctx.ConstFuncs)
 	return mc
+}
+
+// logosSeedConstFuncs fills a copy checker's CTFE body maps from the
+// first check's Info proof plus explicit context entries, so
+// same-package const-func calls from lowered copies resolve their
+// callees. The Info proof fills only entries the fresh checker lacks;
+// explicit entries overwrite.
+func (check *Checker) logosSeedConstFuncs(info *Info, explicit map[string]LogosConstFunc) {
+	if len(explicit) == 0 && (info == nil || len(info.LogosConstFuncs) == 0) {
+		return
+	}
+	bodies, consts := check.logosConstFuncBodies()
+	seed := func(name string, rec LogosConstFunc) {
+		if rec.Decl == nil {
+			return
+		}
+		if _, dup := bodies[name]; !dup {
+			bodies[name] = rec.Decl
+		}
+		if rec.Const {
+			consts[rec.Decl] = true
+		}
+	}
+	if info != nil {
+		for name, rec := range info.LogosConstFuncs {
+			seed(name, rec)
+		}
+	}
+	for name, rec := range explicit {
+		if rec.Decl == nil {
+			continue
+		}
+		bodies[name] = rec.Decl
+		if rec.Const {
+			consts[rec.Decl] = true
+		}
+	}
 }
 
 // logosCopyFinish runs the checker's delayed work and records the

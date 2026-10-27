@@ -368,6 +368,17 @@ type Info struct {
 	LogosPlatformRets map[syntax.Pos][]LogosPlatformRet // logos M9-S2 hook: start positions of return operands holding platform pointers that convert to an interface result.
 
 	LogosConstCov map[syntax.Expr]Type // original const-slice arguments mapped to target interface elements
+
+	// LogosConstFuncs carries the first check's CTFE proof for
+	// same-package functions, keyed by object name (SPEC Sec 2.1,
+	// T-201). Each entry records the checked body for transitive
+	// evaluation plus whether the first check saw it through a
+	// `const func` declaration. Copy checkers run on fresh checkers
+	// sharing this Info, so they read the proof from Info instead of
+	// a package-level global; the first check's static purity scan
+	// remains the impurity verdict. The first record wins, so a later
+	// observation through a plain declaration cannot downgrade it.
+	LogosConstFuncs map[string]LogosConstFunc
 }
 
 func (info *Info) recordTypes() bool {
