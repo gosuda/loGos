@@ -260,6 +260,12 @@ func (b *Builder) Do(ctx context.Context, root *Action) {
 	writeActionGraph()
 }
 
+// logosNogoWPrefixFull expands the W worktree prefix to a full absolute path
+// for every Nogo tool invocation (helper module dir and host go binary).
+func logosNogoWPrefixFull() string {
+	return cfg.GOROOT
+}
+
 // buildActionID computes the action ID for a build action.
 func (b *Builder) buildActionID(a *Action) cache.ActionID {
 	p := a.Package
