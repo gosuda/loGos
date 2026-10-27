@@ -35,6 +35,17 @@ import (
 // //go:linkname mark here, so the linker's linkname check accepts the
 // pull.
 
+// logosWaitersLock guards the slot bitmap and the netpoll waiter
+// registry (logos_group_netpoll.go). It lives here, on all builds, so
+// the slot allocator works where netpoll does not (Plan 9); the waiter
+// registry itself stays in the netpoll-constrained file. Ranked before
+// pollDesc: cancel takes a descriptor lock while holding it.
+var logosWaitersLock mutex
+
+func init() {
+	lockInit(&logosWaitersLock, lockRankLogosWaiters)
+}
+
 // logosSlotLimit is the largest slot a goroutine tag can hold.
 const logosSlotLimit = 1<<32 - 1
 

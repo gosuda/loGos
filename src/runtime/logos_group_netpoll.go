@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build unix || (js && wasm) || wasip1 || windows
+
 package runtime
 
 import (
@@ -45,20 +47,9 @@ type logosWaiter struct {
 }
 
 var (
-	logosWaitersLock mutex
 	logosWaiters     []logosWaiter
 	logosWaiterCount uint32
 )
-
-// init ranks the registry lock before any group goroutine can run. The
-// lock ranks before pollDesc: logosCancelGroup takes a descriptor lock
-// while holding it, and registering appends (allocates) under it, which
-// the chain from pollDesc to the scheduler and MALLOC permits. No other
-// runtime lock is held when a group waiter registers, releases, or
-// cancels, or when a group slot is taken or freed.
-func init() {
-	lockInit(&logosWaitersLock, lockRankLogosWaiters)
-}
 
 // logosWaitersSync publishes the registry length for the lock-free idle
 // check of logosPollPurge. Callers hold logosWaitersLock.
@@ -155,7 +146,7 @@ func logosPollPurge(pd *pollDesc) {
 	}
 	logosWaiters = logosWaiters[:last]
 	logosWaitersSync()
-	atomic.And32(&pd.logosCancel, 0)
+	atomic.Store(&pd.logosCancel, 0)
 	unlock(&logosWaitersLock)
 }
 
