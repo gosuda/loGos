@@ -791,14 +791,34 @@ func (i *importer) hardImportPackages() error {
 // logosPinnedAnalyzers is the analyzer selection cmd/go drives per package:
 // exactly the analyzers whose nogo:: findings the script suite pins
 // (printf, SA4000, SA5001, checkescape, checkconst, checkimports,
-// checklocks). The full registry stays intact for the -list census,
-// TemplateFuncs rendering, and Bundle flows; only the per-package lint
-// path narrows. Narrowing only removes findings, so expectations asserting
-// absence or exact counts can only improve, while scripts asserting the
-// pinned rules are unaffected. In particular SA5007 (infinite recursion)
-// and ST1000 (package comments) stay out: the native compiler lints
-// already report those shapes under their own rule IDs, and the helper
-// copies broke every exact-count expectation they touched.
+// checklocks, plus the ported vet passes below). The full registry stays
+// intact for the -list census, TemplateFuncs rendering, and Bundle flows;
+// only the per-package lint path narrows. Narrowing removes findings
+// relative to the full registry; widening the pinned set adds them, so a
+// new pin must land together with its exact-list fixture and script
+// expectation updates. In particular
+// SA5007 (infinite recursion) and ST1000 (package comments) stay out: the
+// native compiler lints already report those shapes under their own rule
+// IDs, and the helper copies broke every exact-count expectation they
+// touched.
+//
+// Deliberately unpinned from the ported vet set (vetpasses_parity_test.go),
+// with reason:
+//   - nilness: SSA-based; driver panics surface as error findings.
+//   - arg: names no analyzer in the vendored tree (or upstream); there is
+//     no source to pin.
+//   - cgocall: the importer force-disables cgo, so it cannot fire.
+//   - ctrlflow: reports no diagnostics by itself (CFG provider only; still
+//     pulled in through Requires where needed).
+//   - tests: fires only on _test.go files, which the per-package lint path
+//     never passes (cmd/go passes only p.GoFiles, or ejected Go).
+// The remaining stdlib-keyed passes (atomic, errorsas, httpresponse,
+// lostcancel, unmarshal) stay pinned: the driver resolves real export data
+// and GOROOT archives (findStdPkg), so a lint user importing the real
+// standard library triggers the same shapes the parity fixtures pin with
+// source-only packages; printf already proved the pattern for fmt. No
+// ported pass proved to fire only on a stdlib-import shape a lint user
+// cannot trigger.
 var logosPinnedAnalyzers = map[string]bool{
 	"printf":       true,
 	"SA4000":       true,
@@ -807,6 +827,26 @@ var logosPinnedAnalyzers = map[string]bool{
 	"checkconst":   true,
 	"checkimports": true,
 	"checklocks":   true,
+	// Ported vet passes: syntax/types shapes a lint user triggers directly.
+	"assign":        true,
+	"atomic":        true,
+	"bools":         true,
+	"buildtag":      true,
+	"composites":    true,
+	"copylocks":     true,
+	"errorsas":      true,
+	"httpresponse":  true,
+	"loopclosure":   true,
+	"lostcancel":    true,
+	"nilfunc":       true,
+	"shift":         true,
+	"stdmethods":    true,
+	"stringintconv": true,
+	"structtag":     true,
+	"unmarshal":     true,
+	"unreachable":   true,
+	"unsafeptr":     true,
+	"unusedresult":  true,
 }
 
 // logosNarrowAnalyzers returns the pinned selection with its transitive

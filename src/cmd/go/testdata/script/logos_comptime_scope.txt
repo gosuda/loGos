@@ -12,7 +12,8 @@ logos build -o $WORK/bin/scope$GOEXE .
 exec $WORK/bin/scope$GOEXE
 stdout '^2 \[X Y\] 7$'
 
-logos lint ./...
+! logos lint ./...
+stderr 'main\.lgo:24:2: \[nogo::unreachable\] unreachable code'
 
 -- go.mod --
 module example.com/scope

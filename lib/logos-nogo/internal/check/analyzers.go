@@ -31,6 +31,7 @@ import (
 	"golang.org/x/tools/go/analysis/passes/cgocall"
 	"golang.org/x/tools/go/analysis/passes/composite"
 	"golang.org/x/tools/go/analysis/passes/copylock"
+	"golang.org/x/tools/go/analysis/passes/ctrlflow"
 	"golang.org/x/tools/go/analysis/passes/errorsas"
 	"golang.org/x/tools/go/analysis/passes/httpresponse"
 	"golang.org/x/tools/go/analysis/passes/loopclosure"
@@ -181,6 +182,7 @@ func init() {
 	register(allAnalyzers, &plainAnalyzer{cgocall.Analyzer})
 	register(allAnalyzers, &plainAnalyzer{composite.Analyzer})
 	register(allAnalyzers, &plainAnalyzer{copylock.Analyzer})
+	register(allAnalyzers, &plainAnalyzer{ctrlflow.Analyzer})
 	register(allAnalyzers, &plainAnalyzer{errorsas.Analyzer})
 	register(allAnalyzers, &plainAnalyzer{httpresponse.Analyzer})
 	register(allAnalyzers, &plainAnalyzer{loopclosure.Analyzer})

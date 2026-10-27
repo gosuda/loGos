@@ -1200,7 +1200,13 @@ func run(pass *analysis.Pass, binary io.Reader) (any, error) {
 		physStart := pass.Fset.PositionFor(syntax.Pos(), false)
 		physEnd := pass.Fset.PositionFor(syntax.End(), false)
 		file := pass.Fset.File(syntax.Pos())
-		if file == nil || physStart.Filename != file.Name() || physStart.Filename != physEnd.Filename || start.Line == 0 || end.Line < start.Line || end.Line > file.LineCount() {
+		// Bounds check in physical coordinates: start/end are
+		// //line-adjusted (original .lgo lines in ejected output) while
+		// File.LineCount/LineStart are physical ejected lines. Mixing them
+		// rejects valid functions whenever lowering shortens the file
+		// (pruned const-if/const-switch branches) or a user //line pushes
+		// adjusted lines past the physical count.
+		if file == nil || physStart.Filename != file.Name() || physStart.Filename != physEnd.Filename || physStart.Line == 0 || physEnd.Line < physStart.Line || physEnd.Line > file.LineCount() {
 			return nil
 		}
 		// A closure is analyzed as its own SSA function. Do not borrow calls
