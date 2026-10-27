@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.greenteagc && (!js || !wasm)
+//go:build goexperiment.greenteagc && !wasm
 
 package runtime_test
 
@@ -309,8 +309,8 @@ func spanDeckGarbage(n int) []weak.Pointer[spanDeckNode] {
 }
 
 // Whole collections keep every reachable object and free the unreachable
-// ones; in the deck build the deck itself reports that it ran and that no
-// pop broke the order inside a sweep.
+// ones; in the default deck build the deck itself reports that it ran and
+// that no pop broke the order inside a sweep.
 func TestLogosSpanDeckCollectsWithTheDeckSelected(t *testing.T) {
 	const live, dead = 40000, 4000
 	liveWeak := make([]weak.Pointer[spanDeckNode], live)
@@ -369,7 +369,7 @@ func TestLogosSpanDeckCollectsWithTheDeckSelected(t *testing.T) {
 
 // A heap of half a million small records, wired in allocation order with
 // random long edges, survives four collections: every edge is intact, and in
-// the deck build the deck popped spans without breaking its order.
+// the default deck build the deck popped spans without breaking its order.
 func TestLogosSpanDeckLargeHeapKeepsEveryEdge(t *testing.T) {
 	recs := spanOrderHeap(1 << 19)
 	near, far := spanOrderSnapshot(recs)

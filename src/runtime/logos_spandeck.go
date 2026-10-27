@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.greenteagc && (!js || !wasm)
+//go:build goexperiment.greenteagc && !wasm
 
 package runtime
 
@@ -27,8 +27,9 @@ import (
 // descending order: spilling takes the highest spans, which are the last ones
 // the owner would reach, and a pop removes the entry just above the cursor.
 //
-// The setting is a compile-time invariant. It is on only when the build sets
-// GOEXPERIMENT=logosspandeck; there is no runtime toggle.
+// The setting is a compile-time invariant. It is on in every GreenTea build
+// except wasm, which uses the stub; GOEXPERIMENT=nologosspandeck keeps the
+// FIFO comparison path. There is no runtime toggle.
 const logosSpanDeckOn = goexperiment.LogosSpanDeck
 
 // logosSpanPrefetchDepth is how many pointer targets the scan prefetches
