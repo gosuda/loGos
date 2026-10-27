@@ -190,6 +190,24 @@ type Config struct {
 	// Nil for the first user-source check and for plain Go checks.
 	LogosOwnedTypes map[syntax.Expr]LogosOwnedType
 
+	// LogosProvenReadonly carries sealed Good/Pure proofs by stable name
+	// (pkgPath\x00T.M|(*T).M|func) from THAT first check to the lowered
+	// recheck and any further rechecks of the same package in THIS
+	// checkFiles invocation. Explicit invocation ownership: the producer
+	// Config that logosRecheckHook receives holds the fresh map built
+	// from THAT first-checked package; the irgen driver captures THAT
+	// map into its invocation-local carry and passes it to each later
+	// Config of the same package so the final package keeps unqueried
+	// proofs for the Writer. No global handoff, no cache. Nil during
+	// the first check, so the first check proves from bodies only;
+	// populated post-first-check before lowering, honored only for
+	// unavailable/skipped bodies during rechecks, plus a package-wide
+	// after-check stamp onto each rechecked package before the Writer.
+	// Never holds generic instances (Origin!=fn never collects/honors).
+	// On no-recheck, error, or any other package the carry stays nil
+	// and grants no fallback authority; only recheck passes stamp.
+	LogosProvenReadonly map[string]bool
+
 	// If a non-empty ErrorURL format string is provided, it is used
 	// to format an error URL link that is appended to the first line
 	// of an error message. ErrorURL must be a format string containing
@@ -348,6 +366,8 @@ type Info struct {
 	LogosCTFEMaxSteps int                                              // logos M5-S2 hook: step limit for CTFE and copy checkers.
 
 	LogosPlatformRets map[syntax.Pos][]LogosPlatformRet // logos M9-S2 hook: start positions of return operands holding platform pointers that convert to an interface result.
+
+	LogosConstCov map[syntax.Expr]Type // original const-slice arguments mapped to target interface elements
 }
 
 func (info *Info) recordTypes() bool {
