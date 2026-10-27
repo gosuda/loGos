@@ -282,19 +282,14 @@ func (t *toolchain) eject(ctx context.Context, dir string, ov *overlay, targets 
 	return err
 }
 
-// executableDirFlag returns the -o flag that sends executables to bin when
-// the build would write one. A build of a single main package writes its
-// executable into the current directory, the user's package directory;
-// every other build writes none. The directory form of -o is an error when
-// no main package is built, so the flag is given for that case alone.
-func executableDirFlag(targets []pkgInfo, bin string) ([]string, error) {
+// executableDirFlag prevents a single-main eject build from writing an
+// executable into the user's package directory. The null device also keeps
+// the build on the ordinary path that emits lowering sidecars.
+func executableDirFlag(targets []pkgInfo, _ string) ([]string, error) {
 	if len(targets) != 1 || targets[0].name != "main" {
 		return nil, nil
 	}
-	if err := os.MkdirAll(bin, 0o777); err != nil {
-		return nil, err
-	}
-	return []string{"-o", bin + string(filepath.Separator)}, nil
+	return []string{"-o", os.DevNull}, nil
 }
 
 // collect reads the lowered files of package p into low. A file is

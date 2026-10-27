@@ -355,9 +355,8 @@ func TestHintsArchLevelsFollowsModuleTargetCPU(t *testing.T) {
 	}
 }
 
-// TestExecutableDirFlag checks when the executable directory is asked for:
-// only for a build of exactly one main package, the one build that writes
-// an executable into the current directory.
+// TestExecutableDirFlag checks that only a single-main build gets an output
+// override, and that the override is the null device.
 func TestExecutableDirFlag(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "bin")
 	lib, app := pkgInfo{importPath: "m/lib", name: "lib"}, pkgInfo{importPath: "m/app", name: "main"}
@@ -379,8 +378,8 @@ func TestExecutableDirFlag(t *testing.T) {
 		if got := len(flag) > 0; got != c.want {
 			t.Errorf("%s: flag = %v, want one: %v", c.name, flag, c.want)
 		}
-		if c.want && (len(flag) != 2 || flag[0] != "-o" || flag[1] != bin+string(filepath.Separator)) {
-			t.Errorf("%s: flag = %v, want -o %s/", c.name, flag, bin)
+		if c.want && (len(flag) != 2 || flag[0] != "-o" || flag[1] != os.DevNull) {
+			t.Errorf("%s: flag = %v, want -o %s", c.name, flag, os.DevNull)
 		}
 	}
 }
