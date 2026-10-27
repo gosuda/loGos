@@ -16,10 +16,12 @@ import (
 // Every stub taking a pointer holds the memory by reference while the
 // thread traps or blocks, so the kernel and C must never see a colored
 // word. Untagging happens at the Go caller, never in asm: the untag is
-// pure arithmetic, nosplit-safe, and allocation-free. P4 pins the
-// by-reference blocks for the call duration; the pin pass covers the
-// conservative frames. Until the Z2-asm wrappers land, the remaining
-// assembly stub rows stay an audited residual.
+// pure arithmetic, nosplit-safe, and allocation-free. Foreign lifetimes
+// are bounded by an entry-time hold publication protocol (zgcForeignHold)
+// synchronized with gcStart's release gate; the pause pass expands the
+// transitive closure across conservative frames. Until the Z2-asm
+// wrappers land, the remaining assembly stub rows stay an audited
+// residual.
 
 //go:nosplit
 //go:nowritebarrierrec
@@ -144,4 +146,168 @@ func zgcBoundaryWrappersLanded() bool {
 // gcStart rewrite when checkmark debugging is on.
 func zgcWalkAllLiveForCheck() {
 	logosWalkAllWith(zgcVerifySlot, logosWalkPolicy{skipSpan: zgcSpanQuarantined, useAllocBits: true})
+}
+
+// Bounded foreign hold protocol.
+//
+// Holds protect heap storage referenced by foreign code (cgo, syscalls,
+// and raw syscalls) across concurrent GC cycles and pause-driven release.
+// Publication occurs at entry before entering foreign execution; exit
+// clears the hold upon return. Bounded capacity prevents runaway growth,
+// and overflow fails closed rather than running untracked.
+
+const zgcMaxForeignHolds = 256
+
+type zgcForeignHoldSlot struct {
+	gp     atomic.Uintptr // *g address of holder, or 0 if free
+	root   atomic.Uintptr // direct foreign argument root, canonicalized
+	depth  atomic.Uint32  // nesting depth for reentrant foreign calls
+	epoch  atomic.Uint32  // remap epoch at entry
+	active atomic.Uint32  // 1 when hold is fully published, 0 otherwise
+}
+
+var (
+	zgcForeignHoldSlots [zgcMaxForeignHolds]zgcForeignHoldSlot
+	zgcForeignHoldCount atomic.Int32
+)
+
+// logosZgcForeignArg canonicalizes and untags a pointer crossing a foreign
+// boundary, ensuring that if the argument names an object on a relocated
+// page, the foreign caller receives the canonical to-space copy address.
+//
+//go:nosplit
+//go:nowritebarrierrec
+func logosZgcForeignArg(p unsafe.Pointer) unsafe.Pointer {
+	if p == nil {
+		return nil
+	}
+	return unsafe.Pointer(zgcCanonical(uintptr(p)))
+}
+
+// logosZgcForeignHoldEnter publishes a hold for gp before entering foreign
+// execution. If root is non-zero, it names an argument passed across the
+// boundary, which is canonicalized before recording.
+//
+// Reentrant calls on the same gp increment depth. Nosplit-safe and allocation-free.
+//
+//go:nosplit
+func logosZgcForeignHoldEnter(gp *g, root uintptr) int {
+	if gp == nil {
+		return -1
+	}
+	canonicalRoot := uintptr(0)
+	if root != 0 {
+		canonicalRoot = zgcCanonical(root)
+	}
+	gVal := uintptr(unsafe.Pointer(gp))
+	// 1. Nested call on the same goroutine.
+	for i := range zgcForeignHoldSlots {
+		slot := &zgcForeignHoldSlots[i]
+		if slot.gp.Load() == gVal && slot.active.Load() != 0 {
+			slot.depth.Add(1)
+			if canonicalRoot != 0 && slot.root.Load() == 0 {
+				slot.root.Store(canonicalRoot)
+			}
+			return i
+		}
+	}
+	// 2. Claim empty slot. Claim gp ownership, write payload, then publish active=1.
+	for i := range zgcForeignHoldSlots {
+		slot := &zgcForeignHoldSlots[i]
+		if slot.gp.Load() == 0 && slot.active.Load() == 0 {
+			if slot.gp.CompareAndSwap(0, gVal) {
+				slot.root.Store(canonicalRoot)
+				slot.epoch.Store(zgcRemapEpoch.Load())
+				slot.depth.Store(1)
+				slot.active.Store(1)
+				zgcForeignHoldCount.Add(1)
+				return i
+			}
+		}
+	}
+	// 3. Overflow: fail closed. Never allow an untracked foreign entry.
+	throw("logos zgc: foreign hold table overflow")
+	return -1
+}
+
+// logosZgcForeignHoldExit releases one hold level for gp upon return from
+// foreign execution. Clears the slot when depth reaches zero.
+//
+//go:nosplit
+func logosZgcForeignHoldExit(gp *g) {
+	if gp == nil {
+		return
+	}
+	gVal := uintptr(unsafe.Pointer(gp))
+	for i := range zgcForeignHoldSlots {
+		slot := &zgcForeignHoldSlots[i]
+		if slot.gp.Load() == gVal && slot.active.Load() != 0 {
+			d := slot.depth.Add(-1)
+			if d == 0 {
+				slot.active.Store(0)
+				slot.root.Store(0)
+				slot.epoch.Store(0)
+				zgcForeignHoldCount.Add(-1)
+				slot.gp.Store(0)
+			}
+			return
+		}
+	}
+}
+
+// logosZgcForeignHoldDepth returns the nesting depth of gp's active hold.
+//
+//go:nosplit
+func logosZgcForeignHoldDepth(gp *g) uint32 {
+	if gp == nil {
+		return 0
+	}
+	gVal := uintptr(unsafe.Pointer(gp))
+	for i := range zgcForeignHoldSlots {
+		slot := &zgcForeignHoldSlots[i]
+		if slot.gp.Load() == gVal && slot.active.Load() != 0 {
+			return slot.depth.Load()
+		}
+	}
+	return 0
+}
+
+// zgcPageHasActiveHold reports whether pg is retained by the foreign closure
+// or directly addressed by any active foreign hold root. It consults both
+// the legacy bounded-hold closure (populated by the entry hooks preserved
+// below until emission migration) and the new-registry exact page pin set,
+// so pages exposed through either path stay unreleased.
+//
+// The new-registry consult always uses the locking form, so it is exact
+// both inside a pause (the cycle caller) and with the world running (the
+// test export), and it needs no world-state probe, which does not exist
+// in builds without static lock ranking. Gate sections on both sides are
+// short and never block, matching the quarantine and page leaf locks the
+// pauses already share with world-running paths.
+func zgcPageHasActiveHold(pg *zgcPage) bool {
+	if wi, bit, ok := zgcForeignPageBit(pg.start); ok {
+		if zgcForeignVisited != nil && zgcForeignVisited[wi]&bit != 0 {
+			return true
+		}
+	}
+	if zgcForeignPagePinned(pg.start) {
+		return true
+	}
+	if zgcForeignHoldCount.Load() == 0 {
+		return false
+	}
+	for i := range zgcForeignHoldSlots {
+		slot := &zgcForeignHoldSlots[i]
+		if slot.active.Load() == 0 {
+			continue
+		}
+		if slot.depth.Load() == 0 {
+			continue
+		}
+		root := slot.root.Load()
+		if root != 0 && root >= pg.start && root < pg.start+pg.size {
+			return true
+		}
+	}
+	return false
 }
