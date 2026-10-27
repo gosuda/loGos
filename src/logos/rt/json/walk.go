@@ -26,7 +26,9 @@ import (
 // Value encoding reuses the package helpers (AppendEscaped,
 // AppendQuoted, EscapedLen, QuotedLen, AppendInt, AppendUint,
 // AppendFloat, FloatErr) so no escaping or number rule is duplicated
-// here. Only field selection (which fields a struct value exposes) is
+// here; json.Number, whose literal rules belong to the reflective
+// encoder, is delegated to MarshalField on the Number itself. Only
+// field selection (which fields a struct value exposes) is
 // ported in walkfields.go, because no helper provides it: it follows the
 // encoding/json DefaultOptionsV1 rules for method-free values. Values
 // with JSON methods are never walked: exact dynamic types in the root's
@@ -209,16 +211,8 @@ func (s *Walk) appendValue(buf []byte, rv reflect.Value) ([]byte, error) {
 		return append(buf, "null"...), nil
 	}
 	t := rv.Type()
-	// Honour JSON methods, except exact generated-side types in Gen,
-	// which are walked reflectively with shared state. Pointer-receiver
-	// methods apply only to addressable values, matching the reflective
-	// condAddrEncoder rule.
-	if !s.inGen(t) && hasJSONMethod(rv) {
-		b, err := MarshalField(addrWalkInterface(rv))
-		if err != nil {
-			return buf, err
-		}
-		return append(buf, b...), nil
+	if s.honorsJSONMethod(rv) {
+		return appendHonored(buf, rv)
 	}
 	switch rv.Kind() {
 	case reflect.Interface:
@@ -253,6 +247,9 @@ func (s *Walk) appendValue(buf []byte, rv reflect.Value) ([]byte, error) {
 		}
 		return AppendFloat(buf, f, bits), nil
 	case reflect.String:
+		if t == numberType {
+			return appendNumber(buf, rv)
+		}
 		buf = append(buf, '"')
 		buf = AppendEscaped(buf, rv.String())
 		return append(buf, '"'), nil
@@ -327,11 +324,65 @@ func (s *Walk) appendValue(buf []byte, rv reflect.Value) ([]byte, error) {
 	return buf, &stdjson.UnsupportedTypeError{Type: t}
 }
 
+// numberType is the exact encoding/json.Number type. Like the
+// reflective encoders, number handling is keyed on type identity, not
+// on the string kind: an alias of Number is Number, while a defined
+// type whose underlying type is Number is an ordinary string.
+var numberType = reflect.TypeFor[stdjson.Number]()
+
+// numberBody encodes rv, a value of exactly type json.Number, through
+// MarshalField on the Number itself. The bytes and the error come from
+// the real reflective encoder, so the empty-to-0 rule, the number
+// grammar, and the error value and type of the active mode are never
+// restated here.
+func numberBody(rv reflect.Value) ([]byte, error) {
+	return MarshalField(stdjson.Number(rv.String()))
+}
+
+// appendNumber encodes a json.Number as a bare JSON number.
+func appendNumber(buf []byte, rv reflect.Value) ([]byte, error) {
+	b, err := numberBody(rv)
+	if err != nil {
+		return buf, err
+	}
+	return append(buf, b...), nil
+}
+
+// appendQuotedNumber encodes a json.Number under the `string` option.
+// A valid literal is a complete JSON number token, so the option quotes
+// it by wrapping the bytes numberBody returned.
+func appendQuotedNumber(buf []byte, rv reflect.Value) ([]byte, error) {
+	b, err := numberBody(rv)
+	if err != nil {
+		return buf, err
+	}
+	buf = append(buf, '"')
+	buf = append(buf, b...)
+	return append(buf, '"'), nil
+}
+
 // appendStringOptionValue encodes a scalar field carrying the `string`
 // struct-tag option: the value body inside JSON quotes. Only scalar
-// kinds reach here; the field listing sets the option on those kinds
-// alone, matching the reflective encoder.
+// kinds reach here, optionally behind one unnamed pointer; the field
+// listing sets the option on those kinds alone, matching the
+// reflective encoder. A honoured MarshalJSON or MarshalText method
+// takes precedence over the option and ignores it, exactly as the
+// reflective method encoders do, so it is dispatched before the kind
+// switch and also covers a nil or non-nil pointer to a method type.
+// The one exception, under the option only, is exact json.Number and
+// non-nil *json.Number: they are quoted before the method check, because
+// under goexperiment.jsonv2 Number implements MarshalJSONTo, which would
+// emit the literal unquoted. Every other honoured method keeps precedence.
 func (s *Walk) appendStringOptionValue(buf []byte, rv reflect.Value) ([]byte, error) {
+	if rv.Type() == numberType {
+		return appendQuotedNumber(buf, rv)
+	}
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Type().Elem() == numberType {
+		return appendQuotedNumber(buf, rv.Elem())
+	}
+	if s.honorsJSONMethod(rv) {
+		return appendHonored(buf, rv)
+	}
 	if rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
 			return append(buf, "null"...), nil
@@ -369,23 +420,44 @@ func (s *Walk) appendStringOptionValue(buf []byte, rv reflect.Value) ([]byte, er
 	return s.appendValue(buf, rv)
 }
 
-// addrWalkInterface boxes rv for the honour branch in the reflective
-// newTypeEncoder order: value Marshaler, address-only Marshaler, value
-// TextMarshaler, address-only TextMarshaler, then the plain value.
+// honorsJSONMethod reports whether the walk hands rv to its JSON method
+// instead of walking it: the reflective encoder would honour a method
+// on rv's type (see hasJSONMethod), and the exact type is not
+// generated-side. Types in Gen are walked reflectively with shared
+// state even though their generated MarshalJSON would be honoured.
+// Shared by appendValue and appendStringOptionValue so both contexts
+// pick the same values.
+func (s *Walk) honorsJSONMethod(rv reflect.Value) bool {
+	return !s.inGen(rv.Type()) && hasJSONMethod(rv)
+}
+
+// appendHonored encodes rv, a value honorsJSONMethod accepted, through
+// MarshalField, which starts a fresh encoding exactly like the upstream
+// honoured-method branch: a nil pointer encodes null, a method error is
+// returned as the encoder reports it, and the `string` option never
+// applies.
+func appendHonored(buf []byte, rv reflect.Value) ([]byte, error) {
+	b, err := MarshalField(addrWalkInterface(rv))
+	if err != nil {
+		return buf, err
+	}
+	return append(buf, b...), nil
+}
+
+// addrWalkInterface boxes rv for the honour branch so MarshalField
+// meets the method the reflective encoder would pick: an address-only
+// method is reached through the address of an addressable rv, anything
+// else through the value itself. A value-receiver method is in the
+// method set of both T and *T, so checking the value method before the
+// address-only one selects the same method as the mode-specific method
+// precedence in walkMethodTypes.
 func addrWalkInterface(rv reflect.Value) any {
 	t := rv.Type()
-	if t.Implements(marshalerType) {
-		return rv.Interface()
-	}
-	if rv.Kind() != reflect.Pointer && rv.CanAddr() {
-		pt := reflect.PointerTo(t)
-		if pt.Implements(marshalerType) {
-			return rv.Addr().Interface()
-		}
-		if t.Implements(textMarshalerType) {
+	for _, iface := range walkMethodTypes {
+		if t.Implements(iface) {
 			return rv.Interface()
 		}
-		if pt.Implements(textMarshalerType) {
+		if t.Kind() != reflect.Pointer && rv.CanAddr() && reflect.PointerTo(t).Implements(iface) {
 			return rv.Addr().Interface()
 		}
 	}
@@ -393,23 +465,18 @@ func addrWalkInterface(rv reflect.Value) any {
 }
 
 // hasJSONMethod reports whether the reflective encoder would honour a
-// method on a value of rv's type: a value- or addressable
-// pointer-receiver MarshalJSON, else a value- or addressable
-// pointer-receiver MarshalText. Generated-side types never reach here;
+// method on a value of rv's type, using the mode-specific method
+// precedence in walkMethodTypes. Generated-side types never reach here;
 // the caller filters Gen membership first.
 func hasJSONMethod(rv reflect.Value) bool {
 	t := rv.Type()
-	if t.Implements(marshalerType) {
-		return true
-	}
-	if t.Kind() != reflect.Pointer && rv.CanAddr() && reflect.PointerTo(t).Implements(marshalerType) {
-		return true
-	}
-	if t.Implements(textMarshalerType) {
-		return true
-	}
-	if t.Kind() != reflect.Pointer && rv.CanAddr() && reflect.PointerTo(t).Implements(textMarshalerType) {
-		return true
+	for _, iface := range walkMethodTypes {
+		if t.Implements(iface) {
+			return true
+		}
+		if t.Kind() != reflect.Pointer && rv.CanAddr() && reflect.PointerTo(t).Implements(iface) {
+			return true
+		}
 	}
 	return false
 }
@@ -418,14 +485,20 @@ func hasJSONMethod(rv reflect.Value) bool {
 // barred because the element type carries a JSON method, matching
 // newSliceEncoder.
 func sliceElemHasJSONMethod(elem reflect.Type) bool {
-	if elem.Implements(marshalerType) || elem.Implements(textMarshalerType) {
-		return true
+	for _, iface := range walkMethodTypes {
+		if elem.Implements(iface) {
+			return true
+		}
+		if reflect.PointerTo(elem).Implements(iface) {
+			return true
+		}
 	}
-	return reflect.PointerTo(elem).Implements(marshalerType) || reflect.PointerTo(elem).Implements(textMarshalerType)
+	return false
 }
 
 var (
 	marshalerType     = reflect.TypeFor[stdjson.Marshaler]()
+	textAppenderType  = reflect.TypeFor[encoding.TextAppender]()
 	textMarshalerType = reflect.TypeFor[encoding.TextMarshaler]()
 )
 
