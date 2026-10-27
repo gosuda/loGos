@@ -65,6 +65,16 @@ func (e *evaluator) step(pos syntax.Pos) error {
 	return nil
 }
 
+// chargeSteps bills n steps against MaxSteps without the live-size scan that
+// step runs. A bulk host copy uses it and bounds its own bytes as it goes.
+func (e *evaluator) chargeSteps(n int, pos syntax.Pos) error {
+	e.steps += n
+	if e.steps > e.cfg.MaxSteps {
+		return &Error{Code: CodeStepLimit, Pos: pos}
+	}
+	return nil
+}
+
 // impurity reports a purity-class violation: silent inside a const
 // func body (the static check reports it), a CodeEval error elsewhere.
 func (e *evaluator) impurity(fr *frame, pos syntax.Pos, format string, args ...any) *Error {
@@ -143,6 +153,10 @@ func (e *evaluator) execStmt(fr *frame, s syntax.Stmt) (flow, error) {
 		}
 		return f, nil
 	case *syntax.ExprStmt:
+		if call, ok := syntax.Unparen(s.X).(*syntax.CallExpr); ok {
+			_, _, err := e.evalCallMulti(fr, call)
+			return flow{}, err
+		}
 		_, err := e.evalExpr(fr, s.X)
 		return flow{}, err
 	case *syntax.SendStmt:

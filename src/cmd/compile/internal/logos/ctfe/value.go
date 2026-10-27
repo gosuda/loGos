@@ -143,43 +143,201 @@ func copyValue(v Value) Value {
 	return v
 }
 
-// copyArg returns a deep copy of a call argument. A const func writes
-// through its parameters, and a map or slice argument can carry a recorded
-// const's value, so the callee must not reach the caller's storage (SPEC
-// T-201, T-Sec9). Arrays, structs, slice backings, and map entries copy
-// recursively.
-func copyArg(v Value) Value {
+// storeKey identifies one []Value storage by its first element and length.
+// Array and struct storage and slice backings are all []Value, so a slice
+// cut from an array shares a key with the array it views. Every slice view
+// in this package (reslice, array slice, append, make) carries its window in
+// the header (lo, length, cap_ against the whole backing), so overlapping
+// views always share one storage and this key finds it. Two []Value that are
+// different sub-ranges of one Go array are not recognized as overlapping; no
+// producer here builds them.
+type storeKey struct {
+	first *Value
+	n     int
+}
+
+// hostCopy copies one value graph read from the host into evaluator-owned
+// storage. Isolation lives here, at ingress, because a const func writes
+// through whatever it can reach and a recorded const's storage must not be
+// reachable (SPEC T-201, T-Sec9: a const composite materializes as a copy,
+// and writes to it do not change later reads). Shape survives inside the
+// graph: shared backings, slices cut from an array, shared maps, and cycles
+// keep their aliasing because each storage is registered before its
+// elements are visited. Arrays and structs copy by value; slice headers copy
+// per occurrence. Value.constant selects arithmetic mode, not ownership, so
+// it stays as the host set it.
+//
+// The copy is billed against the existing budgets. Slots and payload bytes
+// are each held to MaxValueBytes as the copy proceeds: the slots of a
+// storage (its whole backing, capacity tail included, which valueSize never
+// counts) are charged before the storage is allocated, the element-count
+// bound make and append already use, and every leaf pays its valueSize. A
+// storage reached twice is billed once. Each distinct copied container
+// (storage or map) also costs one step of MaxSteps.
+type hostCopy struct {
+	e        *evaluator
+	pos      syntax.Pos
+	slots    int64
+	bytes    int64
+	stores   map[storeKey][]Value
+	backings map[*[]Value]*[]Value
+	maps     map[*mapVal]*mapVal
+}
+
+// charge bills slots of storage about to be allocated and payload bytes of
+// leaves against MaxValueBytes.
+func (c *hostCopy) charge(slots int, payload int64) error {
+	c.slots += int64(slots)
+	c.bytes += payload
+	limit := c.e.cfg.MaxValueBytes
+	if c.slots > limit {
+		return &Error{Code: CodeTooLarge, Detail: fmt.Sprintf("copy of %d elements over %d byte limit", c.slots, limit), Pos: c.pos}
+	}
+	if c.bytes > limit {
+		return &Error{Code: CodeTooLarge, Detail: fmt.Sprintf("%d bytes over %d byte limit", c.bytes, limit), Pos: c.pos}
+	}
+	return nil
+}
+
+func (c *hostCopy) value(v Value) (Value, error) {
 	switch {
 	case v.array != nil:
-		out := make([]Value, len(v.array))
-		for i, e := range v.array {
-			out[i] = copyArg(e)
+		s, err := c.store(v.array)
+		if err != nil {
+			return Value{}, err
 		}
-		v.array = out
+		v.array = s
 	case v.strct != nil:
-		out := make([]Value, len(v.strct))
-		for i, e := range v.strct {
-			out[i] = copyArg(e)
+		s, err := c.store(v.strct)
+		if err != nil {
+			return Value{}, err
 		}
-		v.strct = out
+		v.strct = s
 	case v.slice != nil:
-		src := *v.slice.backing
-		backing := make([]Value, len(src))
-		for i, e := range src {
-			backing[i] = copyArg(e)
-		}
 		h := *v.slice
-		h.backing = &backing
+		if h.backing != nil {
+			b, err := c.backing(h.backing)
+			if err != nil {
+				return Value{}, err
+			}
+			h.backing = b
+		}
 		v.slice = &h
 	case v.mval != nil:
-		m := &mapVal{keys: make([]Value, len(v.mval.keys)), vals: make([]Value, len(v.mval.vals))}
-		for i := range v.mval.keys {
-			m.keys[i] = copyArg(v.mval.keys[i])
-			m.vals[i] = copyArg(v.mval.vals[i])
+		m, err := c.mapOf(v.mval)
+		if err != nil {
+			return Value{}, err
 		}
 		v.mval = m
+	default:
+		// A leaf pays its payload, sized like valueSize does. That
+		// reads its seen set only for slices and maps, never a leaf.
+		if err := c.charge(0, c.e.valueSize(v, nil)); err != nil {
+			return Value{}, err
+		}
 	}
-	return v
+	return v, nil
+}
+
+// store copies one []Value storage once. Zero-length storage has nothing to
+// write through and is shared.
+func (c *hostCopy) store(src []Value) ([]Value, error) {
+	if len(src) == 0 {
+		return src, nil
+	}
+	key := storeKey{&src[0], len(src)}
+	if dst, ok := c.stores[key]; ok {
+		return dst, nil
+	}
+	if err := c.e.chargeSteps(1, c.pos); err != nil {
+		return nil, err
+	}
+	if err := c.charge(len(src), 0); err != nil {
+		return nil, err
+	}
+	dst := make([]Value, len(src))
+	c.stores[key] = dst
+	for i := range src {
+		v, err := c.value(src[i])
+		if err != nil {
+			return nil, err
+		}
+		dst[i] = v
+	}
+	return dst, nil
+}
+
+// backing copies a slice backing, registering the new pointer first so a
+// slice that reaches its own backing resolves to the copy.
+func (c *hostCopy) backing(src *[]Value) (*[]Value, error) {
+	if dst, ok := c.backings[src]; ok {
+		return dst, nil
+	}
+	dst := new([]Value)
+	c.backings[src] = dst
+	s, err := c.store(*src)
+	if err != nil {
+		return nil, err
+	}
+	*dst = s
+	return dst, nil
+}
+
+func (c *hostCopy) mapOf(src *mapVal) (*mapVal, error) {
+	if dst, ok := c.maps[src]; ok {
+		return dst, nil
+	}
+	if err := c.e.chargeSteps(1, c.pos); err != nil {
+		return nil, err
+	}
+	if err := c.charge(len(src.keys)+len(src.vals), 0); err != nil {
+		return nil, err
+	}
+	dst := &mapVal{keys: make([]Value, len(src.keys)), vals: make([]Value, len(src.vals))}
+	c.maps[src] = dst
+	for i := range src.keys {
+		k, err := c.value(src.keys[i])
+		if err != nil {
+			return nil, err
+		}
+		dst.keys[i] = k
+	}
+	for i := range src.vals {
+		v, err := c.value(src.vals[i])
+		if err != nil {
+			return nil, err
+		}
+		dst.vals[i] = v
+	}
+	return dst, nil
+}
+
+// ingest returns an evaluator-owned copy of a value read from the host. Every
+// read copies afresh, so two reads of one const never alias. The traversal is
+// bounded by hostCopy's charges, and the finished copy must also fit the live
+// value cap together with the frames, the check step applies. A value with no
+// storage (a scalar or a nil slice or map) has nothing to isolate and comes
+// back as read.
+func (e *evaluator) ingest(v Value, pos syntax.Pos) (Value, error) {
+	if v.array == nil && v.strct == nil && v.slice == nil && v.mval == nil {
+		return v, nil
+	}
+	c := &hostCopy{
+		e:        e,
+		pos:      pos,
+		stores:   map[storeKey][]Value{},
+		backings: map[*[]Value]*[]Value{},
+		maps:     map[*mapVal]*mapVal{},
+	}
+	out, err := c.value(v)
+	if err != nil {
+		return Value{}, err
+	}
+	if serr := e.checkSize(out); serr != nil {
+		serr.Pos = pos
+		return Value{}, serr
+	}
+	return out, nil
 }
 
 // resolveType prechecks purity-class type shapes, then delegates to
@@ -746,7 +904,7 @@ func (e *evaluator) evalSelector(fr *frame, sel *syntax.SelectorExpr) (Value, er
 			rent := e.h.ResolveSel(sel)
 			switch rent.Kind {
 			case EntConst:
-				return rent.Const, nil
+				return e.ingest(rent.Const, posOf(sel))
 			case EntPackageVar:
 				return Value{}, e.impurity(fr, posOf(sel), "read of package variable %s in const func", rent.Name)
 			}
@@ -1240,7 +1398,7 @@ func (e *evaluator) evalAppend(fr *frame, c *syntax.CallExpr) (Value, error) {
 	} else if s.slice == nil {
 		return Value{}, e.fail(pos, "append to non-slice in const evaluation")
 	}
-	elems, err := e.evalArgs(fr, &syntax.CallExpr{ArgList: c.ArgList[1:], HasDots: c.HasDots})
+	elems, err := e.evalAppendArgs(fr, &syntax.CallExpr{ArgList: c.ArgList[1:], HasDots: c.HasDots}, s)
 	if err != nil {
 		return Value{}, err
 	}
@@ -1285,6 +1443,37 @@ func (e *evaluator) evalAppend(fr *frame, c *syntax.CallExpr) (Value, error) {
 	copy(backing[length:], elems)
 	s.slice = &sliceVal{backing: &backing, length: need, cap_: newcap}
 	return s, nil
+}
+
+// evalAppendArgs spreads slices and string... only to a []byte destination.
+func (e *evaluator) evalAppendArgs(fr *frame, c *syntax.CallExpr, dst Value) ([]Value, error) {
+	var out []Value
+	for i, a := range c.ArgList {
+		v, err := e.evalExpr(fr, a)
+		if err != nil {
+			return nil, err
+		}
+		if c.HasDots && i == len(c.ArgList)-1 {
+			if v.typ != nil && isStringLike(v.typ.Kind) {
+				if dst.typ == nil || dst.typ.Kind != KSlice || dst.typ.Elem == nil || dst.typ.Elem.Kind != KUint8 {
+					return nil, e.fail(posOf(a), "cannot spread string in const evaluation")
+				}
+				for _, b := range []byte(v.sval) {
+					out = append(out, byteValue(b))
+				}
+				continue
+			}
+			if v.slice == nil && !(v.isNil && v.typ != nil && v.typ.Kind == KSlice) {
+				return nil, e.fail(posOf(a), "cannot spread non-slice in const evaluation")
+			}
+			if v.slice != nil {
+				out = append(out, sliceElems(v)...)
+			}
+			continue
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }
 
 // evalCopy implements copy(dst, src).

@@ -115,6 +115,20 @@ func (e *evaluator) evalName(fr *frame, id *syntax.Name) (Value, error) {
 	if id.Value == "_" {
 		return Value{}, e.fail(posOf(id), "cannot use _ as value in const evaluation")
 	}
+	if v, ok := e.lookup(fr, id.Value); ok {
+		return v, nil
+	}
+	ent := e.h.Resolve(id)
+	switch ent.Kind {
+	case EntConst:
+		return e.ingest(ent.Const, posOf(id))
+	case EntPackageVar:
+		return Value{}, e.impurity(fr, posOf(id), "read of package variable %s in const func", ent.Name)
+	case EntImport:
+		return Value{}, e.impurity(fr, posOf(id), "use of imported %s in const func", ent.Name)
+	case EntBuiltin, EntConstFunc, EntPlainFunc:
+		return Value{}, e.fail(posOf(id), "function %s used as value in const evaluation", id.Value)
+	}
 	switch id.Value {
 	case "nil":
 		return Value{isNil: true, typ: &Type{Kind: KUntypedNil}}, nil
@@ -122,20 +136,6 @@ func (e *evaluator) evalName(fr *frame, id *syntax.Name) (Value, error) {
 		return Value{typ: UntypedBool(), constant: true, bval: true}, nil
 	case "false":
 		return Value{typ: UntypedBool(), constant: true, bval: false}, nil
-	}
-	if v, ok := e.lookup(fr, id.Value); ok {
-		return v, nil
-	}
-	ent := e.h.Resolve(id)
-	switch ent.Kind {
-	case EntConst:
-		return ent.Const, nil
-	case EntPackageVar:
-		return Value{}, e.impurity(fr, posOf(id), "read of package variable %s in const func", ent.Name)
-	case EntImport:
-		return Value{}, e.impurity(fr, posOf(id), "use of imported %s in const func", ent.Name)
-	case EntBuiltin, EntConstFunc, EntPlainFunc:
-		return Value{}, e.fail(posOf(id), "function %s used as value in const evaluation", id.Value)
 	}
 	return Value{}, e.fail(posOf(id), "cannot resolve %s in const evaluation", id.Value)
 }

@@ -86,7 +86,7 @@ func (e *evaluator) evalUserCall(fr *frame, fn *Func, c *syntax.CallExpr) ([]Val
 	if fn.Body == nil {
 		return nil, false, e.fail(posOf(c), "call to function %s without body in const evaluation", fn.Name)
 	}
-	args, err := e.evalArgs(fr, c)
+	args, spread, err := e.evalCallArgs(fr, c)
 	if err != nil {
 		return nil, false, err
 	}
@@ -103,13 +103,17 @@ func (e *evaluator) evalUserCall(fr *frame, fn *Func, c *syntax.CallExpr) ([]Val
 	defer func() { e.frames = e.frames[:len(e.frames)-1] }()
 	for i, p := range params {
 		if fn.Variadic && i == len(params)-1 {
+			if spread != nil && len(c.ArgList) == len(params) {
+				e.declare(nfr, p.Decl.Value, withVar(copyValue(*spread)))
+				break
+			}
 			var elemT *Type
 			if p.Type != nil && p.Type.Kind == KSlice {
 				elemT = p.Type.Elem
 			}
 			elems := make([]Value, 0, len(args)-i)
 			for _, a := range args[i:] {
-				v := copyArg(a)
+				v := a
 				if elemT != nil {
 					var err error
 					v, err = e.convert(v, elemT, posOf(c))
@@ -122,7 +126,7 @@ func (e *evaluator) evalUserCall(fr *frame, fn *Func, c *syntax.CallExpr) ([]Val
 			e.declare(nfr, p.Decl.Value, sliceValue(elemT, elems, len(elems)))
 			break
 		}
-		v := copyArg(args[i])
+		v := copyValue(args[i])
 		if p.Type != nil {
 			if v, err = e.convert(v, p.Type, posOf(c)); err != nil {
 				return nil, false, err
@@ -167,31 +171,31 @@ func (e *evaluator) evalUserCall(fr *frame, fn *Func, c *syntax.CallExpr) ([]Val
 	return f.values, len(f.values) > 1, nil
 }
 
-// evalArgs evaluates call arguments, spreading a trailing slice or
-// string over ... .
-func (e *evaluator) evalArgs(fr *frame, c *syntax.CallExpr) ([]Value, error) {
+// evalCallArgs spreads only slices; string... is rejected and typed nil binds nil.
+func (e *evaluator) evalCallArgs(fr *frame, c *syntax.CallExpr) ([]Value, *Value, error) {
 	var out []Value
+	var spread *Value
 	for i, a := range c.ArgList {
 		v, err := e.evalExpr(fr, a)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if c.HasDots && i == len(c.ArgList)-1 {
-			if v.typ != nil && v.typ.Kind == KString {
-				for _, r := range []byte(v.sval) {
-					out = append(out, byteValue(r))
-				}
-				continue
+			if v.typ != nil && isStringLike(v.typ.Kind) {
+				return nil, nil, e.fail(posOf(a), "cannot spread string in const evaluation")
 			}
-			if v.slice == nil {
-				return nil, e.fail(posOf(a), "cannot spread non-slice in const evaluation")
+			if v.slice == nil && !(v.isNil && v.typ != nil && v.typ.Kind == KSlice) {
+				return nil, nil, e.fail(posOf(a), "cannot spread non-slice in const evaluation")
 			}
-			out = append(out, sliceElems(v)...)
+			spread = &v
+			if v.slice != nil {
+				out = append(out, sliceElems(v)...)
+			}
 			continue
 		}
 		out = append(out, v)
 	}
-	return out, nil
+	return out, spread, nil
 }
 
 // execFor runs classic, condition-only, infinite, and range loops.

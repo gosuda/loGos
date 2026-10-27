@@ -19,10 +19,12 @@ package ctfe
 //
 // Sharing matches Go: slices alias their backing store (append
 // reallocates exactly when the capacity is exhausted), maps are
-// reference values, and arrays and structs copy on assignment. A const
-// composite mutated through an alias still evaluates correctly,
-// because lowering literalizes the final state and the lowered program
-// re-executes the same pure calls in the same order.
+// reference values, and arrays and structs copy on assignment. A
+// recorded const composite read from the host enters the evaluation as
+// a fresh copy (SPEC T-201, T-Sec9), so a const func that writes through
+// it never reaches the host's stored value and two reads of one const
+// never alias. Values built inside one evaluation keep the sharing
+// above across calls, and f(xs...) binds xs itself.
 
 import (
 	"cmd/compile/internal/syntax"
