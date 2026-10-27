@@ -16,6 +16,12 @@ const (
 	zgcPageShift = 21
 	zgcPageSize  = 1 << zgcPageShift
 
+	// zgcMaxPages bounds every page list: one entry per 2 MB directory
+	// granule, the most registrations the directory CAS can admit.
+	// Lists capped here never grow, so their appends under pause locks
+	// never allocate.
+	zgcMaxPages = 1 << (zgcAddrBits - zgcPageShift)
+
 	// zgcMaxPageBytes bounds the page a forwarding entry can index: the
 	// 21-bit source index counts 8-byte granules.
 	zgcMaxPageBytes = 1 << (21 + zgcGranuleShift)
@@ -30,7 +36,18 @@ const (
 	zgcFwdToMask     = uint64(zgcAddrMask)
 	zgcFwdMinCap     = 8
 	zgcFwdHashMul    = 0x9E3779B97F4A7C15
+
+	// zgcMaxSourceRanges bounds the exact source ranges of one page: in-use
+	// spans are disjoint and each takes at least one runtime page of the
+	// 2 MB region, so the region holds at most this many of them.
+	zgcMaxSourceRanges = zgcPageSize / pageSize
 )
+
+// zgcSourceRange is one maximal run of adjacent quarantined source spans:
+// the bytes [lo, hi) belong to the page and to nothing else.
+type zgcSourceRange struct {
+	lo, hi uintptr
+}
 
 // zgcPage is a page metadata header. It and its forwarding table share one
 // off-heap mapping that is separate from the page, so the page can return
@@ -60,6 +77,25 @@ type zgcPage struct {
 	// a later remap pass healed every slot that could still hold a
 	// source address (zgcRetirePage).
 	releaseEpoch uint32
+
+	// Source ownership. A selected heap page owns only its quarantined
+	// source spans, never the 2 MB region around them: the region may
+	// also hold free pages, goroutine stacks and other manual spans, and
+	// objects the mutator allocates after selection. srcN sorted,
+	// disjoint, non-adjacent ranges live at src, in this page's own
+	// metadata mapping. prepareSources writes them once, in the
+	// selection pause before any to-space is reserved, and they never
+	// change until zgcFreePage, so every reader (barrier, pin,
+	// relocation commit under the foreign gate, release, identity
+	// forget) reads them without a lock and without allocating. A page
+	// starts with its whole region as the one range (a synthetic
+	// registration names the memory it was registered over); srcExact
+	// turns true when prepareSources replaces that with the exact
+	// spans, and release refuses a not-exact page whose region holds a
+	// heap arena (zgcReleasePage).
+	src      unsafe.Pointer
+	srcN     uintptr
+	srcExact bool
 }
 
 // zgcRemapEpoch counts completed remap passes: collector passes that
@@ -114,7 +150,8 @@ func zgcAllocPage(start, size, live, nObjects uintptr) *zgcPage {
 	}
 	slots := zgcTableCap(nObjects)
 	hdr := alignUp(unsafe.Sizeof(zgcPage{}), 8)
-	n := alignUp(hdr+slots*8, physPageSize)
+	srcOff := hdr + slots*8
+	n := alignUp(srcOff+zgcMaxSourceRanges*unsafe.Sizeof(zgcSourceRange{}), physPageSize)
 	raw := sysAlloc(n, &memstats.other_sys, "logos zgc page metadata")
 	if raw == nil {
 		throw("zgc: out of memory allocating page metadata")
@@ -124,8 +161,32 @@ func zgcAllocPage(start, size, live, nObjects uintptr) *zgcPage {
 	pg.fwd = add(raw, hdr)
 	pg.fwdMask = slots - 1
 	pg.fwdShift = 64 - uint8(sys.TrailingZeros64(uint64(slots)))
+	pg.src = add(raw, srcOff)
+	// Until prepareSources replaces it, a page resolves its whole
+	// region as one range: a synthetic registration (tests) names the
+	// memory it was registered over, and a heap page is never visible to
+	// a mutator in this state (the selection pause prepares it first).
+	*pg.sourceRangeAt(0) = zgcSourceRange{start, start + size}
+	pg.srcN = 1
 	pg.mapBytes = n
 	return pg
+}
+
+// zgcPagesAppend registers pg in the page directory list. The append
+// never allocates: the list is capped at zgcMaxPages, which registration
+// cannot exceed, so an allocation-triggered collection cannot start while
+// this goroutine holds zgcPagesMu and wait on the pause hook that needs
+// it. Discipline: the holder cannot be async-preempted mid-section
+// (holding a runtime mutex sets m.locks, which the preemption predicate
+// requires to be zero), and the section parks nothing: no channel ops, no
+// nested locks, no syscalls, no allocation.
+func zgcPagesAppend(pg *zgcPage) {
+	lock(&zgcPagesMu)
+	if len(zgcAllPages) == cap(zgcAllPages) {
+		throw("zgc: page registry overflow")
+	}
+	zgcAllPages = append(zgcAllPages, pg)
+	unlock(&zgcPagesMu)
 }
 
 // zgcNewPage returns a registered header for the one-granule page at start,
@@ -141,9 +202,7 @@ func zgcNewPage(start, size, live, nObjects uintptr) *zgcPage {
 		// for it instead.
 		throw("zgc: page registered over a page that is not retired")
 	}
-	lock(&zgcPagesMu)
-	zgcAllPages = append(zgcAllPages, pg)
-	unlock(&zgcPagesMu)
+	zgcPagesAppend(pg)
 	return pg
 }
 
@@ -156,9 +215,14 @@ func zgcFreePage(pg *zgcPage) {
 	if pg.published.Load() != 0 && (pg.released.Load() == 0 || zgcRemapEpoch.Load() == pg.releaseEpoch) {
 		throw("zgc: freeing a relocated page before a remap pass retired it")
 	}
+	if pg.published.Load() != 0 && zgcForeignPagePinnedLocked(pg.start) {
+		throw("zgc: freeing a pinned page with published relocation")
+	}
 	if p := atomic.Loaduintptr(&zgcDirAddr); p != 0 {
 		(*zgcDirectory)(add(nil, p))[pg.start>>zgcPageShift].CompareAndSwap(uintptr(unsafe.Pointer(pg)), 0)
 	}
+	// Discipline: same non-preemptible, allocation-free section as the
+	// append path above (swap-remove only); sysFree runs unlocked below.
 	lock(&zgcPagesMu)
 	for i, q := range zgcAllPages {
 		if q == pg {
@@ -189,13 +253,174 @@ func zgcDirectoryEnsure() *zgcDirectory {
 	return (*zgcDirectory)(add(nil, p))
 }
 
-// zgcPageFor returns the registered page containing addr, or nil.
+// zgcPageFor returns the registered page whose relocation sources contain
+// addr, or nil. The directory is keyed by 2 MB region, but a region may
+// hold more than the page's quarantined source spans (free pages, stacks
+// and other manual spans, objects allocated after selection, the page's
+// own to-space reservation). Those bytes are not relocation sources: no
+// forwarding entry will ever name them, nothing there may be copied,
+// healed through the table, or released, and every caller that asks "is
+// this word on a page that is relocating" must see nil for them. Every
+// resolution path (barrier, remap, pin, attach, identity, foreign
+// admission) goes through this filter, so none needs a membership test of
+// its own.
 func zgcPageFor(addr uintptr) *zgcPage {
 	p := atomic.Loaduintptr(&zgcDirAddr)
 	if p == 0 || addr > zgcAddrMask {
 		return nil
 	}
-	return (*zgcPage)(add(nil, (*zgcDirectory)(add(nil, p))[addr>>zgcPageShift].Load()))
+	v := (*zgcDirectory)(add(nil, p))[addr>>zgcPageShift].Load()
+	if v == 0 {
+		return nil
+	}
+	pg := (*zgcPage)(add(nil, v))
+	if !pg.holdsSource(addr) {
+		return nil
+	}
+	return pg
+}
+
+// sourceRangeAt returns the i-th source range. i < srcN.
+//
+//go:nosplit
+func (pg *zgcPage) sourceRangeAt(i uintptr) *zgcSourceRange {
+	return (*zgcSourceRange)(add(pg.src, i*unsafe.Sizeof(zgcSourceRange{})))
+}
+
+// sourceEnd returns the end of the source range containing addr and
+// reports whether there is one. It reads immutable metadata: no lock, no
+// allocation, safe under the foreign gate and in nosplit code.
+//
+//go:nosplit
+func (pg *zgcPage) sourceEnd(addr uintptr) (uintptr, bool) {
+	lo, hi := uintptr(0), pg.srcN
+	for lo < hi {
+		m := (lo + hi) >> 1
+		if pg.sourceRangeAt(m).hi <= addr {
+			lo = m + 1
+		} else {
+			hi = m
+		}
+	}
+	if lo == pg.srcN {
+		return 0, false
+	}
+	r := pg.sourceRangeAt(lo)
+	if r.lo > addr {
+		return 0, false
+	}
+	return r.hi, true
+}
+
+// holdsSource reports whether addr lies in a source range of pg.
+//
+//go:nosplit
+func (pg *zgcPage) holdsSource(addr uintptr) bool {
+	_, ok := pg.sourceEnd(addr)
+	return ok
+}
+
+// holdsSourceObject reports whether the size bytes from addr lie inside
+// one source range of pg. A copy moves exactly size bytes, so a source that
+// spills out of its range would read, and relocate, memory the page does
+// not own.
+//
+//go:nosplit
+func (pg *zgcPage) holdsSourceObject(addr, size uintptr) bool {
+	end, ok := pg.sourceEnd(addr)
+	return ok && size <= end-addr
+}
+
+// regionHoldsHeapArena reports whether a heap arena covers any byte of the
+// page region [start, start+size). Heap arenas hold every span, goroutine
+// stacks and other manual spans included, so only a region with no arena
+// is wholly owned by whoever registered a page on it. The arena table never
+// shrinks, so a false answer stays false.
+func regionHoldsHeapArena(start, size uintptr) bool {
+	for ai, last := arenaIndex(start), arenaIndex(start+size-1); ai <= last; ai++ {
+		if arenaL1Bits == 0 {
+			if ai.l2() < uint(len(mheap_.arenas[0])) && mheap_.arenas[0][ai.l2()] != nil {
+				return true
+			}
+		} else if ai.l1() < uint(len(mheap_.arenas)) {
+			if l2 := mheap_.arenas[ai.l1()]; l2 != nil && l2[ai.l2()] != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// prepareSources records the bytes of spans, the quarantined source spans
+// of pg, as pg's exact source ownership, and reports whether pg may enter
+// relocation. It runs once per page in the selection pause, before any
+// to-space reservation or quarantine, so the lock-free readers never see
+// the ranges change; it sorts and coalesces in the page's own fixed
+// storage and allocates nothing. A span that is not in use, leaves the
+// region, or overlaps another makes the page ineligible (or, for an
+// overlap, which in-use spans can never do, fatal).
+func (pg *zgcPage) prepareSources(spans []*mspan) bool {
+	if pg.srcExact {
+		return true
+	}
+	// Nothing resolves until the ranges below are complete: a page that
+	// is rejected half-built owns no byte.
+	pg.srcN = 0
+	if len(spans) == 0 {
+		return false
+	}
+	end := pg.start + pg.size
+	rs := (*[zgcMaxSourceRanges]zgcSourceRange)(pg.src)
+	var n uintptr
+	for _, s := range spans {
+		if s == nil || s.state.get() != mSpanInUse {
+			return false
+		}
+		lo, hi := s.base(), s.base()+s.npages*pageSize
+		if lo < pg.start || hi > end || lo >= hi {
+			return false
+		}
+		if n == zgcMaxSourceRanges {
+			throw("zgc: more source spans than runtime pages in the region")
+		}
+		i := n
+		for i > 0 && rs[i-1].lo > lo {
+			rs[i] = rs[i-1]
+			i--
+		}
+		if i > 0 && rs[i-1].hi > lo || i < n && rs[i].lo < hi {
+			throw("zgc: overlapping in-use source spans")
+		}
+		rs[i] = zgcSourceRange{lo, hi}
+		n++
+	}
+	m := uintptr(0)
+	for i := uintptr(0); i < n; i++ {
+		if m > 0 && rs[m-1].hi == rs[i].lo {
+			rs[m-1].hi = rs[i].hi
+		} else {
+			rs[m] = rs[i]
+			m++
+		}
+	}
+	pg.srcN = m
+	pg.srcExact = true
+	return true
+}
+
+// releaseSources returns exactly the page's source ranges to the OS. Each
+// range is shrunk inward to whole system pages: a system page larger than
+// a runtime page would otherwise drag the bytes beside the range, which
+// may be a neighbour's, with it. Nothing outside the ranges is touched;
+// the gaps between them keep whatever owns them.
+func (pg *zgcPage) releaseSources() {
+	for i := uintptr(0); i < pg.srcN; i++ {
+		r := pg.sourceRangeAt(i)
+		lo, hi := alignUp(r.lo, physPageSize), alignDown(r.hi, physPageSize)
+		if lo < hi {
+			zgcReleasePages(add(nil, lo), hi-lo)
+		}
+	}
 }
 
 func (pg *zgcPage) fwdSlot(i uintptr) *atomic.Uint64 {
@@ -222,8 +447,8 @@ func (pg *zgcPage) forwardInsert(from, to uintptr) uintptr {
 // compare-and-swap installed the entry. Only that call may account the
 // object as published: an earlier writer may have chosen the same target.
 func (pg *zgcPage) forwardPublish(from, to uintptr) (uintptr, bool) {
-	if from < pg.start || from-pg.start >= pg.size {
-		throw("zgc: forwarding source outside its page")
+	if !pg.holdsSource(from) {
+		throw("zgc: forwarding source outside its page's source ranges")
 	}
 	if to > zgcAddrMask {
 		throw("zgc: relocation target above the 4 TB range")
@@ -269,21 +494,104 @@ func (pg *zgcPage) forward(from uintptr) (uintptr, bool) {
 	return 0, false
 }
 
-// zgcRelocateObject copies the size-byte object at from to to and publishes
-// the forwarding entry. It returns the winning address; a caller that lost
-// the race discards its copy.
-// The copy completes before publication, and publication happens under
-// the identity lock together with the identity transfer, so a hasher
-// sees either the source with its identity or the copy with it.
+// zgcRelocateObject is the single authoritative copy commit for the zgc
+// cycle. Preparation (claim/reservation, heap bits) happens outside the
+// gate in the caller and may allocate or safepoint; this commit
+// revalidates under the shared admission gate and performs exactly one
+// memmove. The gate-held section holds zgcForeignGate across the
+// exposure recheck, the pin-bit/sticky recheck, the memmove,
+// forwardPublish, identity moveLocked and published accounting, so
+// exposure publication or a concurrent pin commit cannot interleave
+// between the check and the publication. No mheap.alloc, STW, safepoint
+// or P/gcw operation runs while the gate is held. Callers must revalidate
+// pg/forward after any allocation/safepoint by reaching this commit: the
+// gate recheck is authoritative, any outside pre-check is racy.
+// Source membership: only bytes inside the page's prepared source ranges
+// are relocation sources (zgcPageFor filters on them, and the commit
+// requires [from, from+size) to lie inside one range). Anything else in
+// the 2 MB region (a gap object, the page's own to-space) is never copied
+// and never published: the commit returns 0 and nothing is moved.
+// Held sources freeze: an object-exposed source is never moved, and a
+// source carrying a committed pin (pinner bit or sticky span flag) is
+// never moved. The exposure test is the exact per-object one, not the
+// region query: an exposed object elsewhere in the region (a gap object,
+// a to-space copy) does not hold its neighbours, and freezing every
+// source of the page for it would make a lawful pin or foreign admission
+// of a source object fail. The pin test reads the source span's sticky
+// flag and pinner bits with atomic loads only, so no speciallock is taken
+// under the gate and M -> speciallock -> gate order is preserved. The
+// commit returns 0 so the caller unclaims its slot and treats
+// the object as unfinished for this cycle. Lock order is identity -> gate
+// (gate leaf-last, taken last, no lock acquired while it is held); the
+// identity lock is acquired first and held across reservation, gate and
+// commit, so no concurrent identity insert can consume the reservation.
+// reserveMoveLocked (may sysAlloc/sysFree) runs under identity lock outside
+// the gate; moveLockedNoGrow under both locks never resizes/sysAllocs.
+// Gate-held graph: PageFor/forward/source ranges (atomics and immutable
+// metadata) + ObjectExposedLocked (span/alloc-bit reads, set lookups) +
+// sticky flag and pinner-bit loads (atomics only, no speciallock) +
+// memmove + forwardPublish (CAS) + moveNoGrow (find/remove/place, no
+// grow) + published.Add. No mheap.alloc, sysAlloc/sysFree, STW, safepoint
+// or P/gcw under gate.
 func zgcRelocateObject(pg *zgcPage, from, size, to uintptr) uintptr {
-	memmove(add(nil, to), add(nil, from), size)
+	if pg == nil {
+		return 0
+	}
 	t := &zgcIdentity
 	lock(&t.lock)
+	t.reserveMoveLocked(from, to)
+	zgcForeignGateLock()
+	if zgcPageFor(from) != pg {
+		if won, ok := pg.forward(from); ok {
+			zgcForeignGateUnlock()
+			unlock(&t.lock)
+			return won
+		}
+		zgcForeignGateUnlock()
+		unlock(&t.lock)
+		return 0
+	}
+	if won, ok := pg.forward(from); ok {
+		zgcForeignGateUnlock()
+		unlock(&t.lock)
+		return won
+	}
+	if !pg.holdsSourceObject(from, size) || zgcForeignObjectExposedLocked(from) {
+		zgcForeignGateUnlock()
+		unlock(&t.lock)
+		return 0
+	}
+	// No span means no sticky flag and no pinner bits to protect, so a
+	// spanless source (e.g. synthetic sysMap registration) stays
+	// copyable; only a heap span can veto.
+	if srcSpan := spanOfHeap(from); srcSpan != nil {
+		if srcSpan.logosPinned.Load() {
+			zgcForeignGateUnlock()
+			unlock(&t.lock)
+			return 0
+		}
+		if pb := srcSpan.getPinnerBits(); pb != nil {
+			idx := srcSpan.objIndex(from)
+			if idx >= uintptr(srcSpan.nelems) {
+				zgcForeignGateUnlock()
+				unlock(&t.lock)
+				return 0
+			}
+			state := pb.ofObject(idx)
+			if state.isPinned() {
+				zgcForeignGateUnlock()
+				unlock(&t.lock)
+				return 0
+			}
+		}
+	}
+	memmove(add(nil, to), add(nil, from), size)
 	won, mine := pg.forwardPublish(from, to)
 	if mine {
-		t.moveLocked(from, to)
+		t.moveLockedNoGrow(from, to)
 		pg.published.Add(size)
 	}
+	zgcForeignGateUnlock()
 	unlock(&t.lock)
 	return won
 }
@@ -293,6 +601,20 @@ func zgcRelocateObject(pg *zgcPage, from, size, to uintptr) uintptr {
 // those bytes are the only copy of their object. After release, a stale
 // word still resolves through the forwarding table, which lives outside
 // the page.
+// Exact ranges: release returns the prepared source ranges and nothing
+// else (releaseSources). The 2 MB region may also hold free pages,
+// goroutine stacks and other manual spans, and mutator objects allocated
+// after selection; none of them belongs to the page, so none is touched.
+// A page whose ranges were never prepared (not srcExact) may be released
+// whole only when no heap arena covers its region: it is then a synthetic
+// registration over memory nothing else can own. Over a heap arena it
+// would zero memory the page cannot account for, which is runtime
+// corruption, so it throws instead of releasing or quietly refusing.
+// Source freeze: a pinned page stays unreleased while foreign code may
+// retain raw addresses (a pin anywhere in the region only delays release;
+// it never frees a byte). The ranges are immutable, so the gate-held
+// section reads them without a lock and allocates nothing; the only call
+// under the gate is the release syscall, which takes no runtime lock.
 func zgcReleasePage(pg *zgcPage) bool {
 	if pg.released.Load() != 0 {
 		return true
@@ -300,8 +622,17 @@ func zgcReleasePage(pg *zgcPage) bool {
 	if pg.published.Load() != pg.live {
 		return false
 	}
+	if !pg.srcExact && regionHoldsHeapArena(pg.start, pg.size) {
+		throw("zgc: releasing a heap page whose source spans were never prepared")
+	}
+	zgcForeignGateLock()
+	if zgcForeignPagePinnedLocked(pg.start) {
+		zgcForeignGateUnlock()
+		return false
+	}
 	pg.releaseEpoch = zgcRemapEpoch.Load()
-	zgcReleasePages(add(nil, pg.start), pg.size)
+	pg.releaseSources()
 	pg.released.Store(1)
+	zgcForeignGateUnlock()
 	return true
 }

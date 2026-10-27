@@ -80,10 +80,7 @@ func zgcGCStartHook() {
 	// load-barrier behavior is unchanged.
 	systemstack(func() {
 		zgcFinishRelocation()
-		zgcPagesLock()
-		zgcScratchPages = append(zgcScratchPages[:0], zgcAllPages...)
-		pages := zgcScratchPages
-		zgcPagesUnlock()
+		pages := zgcPagesSnapshot()
 		live := pages[:0]
 		for _, pg := range pages {
 			if pg.released.Load() == 0 {
@@ -140,9 +137,7 @@ func zgcGCStartHook() {
 					complete = false
 					continue
 				}
-				lock(&zgcQuarantineLock)
-				zgcRetirePending = append(zgcRetirePending, pg)
-				unlock(&zgcQuarantineLock)
+				zgcRetirePendingAppend(pg)
 			}
 			if complete {
 				zgcRelocating.Store(0)
@@ -274,10 +269,7 @@ func zgcMarkTerminationHook() {
 		if n == 0 {
 			return
 		}
-		zgcPagesLock()
-		zgcScratchPages = append(zgcScratchPages[:0], zgcAllPages[before:]...)
-		pages := zgcScratchPages
-		zgcPagesUnlock()
+		pages := zgcPagesSnapshot()[before:]
 		// Vet every selected page before any to-space is reserved: a
 		// reservation allocates spans, and an ineligible page must not be
 		// able to receive one into a gap the vet is about to rule out.
@@ -334,10 +326,7 @@ func zgcFinishRelocation() {
 	assertWorldStopped()
 	for {
 		progress := false
-		zgcPagesLock()
-		zgcScratchPages = append(zgcScratchPages[:0], zgcAllPages...)
-		pages := zgcScratchPages
-		zgcPagesUnlock()
+		pages := zgcPagesSnapshot()
 		for _, pg := range pages {
 			if pg.published.Load() == pg.live {
 				continue
@@ -361,3 +350,23 @@ var (
 
 func zgcPagesLock()   { lock(&zgcPagesMu) }
 func zgcPagesUnlock() { unlock(&zgcPagesMu) }
+
+// zgcPagesSnapshot returns the registered pages in zgcScratchPages.
+// Stop-the-world only. The scratch shares the zgcMaxPages cap, which the
+// registered list cannot exceed, so the append under the lock never
+// allocates and can never start a collection the stopped world could
+// not finish. The holder cannot be async-preempted mid-section (holding
+// a runtime mutex sets m.locks, which the preemption predicate requires
+// to be zero), and the section parks nothing: no channel ops, no nested
+// locks, no syscalls.
+func zgcPagesSnapshot() []*zgcPage {
+	assertWorldStopped()
+	zgcPagesLock()
+	if cap(zgcScratchPages) < len(zgcAllPages) {
+		throw("zgc: page snapshot overflow")
+	}
+	zgcScratchPages = append(zgcScratchPages[:0], zgcAllPages...)
+	pages := zgcScratchPages
+	zgcPagesUnlock()
+	return pages
+}

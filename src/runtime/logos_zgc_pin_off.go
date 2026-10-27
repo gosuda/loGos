@@ -25,6 +25,8 @@ func zgcAttachResolve(p unsafe.Pointer) (uintptr, *mspan) {
 
 func zgcAttachEnsureCopy(p unsafe.Pointer) unsafe.Pointer { return p }
 
+func zgcAttachStable(s *mspan, p uintptr) bool { return true }
+
 func zgcSpanQuarantined(s *mspan) bool { return false }
 
 func zgcSweepGuard(s *mspan) bool { return false }

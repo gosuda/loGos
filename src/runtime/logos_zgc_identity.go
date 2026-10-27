@@ -42,6 +42,19 @@ type zgcIdentityTable struct {
 
 var zgcIdentity zgcIdentityTable
 
+// init registers the static rank for the identity table lock once before
+// its first acquisition. The lock is held across the shared admission
+// gate (leaf) in zgcRelocateObject, so it must be a real rank while the
+// gate stays the true final leaf. lockInit is a no-op without
+// staticlockranking and allocates nothing. It runs in
+// doInit(runtime_inittasks) before gcenable, user package inits, sweep,
+// and cycles: bootstrap maps before gcinit use no pointer-keyed identity
+// hashes (modulesinit appends, itabsinit under itabLock), so no identity
+// acquisition precedes it. Single execution, never re-mutated.
+func init() {
+	lockInit(&zgcIdentity.lock, lockRankZgcIdentity)
+}
+
 func (t *zgcIdentityTable) slot(i uintptr) *zgcIdentEntry {
 	return (*zgcIdentEntry)(add(t.entries, i*unsafe.Sizeof(zgcIdentEntry{})))
 }
@@ -200,6 +213,45 @@ func (t *zgcIdentityTable) moveLocked(from, to uintptr) {
 			dst.id = id
 		} else {
 			t.insert(to, id)
+		}
+	}
+}
+
+// reserveMoveLocked ensures a subsequent moveLockedNoGrow for from->to
+// cannot resize. Callers hold t.lock outside the foreign gate (identity
+// first, gate last); it may sysAlloc/sysFree via resize in this
+// reservation phase, never under the gate. Fail-closed via resize throw
+// on off-heap exhaustion; no fixed cap, no identity loss.
+func (t *zgcIdentityTable) reserveMoveLocked(from, to uintptr) {
+	if t.entries == nil {
+		return
+	}
+	if e := t.find(from); e == nil {
+		return
+	} else if dst := t.find(to); dst != nil {
+		return
+	}
+	if (t.used+1)*2 > int(t.mask+1) {
+		t.resize()
+	}
+}
+
+// moveLockedNoGrow is the gate-held half of moveLocked: identical
+// semantics, but never resizes. Capacity must be pre-reserved by
+// reserveMoveLocked under the same identity lock hold before the gate.
+// Violation fails closed; no fallback identity loss.
+func (t *zgcIdentityTable) moveLockedNoGrow(from, to uintptr) {
+	if e := t.find(from); e != nil {
+		id := e.id
+		t.remove(e)
+		if dst := t.find(to); dst != nil {
+			dst.id = id
+		} else {
+			if t.entries == nil || (t.used+1)*2 > int(t.mask+1) {
+				throw("zgc: identity table grew under gate")
+			}
+			t.live++
+			t.place(to, id)
 		}
 	}
 }

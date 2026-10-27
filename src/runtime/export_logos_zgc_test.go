@@ -10,6 +10,7 @@ import (
 	"internal/abi"
 	"internal/goarch"
 	"internal/runtime/atomic"
+	"internal/runtime/gc"
 	"unsafe"
 )
 
@@ -518,5 +519,260 @@ func LogosZgcForeignRetain(live []*LogosZgcPage, h *LogosZgcForeignG, mark, expe
 	}
 	n := zgcForeignRetainLive(live)
 	restore()
+	return n
+}
+
+// Exact source-range release seam (logos_zgc_release_ranges_test.go).
+//
+// Everything under test is the runtime's own: zgcNewPage (LogosZgcNewPage),
+// the page state selection fills and zgcPageEligible with its
+// prepareSources (LogosZgcRecordSources, LogosZgcEligible),
+// zgcRelocateObject (LogosZgcRelocate), zgcReleasePage and its madvise
+// (LogosZgcRelease) and zgcRetirePage (LogosZgcRetire). The one thing the
+// tests cannot reach from package runtime_test is an *mspan, so
+// LogosZgcAllocRun hands out real spans from the real page allocator:
+// in-use heap spans from allocSpan(spanAllocHeap) and manual spans from
+// allocManual(spanAllocStack), each with the state the allocator gave it.
+// No span field, pin, goroutine status or syscall result is written here.
+//
+// Observation limit: LogosZgcPageSources reads the private prepared range
+// table, and LogosZgcGappyPages reads the private page registry; both are
+// read-only. The public effect of the same behaviour (neighbour memory
+// survives, stacks keep their frames) is asserted separately through the
+// live heap in TestLogosZgcLiveHeapGappyReleaseKeepsNeighbours.
+
+const (
+	// LogosZgcRunHeap is an in-use heap span of 1024-byte noscan objects.
+	LogosZgcRunHeap = 0
+	// LogosZgcRunManual is a manual span, as a goroutine stack occupies.
+	LogosZgcRunManual = 1
+)
+
+// LogosZgcSpanRun is a run of adjacent spans in one 2 MB region, in the
+// address order of the kinds that asked for them. The handle keeps the
+// spans held until Free.
+type LogosZgcSpanRun struct {
+	spans  []*mspan
+	kinds  []int
+	freed  []bool
+	base   []uintptr
+	bytes  []uintptr
+	elem   []uintptr
+	nelems []uintptr
+}
+
+func logosZgcRunClass() spanClass {
+	for c, sz := range gc.SizeClassToSize {
+		if sz == 1024 {
+			return makeSpanClass(uint8(c), true)
+		}
+	}
+	throw("zgc test: no 1024-byte size class")
+	return 0
+}
+
+// zgcTestRunTight reports whether spans are all present, end to end, and
+// inside one registrable 2 MB region.
+func zgcTestRunTight(spans []*mspan) bool {
+	for _, s := range spans {
+		if s == nil {
+			return false
+		}
+	}
+	region := spans[0].base() &^ (zgcPageSize - 1)
+	if region > zgcAddrMask-(zgcPageSize-1) {
+		return false
+	}
+	for i, s := range spans {
+		end := s.base() + s.npages*pageSize
+		if s.base() < region || end > region+zgcPageSize {
+			return false
+		}
+		if i > 0 && s.base() != spans[i-1].base()+spans[i-1].npages*pageSize {
+			return false
+		}
+	}
+	return true
+}
+
+// zgcTestFreeSpan returns s to the heap. It runs on the system stack.
+func zgcTestFreeSpan(s *mspan, kind int) {
+	if kind == LogosZgcRunManual {
+		mheap_.freeManual(s, spanAllocStack)
+		return
+	}
+	atomic.Store(&s.sweepgen, mheap_.sweepgen)
+	mheap_.freeSpan(s)
+}
+
+// LogosZgcAllocRun allocates one real span for each kind, each as large
+// as a system page needs, and returns them only when they came out end to
+// end inside a single 2 MB region. The page allocator hands out the
+// lowest free pages first, so a trial that lands across a hole or a
+// region edge is held (so the next trial cannot reuse it) and retried;
+// held trials are freed before returning. It returns nil when no trial
+// was tight. The caller keeps GC off while the run is held.
+func LogosZgcAllocRun(kinds []int) *LogosZgcSpanRun {
+	zgcInitPageRegistry()
+	const trials = 256
+	unitPages := max(pageSize, physPageSize) / pageSize
+	class := logosZgcRunClass()
+	n := len(kinds)
+	run := &LogosZgcSpanRun{
+		spans:  make([]*mspan, n),
+		freed:  make([]bool, n),
+		base:   make([]uintptr, n),
+		bytes:  make([]uintptr, n),
+		elem:   make([]uintptr, n),
+		nelems: make([]uintptr, n),
+	}
+	// kinds is copied: slices is an import cycle in package runtime.
+	run.kinds = make([]int, n)
+	copy(run.kinds, kinds)
+	cur := make([]*mspan, n)
+	junk := make([]*mspan, 0, trials*n)
+	junkKind := make([]int, 0, trials*n)
+	found := false
+	for range trials {
+		systemstack(func() {
+			for i, k := range kinds {
+				if k == LogosZgcRunManual {
+					cur[i] = mheap_.allocManual(unitPages, spanAllocStack)
+				} else {
+					cur[i] = mheap_.allocSpan(unitPages, spanAllocHeap, class)
+				}
+			}
+		})
+		if zgcTestRunTight(cur) {
+			copy(run.spans, cur)
+			found = true
+			break
+		}
+		for i, s := range cur {
+			if s != nil {
+				junk = append(junk, s)
+				junkKind = append(junkKind, kinds[i])
+			}
+		}
+	}
+	systemstack(func() {
+		for i, s := range junk {
+			zgcTestFreeSpan(s, junkKind[i])
+		}
+	})
+	if !found {
+		return nil
+	}
+	for i, s := range run.spans {
+		run.base[i] = s.base()
+		run.bytes[i] = s.npages * pageSize
+		if run.kinds[i] == LogosZgcRunHeap {
+			run.elem[i] = s.elemsize
+			run.nelems[i] = uintptr(s.nelems)
+		}
+	}
+	return run
+}
+
+// Len returns the number of spans in the run.
+func (r *LogosZgcSpanRun) Len() int { return len(r.spans) }
+
+// Base returns the first address of span i.
+func (r *LogosZgcSpanRun) Base(i int) uintptr { return r.base[i] }
+
+// Bytes returns the size of span i.
+func (r *LogosZgcSpanRun) Bytes(i int) uintptr { return r.bytes[i] }
+
+// Elem returns the object size of heap span i.
+func (r *LogosZgcSpanRun) Elem(i int) uintptr { return r.elem[i] }
+
+// Nelems returns the object count of heap span i.
+func (r *LogosZgcSpanRun) Nelems(i int) uintptr { return r.nelems[i] }
+
+// MarkFreed records that span i was freed by the runtime itself (a
+// retired page frees its source spans), so Free skips it.
+func (r *LogosZgcSpanRun) MarkFreed(i int) { r.freed[i] = true }
+
+// Free returns span i to the heap unless it is already freed.
+func (r *LogosZgcSpanRun) Free(i int) {
+	if r.freed[i] {
+		return
+	}
+	r.freed[i] = true
+	s, k := r.spans[i], r.kinds[i]
+	systemstack(func() { zgcTestFreeSpan(s, k) })
+}
+
+// LogosZgcRecordSources records the spans of r at idx as the source spans
+// of pg, in the order given, the way zgcSelectPages does for a page it
+// selects: into the page's state list. The list is in no address order
+// (selection walks allspans), and prepareSources sorts it.
+func LogosZgcRecordSources(pg *LogosZgcPage, r *LogosZgcSpanRun, idx []int) {
+	zgcInitPageRegistry()
+	st := zgcPageState(pg)
+	st.spans = st.spans[:0]
+	for _, i := range idx {
+		st.spans = append(st.spans, r.spans[i])
+	}
+}
+
+// LogosZgcEligible runs zgcPageEligible: the selection pause's vet, which
+// prepares the exact source ranges.
+func LogosZgcEligible(pg *LogosZgcPage) bool { return zgcPageEligible(pg) }
+
+// LogosZgcPageSources returns the prepared source ranges of pg as sorted
+// [lo, hi) pairs, and whether prepareSources produced them (a registered
+// page that was never prepared reports its whole region).
+func LogosZgcPageSources(pg *LogosZgcPage) (ranges [][2]uintptr, exact bool) {
+	for i := uintptr(0); i < pg.srcN; i++ {
+		r := pg.sourceRangeAt(i)
+		ranges = append(ranges, [2]uintptr{r.lo, r.hi})
+	}
+	return ranges, pg.srcExact
+}
+
+// LogosZgcNewDetachedPageAt creates an unregistered header whose region is
+// [start, start+size), for prepareSources vetting that must not claim the
+// directory slot.
+func LogosZgcNewDetachedPageAt(start, size uintptr) *LogosZgcPage {
+	return zgcAllocPage(start, size, 0, 0)
+}
+
+// LogosZgcForgetPage drops the span lists selection recorded for pg.
+func LogosZgcForgetPage(pg *LogosZgcPage) { zgcPageForget(pg) }
+
+// LogosZgcFirstMismatch returns the offset of the first byte of
+// [addr, addr+n) that is not b, or -1.
+func LogosZgcFirstMismatch(addr, n uintptr, b byte) int {
+	for i, c := range unsafe.Slice((*byte)(add(nil, addr)), n) {
+		if c != b {
+			return i
+		}
+	}
+	return -1
+}
+
+// LogosZgcByteAt reads the byte at addr.
+func LogosZgcByteAt(addr uintptr) byte { return *(*byte)(add(nil, addr)) }
+
+// LogosZgcGappyPages counts the registered pages whose prepared source
+// ranges do not cover their whole region.
+func LogosZgcGappyPages() int {
+	n := 0
+	zgcPagesLock()
+	for _, pg := range zgcAllPages {
+		if !pg.srcExact {
+			continue
+		}
+		var covered uintptr
+		for i := uintptr(0); i < pg.srcN; i++ {
+			r := pg.sourceRangeAt(i)
+			covered += r.hi - r.lo
+		}
+		if covered < pg.size {
+			n++
+		}
+	}
+	zgcPagesUnlock()
 	return n
 }

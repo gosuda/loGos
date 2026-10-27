@@ -22,11 +22,111 @@ import (
 // zgcFixSlot rewrites a reference to a relocated object to its current
 // canonical address, uncolored. Interior pointers keep their offset.
 // It has the plain func type so it serves as a logosSlotVisitor.
+//
+// It stores only a changed word. A slot inside a heap object that a
+// published foreign frame exposes is swapped with a compare-and-swap
+// from the word read to the canonical word instead of a plain store: C
+// reads (and may write) that object where it sits while the world is
+// stopped for Go only, so a plain store computed from an earlier read
+// could overwrite a concurrent C store, and the CAS loses to it. The
+// swap is never skipped. Admission canonicalized every edge it admitted,
+// so a stale word in an exposed object is an edge a Go store added
+// afterwards; its target is not exposed and can relocate, and no load
+// barrier writes exposed slots (zgcSelfHeal), so leaving it would keep a
+// source address alive past the retire that frees its forwarding entry.
+// The word written is canonical and uncolored, so C never sees a color.
+// The exact object query decides, so unrelated objects on a region that
+// holds an exposed neighbour take the plain store. There is no page
+// prefilter: the registry keys a page pin by the region of the object's
+// base, so a slot of a large exposed object past the first 2 MB region
+// would miss it. Slots outside the heap (globals, stacks, special and
+// queue records) resolve to no span and take the plain store.
 func zgcFixSlot(slot *uintptr) {
-	*slot = zgcCanonical(*slot)
+	v := *slot
+	c := zgcCanonical(v)
+	if c == v {
+		return
+	}
+	if zgcSlotInExposedObject(slot) {
+		atomic.Casuintptr(slot, v, c)
+		return
+	}
+	*slot = c
+}
+
+// zgcMarkForeignRoots greys every object a published foreign frame
+// exposes and forces each one to be scanned. The global exposure table
+// is the union of every frame's admitted bases (refcounted per frame), so
+// one pass over its keys visits each exposed object once, whatever the
+// frame count. The world is stopped (gcStart).
+//
+// Greying is not enough here: admission sets the mark bit directly,
+// without queueing the object, in every GC phase. An object admitted
+// after the last sweep therefore reaches the next gcStart already marked
+// and unscanned, and greyobject and tryDeferToSpanScan both return at a
+// set bit, so edges stored into it between admission and the cycle
+// would never be followed. Clearing the bit first lets the ordinary
+// root path mark and queue it (a span queue for inline-mark spans, a
+// work buffer otherwise); the bit is checked set afterwards because an
+// exposed object left unmarked is freed under C. Noscan objects need
+// only the mark. Frames admitted after this pass mark their whole closure
+// at admission, with edges stored later shaded by the load barrier, so
+// no mark-termination rescan is required.
+func zgcMarkForeignRoots(gcw *gcWork) {
+	if zgcForeignActive.Load() == 0 {
+		return
+	}
+	t := &zgcForeignObjects
+	for i := uintptr(0); i < t.cap; i++ {
+		if base := zgcForeignSetKeyAt(t, i); base != 0 && base != ^uintptr(0) {
+			zgcMarkForeignBase(base, gcw)
+		}
+	}
+}
+
+// zgcMarkForeignBase marks and queues one exposed object base.
+func zgcMarkForeignBase(base uintptr, gcw *gcWork) {
+	s := spanOfHeap(base)
+	if s == nil || zgcSpanQuarantined(s) {
+		throw("logos zgc: foreign root names no live heap object")
+	}
+	if logosGenSkip(s) {
+		// A mature span is not marked or scanned by a minor cycle:
+		// greyobject and tryDeferToSpanScan return without touching the
+		// bit, so clearing it here would leave the object unmarked for
+		// the sweep. The generation's own cards cover its edges.
+		return
+	}
+	idx := uintptr(0)
+	if s.spanclass.sizeclass() != 0 {
+		idx = s.objIndex(base)
+		if idx >= uintptr(s.nelems) || base != s.base()+idx*s.elemsize {
+			throw("logos zgc: foreign root is not an object base")
+		}
+	}
+	mbits := s.markBitsForIndex(idx)
+	if !s.spanclass.noscan() {
+		mbits.clearMarked()
+	}
+	if !tryDeferToSpanScan(base, gcw) {
+		greyobject(base, 0, 0, s, gcw, idx)
+	}
+	if !mbits.isMarked() {
+		throw("logos zgc: foreign root left unmarked")
+	}
+}
+
+// zgcSlotInExposedObject reports whether slot lies inside a heap object
+// that a published foreign frame currently exposes. The world is stopped.
+// The exact object query resolves the slot to its object base itself and
+// returns at once while no frame is published.
+func zgcSlotInExposedObject(slot *uintptr) bool {
+	return zgcForeignObjectExposedLocked(uintptr(unsafe.Pointer(slot)))
 }
 
 // zgcVerifySlot throws when a reference to a relocated object remains.
+// It checks every slot zgcFixSlot visits, exposed objects included: the
+// fixup heals those too, so a stale word left in one is a real defect.
 func zgcVerifySlot(slot *uintptr) {
 	if v := *slot; zgcRemap(zgcAddr(v)) != zgcAddr(v) {
 		print("runtime: slot ", slot, " still holds relocated pointer ", hex(v), "\n")
@@ -36,7 +136,11 @@ func zgcVerifySlot(slot *uintptr) {
 
 // zgcFixRoots rewrites the root slots that must be current before the
 // world restarts: globals, specials, finalizer and cleanup queues, and
-// precise stacks. Heap slots heal lazily through the barrier.
+// precise stacks. Heap slots heal lazily through the barrier. The
+// visitor decides ownership per slot (zgcFixSlot swaps slots of exactly
+// the objects a foreign frame exposes with a compare-and-swap), so the
+// finalizer special's own object walk obeys the same rule as the heap
+// rewrite.
 func zgcFixRoots(v logosSlotVisitor) {
 	assertWorldStopped()
 	logosWalkGlobals(v)
@@ -212,28 +316,32 @@ func zgcForeignVisitSlot(slot *uintptr) {
 // status read per goroutine.
 func zgcForeignRetainLive(live []*zgcPage) int {
 	assertWorldStopped()
+	for i := range zgcForeignVisited {
+		zgcForeignVisited[i] = 0
+		zgcForeignExpanded[i] = 0
+	}
 	if len(live) == 0 {
 		return 0
 	}
 	foreign := false
-	for _, gp := range allgs {
-		if readgstatus(gp)&^_Gscan == _Gsyscall {
-			foreign = true
-			break
+	if zgcForeignHoldCount.Load() > 0 {
+		foreign = true
+	} else {
+		for _, gp := range allgs {
+			if readgstatus(gp)&^_Gscan == _Gsyscall {
+				foreign = true
+				break
+			}
 		}
 	}
 	if !foreign {
 		return 0
 	}
-	for i := range zgcForeignVisited {
-		zgcForeignVisited[i] = 0
-		zgcForeignExpanded[i] = 0
-	}
 	zgcForeignLive = live
 	zgcForeignRetained = 0
-	// Seeds: every stack word of every foreign thread, conservative and
-	// read-only. Unregistered pages are visited the same way so an
-	// A -> X -> B chain through ordinary heap still retains B; only
+	// Seeds: every stack word of every foreign thread and active hold, conservative
+	// and read-only, plus published hold roots. Unregistered pages are visited the
+	// same way so an A -> X -> B chain through ordinary heap still retains B; only
 	// registered pages join the retained prefix.
 	seeded := false
 	for _, gp := range allgs {
@@ -244,6 +352,33 @@ func zgcForeignRetainLive(live []*zgcPage) int {
 			if base, ok := zgcForeignObjectBase(*(*uintptr)(unsafe.Pointer(p))); ok {
 				if zgcForeignNotePage(base) {
 					seeded = true
+				}
+			}
+		}
+	}
+	for i := range zgcForeignHoldSlots {
+		slot := &zgcForeignHoldSlots[i]
+		if slot.active.Load() == 0 {
+			continue
+		}
+		gBits := slot.gp.Load()
+		if gBits == 0 || slot.depth.Load() == 0 {
+			continue
+		}
+		if root := slot.root.Load(); root != 0 {
+			if base, ok := zgcForeignObjectBase(root); ok {
+				if zgcForeignNotePage(base) {
+					seeded = true
+				}
+			}
+		}
+		holdG := (*g)(unsafe.Pointer(gBits))
+		if holdG != nil && holdG.stack.lo != 0 && holdG.stack.hi > holdG.stack.lo {
+			for p := holdG.stack.lo; p < holdG.stack.hi; p += goarch.PtrSize {
+				if base, ok := zgcForeignObjectBase(*(*uintptr)(unsafe.Pointer(p))); ok {
+					if zgcForeignNotePage(base) {
+						seeded = true
+					}
 				}
 			}
 		}
@@ -328,21 +463,35 @@ func zgcAttachResolve(p unsafe.Pointer) (base uintptr, s *mspan) {
 // the address to attach to. Published, ordinary, and non-heap words
 // pass through unchanged. Large objects are never copied; they pass
 // through and the caller pins the span through the normal
-// logosExcludeRelocation hook. Copy failure means the to-space
-// reservation is exhausted, which is out of memory: attaching to the
-// source would dangle the special, since the in-flight evacuation
-// copies regardless of span flags and release frees on published ==
-// live.
+// logosExcludeRelocation hook.
 //
-// The copy goes through zgcRelocateOneLocked, the same race-safe path
-// the load barrier uses: a concurrent barrier copy of the same object
-// returns the one published copy through the forwarding table, so the
-// attach cannot fork two copies. Callers run it before taking span or
-// special locks: the refill it may need runs in preemptible context
-// only. Only finalizer and cleanup attaches copy: those records keep
-// their object stable, while weak handles must not resurrect and
-// profile, secret, and debug records ride the pre-existing span
-// lifecycle through canonicalization alone.
+// The copy goes through zgcRelocateOneResult, the single typed
+// implementation the load barrier shares: a concurrent barrier copy of
+// the same object returns the one published copy through the forwarding
+// table, so the attach cannot fork two copies. Only Done adopts a copy;
+// NoMemory alone throws out of memory (true to-space exhaustion);
+// NotHeap returns the source as ordinary identity under the caller's
+// lifetime (unregistered sources are never moved by workers, so the
+// M-held commit in addspecialStable is stable); Refused returns the
+// source for the in-place pin below (a frozen foreign-exposed source at
+// commit), never retried until unexposure and never misthrown as OOM:
+// retrying until a same-G callback scope ends would self-deadlock,
+// because the scope cannot end until the callback returns. The commit
+// veto in the copy path stops post-exposure worker moves once the pin
+// commits; the narrow claim-before-pin race plus the missing gate-held
+// forward recheck in the pin commit stays the page/pinner owner's
+// bounded remaining work, coordinated through the existing gate and
+// source-stability APIs, with no copy under M and no M-held wait here.
+// Only preemptible callers run it, and never under a pinned M or on g0:
+// the refill it may need runs in preemptible context only. Those callers
+// are SetFinalizer's attach loop (outside its systemstack) and
+// addCleanup's (before it pins the M); addspecialStable never copies, it
+// reports specialAttachUnstable and the loop copies again. Only finalizer
+// and cleanup attaches copy: those records keep their object stable,
+// while weak handles must not resurrect and profile, secret, and debug
+// records ride the pre-existing span lifecycle through canonicalization
+// alone. The old boolean wrapper stays live for barrier users that only
+// need success; this helper is its typed companion for attach.
 func zgcAttachEnsureCopy(p unsafe.Pointer) unsafe.Pointer {
 	if !zgcCycleEnabled() {
 		return p
@@ -350,6 +499,9 @@ func zgcAttachEnsureCopy(p unsafe.Pointer) unsafe.Pointer {
 	addr := zgcCanonical(uintptr(p))
 	pg := zgcPageFor(addr)
 	if pg == nil {
+		// NotHeap fast path: unregistered ordinary identity under the
+		// caller's lifetime (a live Go reference plus the M-held
+		// commit below keeps it stable; workers never move it).
 		return unsafe.Pointer(addr)
 	}
 	base := addr
@@ -357,23 +509,141 @@ func zgcAttachEnsureCopy(p unsafe.Pointer) unsafe.Pointer {
 		base = s.base() + s.objIndex(addr)*s.elemsize
 	}
 	if to, ok := pg.forward(base); ok {
-		// Published: resolving to the copy needs no allocation and
-		// is safe in any context.
+		// Published (Done): resolving to the copy needs no allocation
+		// and is safe in any context.
 		return unsafe.Pointer(to + (addr - base))
 	}
 	if !zgcCanRelocateDeep() {
 		// Unpublished and no preemptible context to copy in (locked,
 		// g0, signal, or P-less): the refill would allocate where it
-		// must not. Fail fast; the hoisted pre-lock copies cover
-		// every in-runtime caller, so this fires only on a missed
-		// hoist or an alien context.
+		// must not. Fail fast; the attach loops copy at their own
+		// preemptible boundary, so this fires only on an alien
+		// context calling the public entries from a locked, g0, or
+		// signal context.
 		throw("logos zgc: cannot attach finalizer/cleanup in non-relocatable context")
 	}
-	if to, ok := zgcRelocateOneLocked(pg, addr); ok {
+	to, st := zgcRelocateOneResult(pg, addr)
+	switch st {
+	case zgcRelocateDone:
 		return unsafe.Pointer(to)
+	case zgcRelocateNoMemory:
+		throw("logos zgc: out of memory copying object for finalizer/cleanup attach")
+	case zgcRelocateNotHeap:
+		// Ordinary identity under the caller's lifetime: nil page or
+		// span only (defensive; pg is non-nil above, so a heap race
+		// that no longer resolves). Use the source; the M-held
+		// commit below is stable for it.
+		return unsafe.Pointer(addr)
+	default:
+		// Refused: frozen source at commit (foreign-exposed or pinned).
+		// Arm the sticky veto here, preemptible with a P (never on
+		// g0): gate-held exposure recheck plus the pin-bit read the
+		// copy commit vetoes on, then set the span sticky the commit
+		// reads lock-free. Never retry until unexposure and never
+		// misthrow as OOM. The g0 commit below stays lock-free.
+		if s := spanOfHeap(addr); s != nil {
+			zgcForeignGateLock()
+			exposed := zgcForeignObjectExposedLocked(addr)
+			pinned := s.logosPinned.Load() || isPinned(unsafe.Pointer(addr))
+			if exposed || pinned {
+				s.logosPinned.Store(true)
+			}
+			zgcForeignGateUnlock()
+		}
+		return unsafe.Pointer(addr)
 	}
-	throw("logos zgc: out of memory copying object for finalizer/cleanup attach")
 	return nil
+}
+
+// zgcAttachStable reports whether the object at p, on span s, may take a
+// finalizer or cleanup special right now. It is the attach handshake's
+// commit-time half and #175's phase 2 prerequisite: zgcAttachEnsureCopy
+// and logosZgcAttachSpecial run before the attacher becomes
+// non-preemptible, so a mark-termination pause can select the copy's own
+// page in that window, and a special spliced onto a quarantined span would
+// be lost when the page is released.
+//
+// addspecialStable runs it with its M non-preemptible (acquirem) after
+// ensureSwept and before taking speciallock. On false it releases the M
+// and reports specialAttachUnstable with nothing spliced; the caller
+// (SetFinalizer's loop, addCleanup's loop) returns to a preemptible
+// point, runs zgcAttachEnsureCopy again and retries. While the M cannot
+// be preempted no pause can start, so quarantine state cannot change
+// between this check and the splice, and a true answer stays true until
+// the splice arms the pin veto (span.logosPinned, which the copy
+// preparation and gate-held commit refuse) alongside logosNoReloc; the
+// pin veto is the commit safety, not NoReloc, which only steers future
+// selection. Consistency: the exposure/pin veto is linearizable under
+// the gate in EnsureCopy's preemptible arm; the commit reads the armed
+// pin flag lock-free (causal atomic publication), and the M-held span
+// resolution is a stable snapshot (no pause can intervene). False
+// means: p is not canonical (a published copy exists, or a stale color
+// remains), its span is quarantined and unfrozen (no veto armed, so no
+// record could survive there), or its page is registered for relocation
+// and not yet copied. A frozen quarantined span (vetoed: exposed or
+// pinned) IS a home: selection quarantines source spans, so a Refused
+// source is quarantined by construction, and refusing it would spin
+// EnsureCopy (source) -> Stable (false) forever; the armed veto keeps
+// published < live so the page never releases while the unpublished
+// source is pending, and the splice re-arms it idempotently. Retry
+// budget is bounded: each false makes progress (a published copy is
+// adopted, or the veto is armed), so loops settle in at most one re-arm
+// round with no pause and no wait for unexposure. A non-quarantined
+// large object never moves (zgcAttachEnsureCopy returns it in place),
+// so it is always home; a quarantined large is accepted only when
+// frozen, by the same lock-free pin signal.
+func zgcAttachStable(s *mspan, p uintptr) bool {
+	if !zgcCycleEnabled() {
+		return true
+	}
+	if zgcCanonical(p) != p {
+		return false
+	}
+	if s.spanclass.sizeclass() == 0 {
+		// Large spans are never selected, hence never quarantined in
+		// practice; a quarantined large is defensive-only. A frozen
+		// (vetoed) quarantined large is accepted: the pin veto keeps
+		// published < live so the page never releases while the
+		// unpublished source is pending, and the splice re-arms the
+		// veto idempotently. Lock-free pin read, no gate on g0.
+		if zgcSpanQuarantined(s) {
+			return s.logosPinned.Load() || isPinned(unsafe.Pointer(p))
+		}
+		return true
+	}
+	if zgcSpanQuarantined(s) {
+		// A frozen (vetoed: exposed or pinned) quarantined source is
+		// accepted, not retried: selection quarantines source spans,
+		// so a Refused source is quarantined by construction and
+		// refusing it would spin EnsureCopy (source) -> Stable
+		// (false) forever, self-deadlocking a same-G callback whose
+		// scope cannot end until the callback returns. The pin veto
+		// keeps published < live, so the page never releases while
+		// the unpublished source is pending, and the splice re-arms
+		// the veto idempotently. Lock-free pin read, no gate on g0;
+		// a fresh exposure takes one retry round to arm (never a
+		// wait for unexposure). Unfrozen quarantined storage is
+		// never a home: false routes back through EnsureCopy's
+		// forward recheck, which adopts a published copy when one
+		// exists.
+		return s.logosPinned.Load() || isPinned(unsafe.Pointer(p))
+	}
+	if zgcPageFor(p) == nil {
+		return true
+	}
+	// Registered, unquarantined, unpublished source. A frozen source
+	// (Refused at commit) pins in place: true lets the splice arm the
+	// pin veto (span.logosPinned, which the copy preparation and
+	// gate-held commit both refuse) alongside logosNoReloc under
+	// speciallock with the M held. The preemptible EnsureCopy arm
+	// narrows the pre-M window; a fresh exposure takes one retry
+	// round to arm, never a wait for unexposure. Lock-free pin read,
+	// no gate on g0. Anything else still needs a copy: false routes
+	// back through EnsureCopy's forward recheck (plus Result), and
+	// each such false the loops observe follows real pause/copy
+	// progress; the narrow claim-before-pin race stays the
+	// page/pinner owner's bounded work, coordinated read-only here.
+	return s.logosPinned.Load() || isPinned(unsafe.Pointer(p))
 }
 
 // zgcPinSelfStack pins every heap object a word of the calling
