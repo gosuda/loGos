@@ -9,6 +9,8 @@ package runtime_test
 import (
 	"fmt"
 	"internal/goexperiment"
+	"math"
+	"math/bits"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -831,4 +833,289 @@ func TestLogosArenaDynamicMakeWatermark(t *testing.T) {
 			t.Errorf("call 2: watermark after frame exit = %d, want %d (watermark did not fall back)", after2, before)
 		}
 	})
+}
+
+// The make seam attacks below drive the public make([]T, len, cap) syntax
+// through sites the compiler places in the arena (non-escaping, dynamic
+// capacity), and compare every panic with the heap path's. They never touch
+// a slice an overflowing make returned: an unexpected success ends the
+// subtest at once, so a wrapped size cannot turn into an out-of-bounds write.
+
+const (
+	arenaMakeLenPanic = "runtime error: makeslice: len out of range"
+	arenaMakeCapPanic = "runtime error: makeslice: cap out of range"
+
+	// arenaMakeAllocSlack bounds the heap bytes a panicking make may
+	// allocate: the panic value and test bookkeeping, never the slice.
+	arenaMakeAllocSlack = 1 << 20
+)
+
+type arenaMakeCase struct {
+	len, cap int64
+	want     string
+}
+
+type arenaElem24 [3]int64
+
+//go:noinline
+func arenaSeamInt64(n, c int) (length, capacity int, used uintptr) {
+	b := make([]int64, n, c)
+	return len(b), cap(b), runtime.LogosArenaStat().NoscanUsed
+}
+
+//go:noinline
+func arenaSeamElem24(n, c int) (int, int) {
+	b := make([]arenaElem24, n, c)
+	return len(b), cap(b)
+}
+
+//go:noinline
+func arenaSeamByte(n, c int) (int, int) {
+	b := make([]byte, n, c)
+	return len(b), cap(b)
+}
+
+//go:noinline
+func arenaSeamUint32Wide(n, c uint64) (int, int) {
+	b := make([]uint32, n, c)
+	return len(b), cap(b)
+}
+
+//go:noinline
+func arenaSeamFill(n, c int) bool {
+	b := make([]int64, n, c)
+	if len(b) != n || cap(b) != c {
+		return false
+	}
+	b = b[:cap(b)]
+	for i := range b {
+		if b[i] != 0 {
+			return false
+		}
+		b[i] = int64(i) + 1
+	}
+	for i := range b {
+		if b[i] != int64(i)+1 {
+			return false
+		}
+	}
+	return true
+}
+
+//go:noinline
+func heapSeamInt64(n, c int) { arenaSink = make([]int64, n, c) }
+
+//go:noinline
+func heapSeamElem24(n, c int) { arenaSink = make([]arenaElem24, n, c) }
+
+//go:noinline
+func heapSeamByte(n, c int) { arenaSink = make([]byte, n, c) }
+
+//go:noinline
+func heapSeamUint32Wide(n, c uint64) { arenaSink = make([]uint32, n, c) }
+
+// arenaMakeMustPanic runs fn, which holds one make, and requires the panic
+// message want and no enormous allocation. It stops the subtest when fn
+// returns normally, before anything could use the slice.
+func arenaMakeMustPanic(t *testing.T, what, want string, fn func()) {
+	t.Helper()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	msg, panicked := recoverMsg(fn)
+	runtime.ReadMemStats(&after)
+	if !panicked {
+		t.Fatalf("%s: make returned without panic, want %q", what, want)
+	}
+	if msg != want {
+		t.Errorf("%s: panic %q, want %q", what, msg, want)
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > arenaMakeAllocSlack {
+		t.Errorf("%s: panicking make allocated %d heap bytes, want at most %d", what, grew, arenaMakeAllocSlack)
+	}
+}
+
+// arenaMakeOverflowCases lists len/cap pairs for elements of size bytes
+// (size >= 2) whose make must panic. The expected message follows makeslice:
+// the len message when len alone is out of range, else the cap message.
+// Every capacity comes from the runtime's own bounds, not from a literal.
+// Each pair either fails an unchecked lowering's own len/cap checks or wraps
+// the byte size to zero or a tiny value, so an unchecked lowering never
+// reaches the allocator with a huge size here.
+func arenaMakeOverflowCases(size uintptr) []arenaMakeCase {
+	// wrap is the smallest capacity whose byte size overflows uintptr.
+	wrap := int64(^uintptr(0)/size + 1)
+	minInt := int64(math.MinInt)
+	return []arenaMakeCase{
+		{0, wrap, arenaMakeCapPanic},
+		{0, wrap + 1, arenaMakeCapPanic},
+		{1, wrap, arenaMakeCapPanic},
+		{1, wrap + 1, arenaMakeCapPanic},
+		{wrap, wrap, arenaMakeLenPanic},
+		{wrap + 1, wrap + 1, arenaMakeLenPanic},
+		{wrap + 1, wrap + 2, arenaMakeLenPanic},
+		{wrap, 1, arenaMakeLenPanic},
+		{0, minInt, arenaMakeCapPanic},
+		{minInt, 0, arenaMakeLenPanic},
+		{minInt, minInt, arenaMakeLenPanic},
+		{-1, 1, arenaMakeLenPanic},
+		{-1, -1, arenaMakeLenPanic},
+		{1, -1, arenaMakeCapPanic},
+		{2, 1, arenaMakeCapPanic},
+	}
+}
+
+func arenaMakeRun(t *testing.T, size uintptr, arena, heap func(n, c int)) {
+	for _, tc := range arenaMakeOverflowCases(size) {
+		t.Run(fmt.Sprintf("len=%d,cap=%d", tc.len, tc.cap), func(t *testing.T) {
+			n, c := int(tc.len), int(tc.cap)
+			arenaMakeMustPanic(t, "heap control", tc.want, func() { heap(n, c) })
+			arenaMakeMustPanic(t, "arena make", tc.want, func() { arena(n, c) })
+		})
+	}
+}
+
+// TestLogosArenaMakeOverflow attacks the dynamic arena make with capacities
+// whose byte size wraps uintptr to zero or a tiny positive size. makeslice
+// panics on all of them, with the len message when len alone is out of
+// range; the arena path must panic identically instead of returning a slice
+// whose cap exceeds its storage.
+func TestLogosArenaMakeOverflow(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	t.Run("int64", func(t *testing.T) {
+		arenaMakeRun(t, 8, func(n, c int) { arenaSeamInt64(n, c) }, heapSeamInt64)
+	})
+	t.Run("elem24", func(t *testing.T) {
+		arenaMakeRun(t, 24, func(n, c int) { arenaSeamElem24(n, c) }, heapSeamElem24)
+	})
+}
+
+// TestLogosArenaMakeOverflowWide covers unsigned 64-bit len and cap, whose
+// conversion to int must keep the makeslice64 verdicts. There is no fixed
+// expectation: the heap path is the reference for every pair.
+func TestLogosArenaMakeOverflowWide(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	top := uint64(1) << 63
+	wrap := uint64(1) << 62
+	for _, tc := range [][2]uint64{
+		{0, wrap}, {wrap, wrap}, {0, top}, {top, top}, {top, 0}, {1, top + 1}, {wrap + 1, wrap + 1},
+	} {
+		t.Run(fmt.Sprintf("len=%d,cap=%d", tc[0], tc[1]), func(t *testing.T) {
+			n, c := tc[0], tc[1]
+			msg, panicked := recoverMsg(func() { heapSeamUint32Wide(n, c) })
+			if !panicked {
+				t.Fatal("heap control: make returned without panic")
+			}
+			arenaMakeMustPanic(t, "arena make", msg, func() { arenaSeamUint32Wide(n, c) })
+		})
+	}
+}
+
+// TestLogosArenaMakeOverflowMaxAlloc covers sizes past maxAlloc that wrap
+// uintptr to a huge value or do not wrap at all. An unchecked lowering hands
+// those to the allocator, which aborts the process, so the test first
+// proves the lowering checks sizes, with a capacity that wraps to zero, and
+// fails before any such size is attempted when it does not.
+func TestLogosArenaMakeOverflowMaxAlloc(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	wrapsToZero := int(^uintptr(0)/8 + 1)
+	if _, panicked := recoverMsg(func() { arenaSeamInt64(0, wrapsToZero) }); !panicked {
+		t.Fatal("make([]int64, 0, cap) with a wrapping byte size returned without panic; refusing to attempt sizes past maxAlloc")
+	}
+	// The smallest int64 capacity past maxAlloc. The constant fits int on
+	// 32-bit and 64-bit; on 32-bit its byte size also wraps, which panics too.
+	const pastInt64 = int(runtime.LogosArenaMaxAlloc/8 + 1)
+	for _, tc := range []struct {
+		name string
+		n, c int
+		want string
+	}{
+		{"cap", 0, pastInt64, arenaMakeCapPanic},
+		{"len", pastInt64, pastInt64, arenaMakeLenPanic},
+		{"maxint-cap", 0, math.MaxInt, arenaMakeCapPanic},
+		{"maxint-len", math.MaxInt, math.MaxInt, arenaMakeLenPanic},
+	} {
+		t.Run("int64/"+tc.name, func(t *testing.T) {
+			arenaMakeMustPanic(t, "heap control", tc.want, func() { heapSeamInt64(tc.n, tc.c) })
+			arenaMakeMustPanic(t, "arena make", tc.want, func() { arenaSeamInt64(tc.n, tc.c) })
+		})
+	}
+	if bits.UintSize == 64 {
+		// maxAlloc fits int only on 64-bit; one byte past it needs no wrap.
+		maxAlloc := runtime.LogosArenaMaxAlloc
+		pastByte := int(maxAlloc) + 1
+		t.Run("byte/cap", func(t *testing.T) {
+			arenaMakeMustPanic(t, "heap control", arenaMakeCapPanic, func() { heapSeamByte(0, pastByte) })
+			arenaMakeMustPanic(t, "arena make", arenaMakeCapPanic, func() { arenaSeamByte(0, pastByte) })
+		})
+		t.Run("byte/len", func(t *testing.T) {
+			arenaMakeMustPanic(t, "heap control", arenaMakeLenPanic, func() { heapSeamByte(pastByte, pastByte) })
+			arenaMakeMustPanic(t, "arena make", arenaMakeLenPanic, func() { arenaSeamByte(pastByte, pastByte) })
+		})
+	}
+}
+
+// TestLogosArenaMakeSeamPlacement pins that the probe site really is placed
+// in the arena on amd64, the only architecture that lowers the make, so the
+// overflow attacks above run against the arena path, and that valid makes
+// still return zeroed, writable, correctly sized storage.
+func TestLogosArenaMakeSeamPlacement(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	if runtime.GOARCH != "amd64" {
+		t.Skip("skipping test: arena make lowering is amd64-only")
+	}
+	inFreshGoroutine(t, func() {
+		before := runtime.LogosArenaStat().NoscanUsed
+		n, c, during := arenaSeamInt64(64, 96)
+		after := runtime.LogosArenaStat().NoscanUsed
+		if n != 64 || c != 96 {
+			t.Errorf("make([]int64, 64, 96) has len %d cap %d", n, c)
+		}
+		if want := before + 96*8; during < want {
+			t.Errorf("watermark during make = %d, want at least %d (probe site is not arena-placed)", during, want)
+		}
+		if after != before {
+			t.Errorf("watermark after frame exit = %d, want %d", after, before)
+		}
+		for _, tc := range [][2]int{{0, 0}, {1, 1}, {3, 5}, {64, 64}, {513, 1024}, {int(runtime.LogosArenaChunkBytes/8) + 1, int(runtime.LogosArenaChunkBytes/8) + 1}} {
+			if !arenaSeamFill(tc[0], tc[1]) {
+				t.Errorf("make([]int64, %d, %d) is not zeroed, writable, and cap-sized", tc[0], tc[1])
+			}
+		}
+	})
+}
+
+// TestLogosArenaMakeSliceEntry attacks the private runtime entry directly
+// with the same pairs, plus int64 values that do not fit int on 32-bit.
+func TestLogosArenaMakeSliceEntry(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	for _, size := range []uintptr{8, 24} {
+		elem := any(int64(0))
+		if size == 24 {
+			elem = arenaElem24{}
+		}
+		for _, tc := range arenaMakeOverflowCases(size) {
+			t.Run(fmt.Sprintf("size=%d/len=%d,cap=%d", size, tc.len, tc.cap), func(t *testing.T) {
+				arenaMakeMustPanic(t, "entry", tc.want, func() { runtime.LogosArenaMakeSlice(elem, tc.len, tc.cap) })
+			})
+		}
+	}
+	if bits.UintSize == 32 {
+		wide := int64(1) << 32
+		t.Run("truncated-len", func(t *testing.T) {
+			arenaMakeMustPanic(t, "entry", arenaMakeLenPanic, func() { runtime.LogosArenaMakeSlice(int64(0), wide, wide) })
+		})
+		t.Run("truncated-cap", func(t *testing.T) {
+			arenaMakeMustPanic(t, "entry", arenaMakeCapPanic, func() { runtime.LogosArenaMakeSlice(int64(0), 0, wide) })
+		})
+	}
 }

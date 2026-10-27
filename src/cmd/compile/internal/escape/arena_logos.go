@@ -393,10 +393,38 @@ func logosArenaRetShape(n *ir.MakeExpr) bool {
 	if capExpr == nil {
 		capExpr = n.Len
 	}
-	if capExpr != nil && ir.IsSmallIntConst(capExpr) && ir.Int64Val(capExpr)*elem.Size() > LogosArenaMaxBytes {
+	if capExpr != nil && ir.IsSmallIntConst(capExpr) && !logosArenaConstFits(ir.Int64Val(capExpr), elem.Size()) {
 		return false
 	}
 	return true
+}
+
+// logosArenaConstFits reports whether n elements of elemSize bytes
+// (elemSize > 0) fit one arena object. It divides before it multiplies, so
+// a huge elemSize cannot wrap the product into a size that looks small.
+func logosArenaConstFits(n, elemSize int64) bool {
+	return n <= LogosArenaMaxBytes/elemSize
+}
+
+// LogosArenaConstBytes returns the byte size of n when n is a make of a
+// small constant capacity and that size is positive and fits one arena
+// object. The fit is tested by division before the product is formed, and
+// the walk phase calls this before it evaluates or appends anything, so a
+// refusal leaves the standard lowering a clean start.
+func LogosArenaConstBytes(n *ir.MakeExpr) (int64, bool) {
+	capExpr := n.Cap
+	if capExpr == nil {
+		capExpr = n.Len
+	}
+	if capExpr == nil || !ir.IsSmallIntConst(capExpr) {
+		return 0, false
+	}
+	elemSize := n.Type().Elem().Size()
+	capVal := ir.Int64Val(capExpr)
+	if elemSize <= 0 || capVal <= 0 || !logosArenaConstFits(capVal, elemSize) {
+		return 0, false
+	}
+	return capVal * elemSize, true
 }
 
 // recompute derives producing and live from the recorded sites. The caller
@@ -503,8 +531,8 @@ func LogosArenaConstMake(n *ir.MakeExpr, fn *ir.Func) bool {
 	if capExpr == nil || !ir.IsSmallIntConst(capExpr) {
 		return false
 	}
-	total := ir.Int64Val(capExpr) * n.Type().Elem().Size()
-	if total <= int64(base.Debug.VariableMakeThreshold) || total > LogosArenaMaxBytes {
+	total, ok := LogosArenaConstBytes(n)
+	if !ok || total <= int64(base.Debug.VariableMakeThreshold) {
 		return false
 	}
 	return !logosArenaReturned(n)

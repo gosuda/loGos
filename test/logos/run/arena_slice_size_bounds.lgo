@@ -1,0 +1,146 @@
+// run -goexperiment logosarena
+
+package main
+
+// The arena and native heap paths must agree on checked makeslice bounds for a
+// pointer-free 16-byte element. Success cases also exercise the backing store;
+// this fixture is silent unless an assertion fails.
+
+import "fmt"
+
+type e16 struct {
+	lo int64
+	hi int64
+}
+
+var sink []e16
+
+const (
+	lenPanic = "runtime error: makeslice: len out of range"
+	capPanic = "runtime error: makeslice: cap out of range"
+)
+
+func panicMsg(fn func()) (msg string, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			msg = fmt.Sprint(r)
+			ok = true
+		}
+	}()
+	fn()
+	return msg, ok
+}
+
+//go:noinline
+func arenaE16(n, c int) (int, int, int64) {
+	b := make([]e16, n, c)
+	if len(b) != n || cap(b) != c {
+		panic("bounds: arena len/cap mismatch")
+	}
+	if cap(b) > 1024 {
+		panic("bounds: arena backing cap unexpectedly large")
+	}
+	all := b[:cap(b)]
+	for i := range all {
+		if all[i].lo != 0 || all[i].hi != 0 {
+			panic("bounds: arena backing not zeroed")
+		}
+	}
+	var sum int64
+	for i := range b {
+		b[i].lo = int64(i + 1)
+		b[i].hi = int64(i + 2)
+	}
+	for i := range b {
+		if b[i].lo != int64(i+1) || b[i].hi != int64(i+2) {
+			panic("bounds: arena backing not usable")
+		}
+		sum += b[i].lo + b[i].hi
+	}
+	return len(b), cap(b), sum
+}
+
+//go:noinline
+func heapE16(n, c int) (int, int, int64) {
+	b := make([]e16, n, c)
+	sink = b
+	if len(b) != n || cap(b) != c {
+		panic("bounds: heap len/cap mismatch")
+	}
+	if cap(b) > 1024 {
+		panic("bounds: heap backing cap unexpectedly large")
+	}
+	all := b[:cap(b)]
+	for i := range all {
+		if all[i].lo != 0 || all[i].hi != 0 {
+			panic("bounds: heap backing not zeroed")
+		}
+	}
+	var sum int64
+	for i := range b {
+		b[i].lo = int64(i + 1)
+		b[i].hi = int64(i + 2)
+	}
+	for i := range b {
+		if b[i].lo != int64(i+1) || b[i].hi != int64(i+2) {
+			panic("bounds: heap backing not usable")
+		}
+		sum += b[i].lo + b[i].hi
+	}
+	return len(b), cap(b), sum
+}
+
+func checkValid(what string, n, c int) {
+	al, ac, asum := arenaE16(n, c)
+	hl, hc, hsum := heapE16(n, c)
+	if al != hl || ac != hc || asum != hsum {
+		panic("bounds: " + what + ": arena/native result mismatch")
+	}
+}
+
+func checkPair(what string, n, c int, want string) {
+	hmsg, hok := panicMsg(func() { heapE16(n, c) })
+	if !hok {
+		panic("bounds: " + what + ": native returned without panic")
+	}
+	if hmsg != want {
+		panic("bounds: " + what + ": native panic " + hmsg + ", want " + want)
+	}
+	amsg, aok := panicMsg(func() { arenaE16(n, c) })
+	if !aok {
+		panic("bounds: " + what + ": arena returned without panic")
+	}
+	if amsg != want {
+		panic("bounds: " + what + ": arena panic " + amsg + ", want " + want)
+	}
+}
+
+//go:noinline
+func runtimeInt(v int) int {
+	return v
+}
+
+func main() {
+	zero := runtimeInt(0)
+	one := runtimeInt(1)
+	two := runtimeInt(2)
+	three := runtimeInt(3)
+	five := runtimeInt(5)
+	negOne := runtimeInt(-1)
+	wrap := runtimeInt(1 << 60)
+
+	// For 16-byte elements, cap=1<<60 wraps the byte-size multiplication.
+	// Keep this zero-length case first: a broken guard must not reach a huge
+	// allocation before reporting the cap error.
+	checkPair("zero/wrap cap", zero, wrap, capPanic)
+	checkPair("wrap/wrap len", wrap, wrap, lenPanic)
+	checkPair("one/wrap cap", one, wrap, capPanic)
+	checkPair("negative len", negOne, one, lenPanic)
+	checkPair("negative cap", one, negOne, capPanic)
+	checkPair("len greater than cap", two, one, capPanic)
+
+	// Small neighbors must be fully usable on both allocation paths.
+	checkValid("one/one", one, one)
+	checkValid("three/five", three, five)
+	_ = sink
+}

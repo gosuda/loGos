@@ -31,12 +31,23 @@ func walkLogosArenaMake(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 		return nil
 	}
 
-	isConst := escape.LogosArenaConstMake(n, ir.CurFunc)
-	isDynamic := escape.LogosArenaMake(n, ir.CurFunc)
-	if !isConst && !isDynamic {
+	if escape.LogosArenaConstMake(n, ir.CurFunc) {
+		// The size is positive and fits one chunk, proven by division
+		// before any product of capacity and element size exists.
+		if total, ok := escape.LogosArenaConstBytes(n); ok {
+			return walkLogosArenaConstMake(n, init, total)
+		}
 		return nil
 	}
+	if escape.LogosArenaMake(n, ir.CurFunc) {
+		return walkLogosArenaDynamicMake(n, init)
+	}
+	return nil
+}
 
+// walkLogosArenaConstMake lowers a make of a small constant capacity whose
+// total size, totalSize bytes, is already known to fit one arena chunk.
+func walkLogosArenaConstMake(n *ir.MakeExpr, init *ir.Nodes, totalSize int64) ir.Node {
 	lenNode := safeExpr(n.Len, init)
 	capExpr := n.Cap
 	if capExpr != nil {
@@ -55,21 +66,15 @@ func walkLogosArenaMake(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 	lenCap := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OGT, typecheck.Conv(lenNode, types.Types[types.TUINT64]), typecheck.Conv(capExpr, types.Types[types.TUINT64])), []ir.Node{mkcall("panicmakeslicecap", nil, init)}, nil)
 	appendWalkStmt(init, lenCap)
 
-	elemSize := n.Type().Elem().Size()
 	rtyp := reflectdata.MakeSliceElemRType(base.Pos, n)
+	rndSize := (totalSize + 7) &^ 7
 
-	if isConst {
-		capVal := ir.Int64Val(capExpr)
-		totalSize := capVal * elemSize
-		if totalSize <= 0 || totalSize > escape.LogosArenaMaxBytes {
-			return nil
-		}
-		rndSize := (totalSize + 7) &^ 7
-
-		// Call runtime.logosArenaBump(rndSize).
+	var ptrTemp *ir.Name
+	if totalSize <= 512 && !base.Flag.Race {
+		// Fast path: call runtime.logosArenaBump(rndSize) with fallback.
 		fn := typecheck.LookupRuntime("logosArenaBump")
 		callBump := mkcall1(fn, types.Types[types.TUNSAFEPTR], init, ir.NewInt(base.Pos, rndSize))
-		ptrTemp := typecheck.TempAt(base.Pos, ir.CurFunc, types.Types[types.TUNSAFEPTR])
+		ptrTemp = typecheck.TempAt(base.Pos, ir.CurFunc, types.Types[types.TUNSAFEPTR])
 		appendWalkStmt(init, ir.NewAssignStmt(base.Pos, ptrTemp, callBump))
 
 		// If ptrTemp == nil, fallback to runtime allocator logosArenaAlloc.
@@ -84,28 +89,47 @@ func walkLogosArenaMake(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 
 		nif := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OEQ, ptrTemp, typecheck.NodNil()), ifBody, elseBody)
 		appendWalkStmt(init, typecheck.Stmt(nif))
-
-		sh := ir.NewSliceHeaderExpr(base.Pos, n.Type(), ptrTemp, typecheck.Conv(lenNode, types.Types[types.TINT]), typecheck.Conv(capExpr, types.Types[types.TINT]))
-		sh.SetTypecheck(1)
-		slice := typecheck.TempAt(base.Pos, ir.CurFunc, n.Type())
-		appendWalkStmt(init, ir.NewAssignStmt(base.Pos, slice, sh))
-		return slice
-	}
-
-	// Dynamic make: call runtime.logosArenaAlloc(rtyp, size).
-	allocFn := typecheck.LookupRuntime("logosArenaAlloc")
-	capConv := typecheck.Conv(capExpr, types.Types[types.TUINTPTR])
-	var sizeNode ir.Node
-	if elemSize == 1 {
-		sizeNode = capConv
 	} else {
-		sizeNode = typecheck.Expr(ir.NewBinaryExpr(base.Pos, ir.OMUL, capConv, ir.NewInt(base.Pos, elemSize)))
+		// Noscan sizes > 512 or under -race take the runtime allocator directly.
+		allocFn := typecheck.LookupRuntime("logosArenaAlloc")
+		callAlloc := mkcall1(allocFn, types.Types[types.TUNSAFEPTR], init, rtyp, ir.NewInt(base.Pos, rndSize))
+		ptrTemp = typecheck.TempAt(base.Pos, ir.CurFunc, types.Types[types.TUNSAFEPTR])
+		appendWalkStmt(init, ir.NewAssignStmt(base.Pos, ptrTemp, callAlloc))
 	}
+
+	return walkLogosArenaSlice(n, init, ptrTemp, lenNode, capExpr)
+}
+
+// walkLogosArenaDynamicMake lowers a make of dynamic capacity. It emits no
+// checks and no size arithmetic of its own: runtime.logosArenaMakeSlice takes
+// len and cap as int64, as makeslice64 does, and applies the makeslice
+// truncation, overflow, maxAlloc and len-before-cap verdicts before it
+// allocates, then dispatches to logosArenaAllocScan for pointer-bearing
+// element types and logosArenaAlloc otherwise. The stack-buffer and heap
+// fallbacks of walkMakeSlice are not involved, so the call has no else branch.
+func walkLogosArenaDynamicMake(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
+	lenNode := safeExpr(n.Len, init)
+	capExpr := n.Cap
+	if capExpr != nil {
+		capExpr = safeExpr(capExpr, init)
+	} else {
+		capExpr = lenNode
+	}
+
+	rtyp := reflectdata.MakeSliceElemRType(base.Pos, n)
+	allocFn := typecheck.LookupRuntime("logosArenaMakeSlice")
+	int64Typ := types.Types[types.TINT64]
 	ptrTemp := typecheck.TempAt(base.Pos, ir.CurFunc, types.Types[types.TUNSAFEPTR])
-	callAlloc := mkcall1(allocFn, types.Types[types.TUNSAFEPTR], init, rtyp, sizeNode)
+	callAlloc := mkcall1(allocFn, types.Types[types.TUNSAFEPTR], init, rtyp, typecheck.Conv(lenNode, int64Typ), typecheck.Conv(capExpr, int64Typ))
 	appendWalkStmt(init, ir.NewAssignStmt(base.Pos, ptrTemp, callAlloc))
 
-	sh := ir.NewSliceHeaderExpr(base.Pos, n.Type(), ptrTemp, typecheck.Conv(lenNode, types.Types[types.TINT]), typecheck.Conv(capExpr, types.Types[types.TINT]))
+	return walkLogosArenaSlice(n, init, ptrTemp, lenNode, capExpr)
+}
+
+// walkLogosArenaSlice assembles the slice header of n over the arena block
+// at ptr and returns the temporary that holds it.
+func walkLogosArenaSlice(n *ir.MakeExpr, init *ir.Nodes, ptr *ir.Name, lenNode, capExpr ir.Node) ir.Node {
+	sh := ir.NewSliceHeaderExpr(base.Pos, n.Type(), ptr, typecheck.Conv(lenNode, types.Types[types.TINT]), typecheck.Conv(capExpr, types.Types[types.TINT]))
 	sh.SetTypecheck(1)
 	slice := typecheck.TempAt(base.Pos, ir.CurFunc, n.Type())
 	appendWalkStmt(init, ir.NewAssignStmt(base.Pos, slice, sh))
