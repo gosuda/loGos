@@ -1524,7 +1524,11 @@ A field of type int or uint warns portability::serialized_unsized_int. [T-Sec12.
 Sized kinds are preferred. [T-Sec12.1]
 Tag options change nothing in binary output. [T-Sec12.1]
 UnmarshalBinary rejects truncation, bad presence bytes, version mismatch, and trailing bytes with errors naming field and offset. [T-Sec12.1]
-A count header MUST pre-allocate at most min(len(rest)/2, 1 MB / sizeof(elem)) elements and MUST grow past that only as input bytes arrive. [T-Sec12.1]
+For elements with a nonzero wire payload, a count header MUST pre-allocate at most min(len(rest)/2, 1 MB / sizeof(elem)) elements and MUST grow past that only as input bytes arrive. [T-Sec12.1]
+Charge nothing against a total budget on the count header; a count whose element bytes are all present in the input is lawful and MUST decode, even when the total exceeds 1 MiB. [T-Sec12.1]
+For slices whose elements have zero wire payload, the count itself MUST NOT exceed 1,048,576 (the 1 MiB prealloc bound at unit 1); larger counts MUST be rejected with a count-out-of-range error, encoder symmetric, checked before allocation or element iteration. [T-Sec12.1]
+Zero-wire slices MUST be handled in constant time with respect to count, without per-element iteration. [T-Sec12.1]
+These resource bounds MUST NOT change the wire bytes of accepted values. [T-Sec12.1]
 
 ## 13. Capabilities auditor
 
@@ -1826,7 +1830,7 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #136 go group sibling hanging on channel receive: Plain channel operations in a child MUST lower to a `select` with `<-gctx.Done()`. Cancellation MUST reach blocked siblings. See Sec 2.6. [T-206]
 - #137 Call-free loop starving scheduler blocking GC: Back-edge checks MUST fire every 4096 iterations where async preemption is absent. A call-free loop MUST NOT starve its peers. See Sec 15.3. [T-303]
 - #138 Arena pointer stored into sync Pool: A value stored into `sync.Pool` MUST stay on the heap. The compiler MUST keep such values out of the arena. See Sec 8.3. [T-301.1]
-- #139 Malicious JSON array triggering huge preallocation: JSON decoders MUST grow arrays incrementally with no pre-allocation cap. Binary counts MUST pre-allocate at most `min(len(rest)/2, 1 MB / sizeof(elem))`. See Sec 12.2. [T-Sec12][T-Sec12.1]
+- #139 Malicious JSON array triggering huge preallocation: JSON decoders MUST grow arrays incrementally with no pre-allocation cap. Binary counts for elements with nonzero wire payload MUST pre-allocate at most `min(len(rest)/2, 1 MB / sizeof(elem))` and grow only as bytes arrive, charging nothing on the count header; lawful large payloads with all bytes present MUST decode. Zero-wire slice counts MUST NOT exceed 1,048,576, rejected with count-out-of-range, encoder symmetric, constant-time without per-element iteration. Accepted wire bytes MUST stay unchanged. See Sec 12.2 and Sec 12.3. [T-Sec12][T-Sec12.1]
 - #140 Known hash seed enabling hash-flooding DoS: Large const maps MUST provide one-probe lookup from a static perfect-hash table in read-only data with constant-time auxiliary metadata reads plus exactly one final key/value-slot probe with full-key validation. Construction MUST use at most 1,000,000 seed-candidate trials in total per const map. A logarithmic fallback MUST NOT satisfy the contract. Exhaustion MUST fail with `comptime::constmap_seed_not_found`. See Sec 9.1. [T-Sec9]
 - #141 Method call on property value losing mutation: A method call on a property value MUST use read-call-write-back around the call. The write MUST reach the struct. See Sec 6.3. [T-203.2]
 - #142 Chain map leaking file descriptors on failure: Partial chain failure MUST close already produced `io.Closer` elements in reverse order. The fused loop MUST run that rollback before returning. See Sec 1.4. [T-104.6]
