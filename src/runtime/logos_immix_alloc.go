@@ -6,6 +6,7 @@ package runtime
 
 import (
 	"internal/goexperiment"
+	"internal/runtime/atomic"
 	"internal/runtime/gc"
 	"internal/runtime/sys"
 )
@@ -228,6 +229,13 @@ func logosImmixFreeSpan(s *mspan) {
 	}
 	b.clearOccupy()
 	b.clearDirtyAll()
+	// Retire the metadata with the span: a recycled block address must
+	// not inherit the dead span's pin or liveness. Lookup rejects
+	// non-live blocks, so clearing here makes the death transition the
+	// struct comment promises; BlockFor retakes the slot (0->1->2 with
+	// the epoch sentinel) when the address is reused.
+	atomic.Store8(&b.blockPinned, 0)
+	atomic.Store(&b.blockLive, 0)
 	s.logosImmixBlock = nil
 	s.logosImmixActive = false
 	s.logosImmixCursor = 0
