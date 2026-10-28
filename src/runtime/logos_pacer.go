@@ -179,9 +179,10 @@ func (c *gcControllerState) logosElasticRevise(live, goal uint64) {
 //
 // Every successful raise adds exactly the difference of the two dedicated
 // counts it moves between to dedicatedMarkWorkersNeeded, so needed plus
-// running dedicated workers always equals the count of the peak. All shared
-// state is atomic and no lock is taken, as revise itself is lock free:
-// raises that race each other are ordered by the compare-and-swap of peak.
+// running dedicated workers always equals the count of the peak. All
+// shared state is atomic and no lock is taken, as revise itself is lock
+// free: raises that race each other are ordered by the compare-and-swap
+// of peak.
 func (c *gcControllerState) logosElasticRaise(total float64, now int64) {
 	e := &c.logosElastic
 	for {
