@@ -275,7 +275,7 @@ func (plan *ejectPlan) addPackage(p *load.Package) {
 		}
 		m.pkgs = append(m.pkgs, p)
 	}
-	if p.IsLogos() {
+	if ejectOwnsLogos(p) {
 		plan.logos = append(plan.logos, p)
 	}
 }
@@ -294,10 +294,28 @@ func resortEjectPlan(plan *ejectPlan) {
 	slices.SortFunc(plan.main.pkgs, func(a, b *load.Package) int { return strings.Compare(a.ImportPath, b.ImportPath) })
 }
 
+// ejectOwnsLogos reports whether p owns any loGo/s source, including
+// host-inactive files. Unlike load.Package.IsLogos, which classifies by
+// the first active file, eject must also lower alternate-platform files
+// listed under IgnoredGoFiles: they never reach the host build, so
+// without this the variant staging would never see them and the ejected
+// tree would silently omit them instead of emitting their lowered Go.
+func ejectOwnsLogos(p *load.Package) bool {
+	if p.IsLogos() {
+		return true
+	}
+	for _, name := range p.IgnoredGoFiles {
+		if cfg.IsLogosFile(name) {
+			return true
+		}
+	}
+	return false
+}
+
 // moduleHasLogos reports whether any package of m is a loGo/s package.
 func moduleHasLogos(m *ejectModule) bool {
 	for _, p := range m.pkgs {
-		if p.IsLogos() {
+		if ejectOwnsLogos(p) {
 			return true
 		}
 	}
@@ -579,7 +597,7 @@ func writeLoweredFile(dstRoot, rel, stem, name string, raw []byte) bool {
 // owned file is present, so a miss is a build failure, never a silent
 // omission or raw fallback.
 func emitPackageGoFiles(p *load.Package, plan *ejectPlan, staging, dstRoot, modRoot string) bool {
-	if !p.IsLogos() {
+	if !ejectOwnsLogos(p) {
 		return false
 	}
 	rel, err := filepath.Rel(modRoot, p.Dir)
@@ -620,7 +638,7 @@ func emitPackageGoFiles(p *load.Package, plan *ejectPlan, staging, dstRoot, modR
 // by design, so it skips every missing file; the main eject merges
 // every helper tree and fails loudly if anything is still missing.
 func emitPackageGoFilesVariant(p *load.Package, plan *ejectPlan, staging, dstRoot, modRoot string) bool {
-	if !p.IsLogos() {
+	if !ejectOwnsLogos(p) {
 		return false
 	}
 	rel, err := filepath.Rel(modRoot, p.Dir)
