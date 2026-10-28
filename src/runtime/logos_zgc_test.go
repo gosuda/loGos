@@ -139,7 +139,21 @@ func TestLogosZgcGoodColorFollowsFlip(t *testing.T) {
 	}
 }
 
+// logosZgcRequireHeapWindow skips a test whose contract lives in the zgc
+// collector's own machinery: the self-heal slow path, its accounting, and
+// the release-drain-retire lifecycle. An immix-linked binary neither
+// drives nor honours those paths, so the fixtures would plant coloured
+// words in a build with no zgc barrier and take the whole binary down.
+func logosZgcRequireHeapWindow(t *testing.T) {
+	t.Helper()
+	if LogosZgcCycleEnabled() {
+		return
+	}
+	t.Skip("needs the zgc collector's low heap window: run with -ldflags=-X=runtime.logosGCMode=zgc")
+}
+
 func TestLogosZgcSoftwareBarrier(t *testing.T) {
+	logosZgcRequireHeapWindow(t)
 	for _, sel := range []func(uint8){LogosZgcSelectSoftware, LogosZgcSelectHardware} {
 		sel(LogosZgcRemapped)
 		base, free := logosZgcPlace(t)
@@ -214,6 +228,7 @@ func logosZgcCheckRecolorAndFlip(t *testing.T, slot *uintptr, oldA uintptr) {
 }
 
 func TestLogosZgcSelfHealConcurrentCAS(t *testing.T) {
+	logosZgcRequireHeapWindow(t)
 	LogosZgcSelectSoftware(LogosZgcRemapped)
 	base, free := logosZgcPlace(t)
 	defer free()
@@ -442,6 +457,7 @@ func TestLogosZgcForwardingConcurrentInsert(t *testing.T) {
 }
 
 func TestLogosZgcReleaseBeforeSelfHealDrains(t *testing.T) {
+	logosZgcRequireHeapWindow(t)
 	if GOOS != "linux" {
 		t.Skip("blocked: zero fill after release is a property of madvise(MADV_DONTNEED) on Linux")
 	}
