@@ -7,12 +7,12 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #1 |M2| test/logos/redteam/attack_001_split_union_ptr_scalar | tested |
 | #2 | M5 | test/logos/run/zerocopy.lgo | tested |
 | #3 | M5 | test/logos/run/constmap_switch.lgo; src/cmd/compile/internal/logos/constmap_test.go (TestConstmapSwitchMax) | tested |
-| #4 | M18 | src/cmd/go/testdata/script/logos_redteam_4.txt (planned: script exists, no executed test/logos attack run) | planned |
+| #4 | M18 | src/cmd/go/testdata/script/logos_redteam_4.txt (executed 2026-10-28: `go test cmd/go -run 'Script/^logos_redteam_4$'` passes both legs, the five arena park tests plus the `-race` leg SPEC 17 requires) | tested |
 | #5 | M8, M20 | src/cmd/cgo/internal/testlogos/fastcall_test.go | tested |
 | #6 | M6 | test/logos/run/lambda.lgo; test/logos/run/chains.lgo (dblBlock, count with ?) | tested |
 | #7 | M3, M11 | test/logos/run/json_unmarshal_test.lgo; src/internal/types/testdata/logos/nonnil_zero.lgo; src/internal/types/testdata/logos/map_index.lgo | tested |
 | #8 | M3 | test/logos/run/platform.lgo | tested |
-| #9 | M13 | test/logos/redteam/attack_009_cold_last_trace_names.lgo (blocked: comptime clone pclntab naming pending) | blocked |
+| #9 | M13 | test/logos/redteam/attack_009_cold_last_trace_names.lgo (executed 2026-10-28: the fixpoint strip in src/cmd/link/internal/ld/pcln_logos.go:50-79 lands it; the fixture now asserts both suffixes absent and the base name present, and passes) | tested |
 | #10 | M9 | test/logos/lint/exhaustive_union_switch.lgo; src/cmd/go/testdata/script/logos_pedantic_lint.txt | tested |
 | #11 | M18 | test/logos/redteam/attack_011_preempt_arena_reachable.lgo | tested |
 | #12 | M18 | test/logos/codegen/redteam12_bump_scan_guard.lgo | tested |
