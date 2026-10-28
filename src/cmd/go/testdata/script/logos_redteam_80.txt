@@ -44,7 +44,16 @@ env GOTOOLCHAIN=local
 #   crypto/tls: TestBogoSuite
 #   crypto/x509: TestX509Limbo
 #   runtime: TestMkmalloc
-env REDTEAM80_SKIP='^(TestACVP|TestBogoSuite|TestCBCAESWycheproof|TestCMACWycheproof|TestChaCha20Poly1305Wycheproof|TestDSAWycheproof|TestECDSAWycheproof|TestEd25519Vectors|TestEd25519Wycheproof|TestGCMWycheproof|TestHKDFWycheproof|TestHMACWycheproof|TestKeyGenWycheproof|TestMkmalloc|TestMLKEMDecapsWycheproof|TestMLKEMEncapsWycheproof|TestMLKEMSemiExpandedDecapsWycheproof|TestMLDSANoSeedWycheproof|TestMLDSASignSeedRandomizedWycheproof|TestRSAOAEPDecryptWycheproof|TestRSAPKCS1DecryptWycheproof|TestRSAPKCS1SignaturesWycheproof|TestRSAPSSSignaturesWycheproof|TestSecpECDHSPKIWycheproof|TestSecpECDHWycheproof|TestSignSeedWycheproof|TestVerifyWycheproof|TestWycheproof|TestX509Limbo|TestX25519ECDHWycheproof)$'
+#
+# One host-limit exclusion, not a fetch one: os.TestPipeThreads raises
+# debug.SetMaxThreads to half its pipe count and then opens that many pipes,
+# which on a many-core host exceeds the kernel's thread headroom and dies with
+# "fatal error: thread exhaustion" inside runtime.checkmcount. The same
+# failure reproduces under plain `go` on the same host, so it carries no
+# information about generated code. The test is excluded by name here, is
+# still compiled, and remains covered wherever the host offers thread
+# headroom.
+env REDTEAM80_SKIP='^(TestACVP|TestBogoSuite|TestCBCAESWycheproof|TestCMACWycheproof|TestChaCha20Poly1305Wycheproof|TestDSAWycheproof|TestECDSAWycheproof|TestEd25519Vectors|TestEd25519Wycheproof|TestGCMWycheproof|TestHKDFWycheproof|TestHMACWycheproof|TestKeyGenWycheproof|TestMkmalloc|TestPipeThreads|TestMLKEMDecapsWycheproof|TestMLKEMEncapsWycheproof|TestMLKEMSemiExpandedDecapsWycheproof|TestMLDSANoSeedWycheproof|TestMLDSASignSeedRandomizedWycheproof|TestRSAOAEPDecryptWycheproof|TestRSAPKCS1DecryptWycheproof|TestRSAPKCS1SignaturesWycheproof|TestRSAPSSSignaturesWycheproof|TestSecpECDHSPKIWycheproof|TestSecpECDHWycheproof|TestSignSeedWycheproof|TestVerifyWycheproof|TestWycheproof|TestX509Limbo|TestX25519ECDHWycheproof)$'
 
 # Host limit: AF_UNIX sun_path caps at 108 bytes, so t.TempDir paths under the
 # deep harness $WORK tree overflow the cap and net TestUnixConnReadEOF fails at
