@@ -1,0 +1,81 @@
+# REDTEAM #80 (SPEC Sec 22.1, T-Sec22; IMPLEMENTATION.md M22): cross-layer
+# regression matrix verification. `logos test -O=1 std cmd`,
+# `logos test -O=2 std cmd`, and `logos test -O=3 std cmd` MUST all pass
+# without -short on the full unmodified `std` and `cmd` suites, except for
+# the fetch-dependent tests named below. Each command below is the SPEC
+# command plus that one documented `-skip`; a nonzero exit fails the script.
+# No -short, no package subset, no representative probe: this row IS the
+# matrix, so a smaller gate cannot prove it. Per SPEC Sec 22.3 the -race and per-gc-mode
+# dimensions are proved by the individual runtime attack fixtures, not here.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+# Repair choice (b): narrow the run by a named -skip exclusion, not (a) a
+# trusted local file proxy. The modules the tests below download at run
+# time through crypto/internal/cryptotest.FetchModule
+# (github.com/c2sp/wycheproof, filippo.io/mostly-harmless/ed25519vectors,
+# boringssl.googlesource.com/boringssl.git, github.com/geomys/acvp-testdata,
+# github.com/C2SP/x509-limbo, golang.org/x/tools for runtime/_mkmalloc)
+# are not in the tree, not in cmd/go/testdata/mod, and not in any module
+# cache this hermetic script can reach, and the harness forbids the
+# network (TESTGONETWORK=panic) while this script deliberately sets
+# GOPROXY=off, so the downloads cannot succeed: each fetch-dependent
+# test fails with "module lookup disabled by GOPROXY=off" before it can
+# run, which says nothing about -O. Vendoring megabytes of third-party
+# vectors we do not have (option a) is not an honest repair, so each
+# command below skips exactly those tests by name. No package is dropped:
+# every std and cmd package still compiles and runs at each -O level, the
+# exclusion names each fetch-dependent test (each name verified to occur
+# exactly once in the tree, so the pattern skips nothing else), and a new
+# fetch-dependent test would fail instead of being silently skipped:
+#   crypto/cipher: TestCBCAESWycheproof TestGCMWycheproof
+#   crypto/dsa: TestDSAWycheproof
+#   crypto/ecdh: TestSecpECDHWycheproof TestSecpECDHSPKIWycheproof TestX25519ECDHWycheproof
+#   crypto/ecdsa: TestECDSAWycheproof
+#   crypto/ed25519: TestEd25519Wycheproof TestEd25519Vectors
+#   crypto/hkdf: TestHKDFWycheproof
+#   crypto/hmac: TestHMACWycheproof
+#   crypto/internal/cryptotest: TestChaCha20Poly1305Wycheproof
+#   crypto/internal/fips140test: TestACVP TestCMACWycheproof
+#   crypto/mldsa: TestVerifyWycheproof TestSignSeedWycheproof TestMLDSASignSeedRandomizedWycheproof TestMLDSANoSeedWycheproof
+#   crypto/mlkem: TestKeyGenWycheproof TestMLKEMEncapsWycheproof TestMLKEMDecapsWycheproof TestMLKEMSemiExpandedDecapsWycheproof
+#   crypto/pbkdf2: TestWycheproof
+#   crypto/rsa: TestRSAOAEPDecryptWycheproof TestRSAPKCS1DecryptWycheproof TestRSAPKCS1SignaturesWycheproof TestRSAPSSSignaturesWycheproof
+#   crypto/tls: TestBogoSuite
+#   crypto/x509: TestX509Limbo
+#   runtime: TestMkmalloc
+env REDTEAM80_SKIP='^(TestACVP|TestBogoSuite|TestCBCAESWycheproof|TestCMACWycheproof|TestChaCha20Poly1305Wycheproof|TestDSAWycheproof|TestECDSAWycheproof|TestEd25519Vectors|TestEd25519Wycheproof|TestGCMWycheproof|TestHKDFWycheproof|TestHMACWycheproof|TestKeyGenWycheproof|TestMkmalloc|TestMLKEMDecapsWycheproof|TestMLKEMEncapsWycheproof|TestMLKEMSemiExpandedDecapsWycheproof|TestMLDSANoSeedWycheproof|TestMLDSASignSeedRandomizedWycheproof|TestRSAOAEPDecryptWycheproof|TestRSAPKCS1DecryptWycheproof|TestRSAPKCS1SignaturesWycheproof|TestRSAPSSSignaturesWycheproof|TestSecpECDHSPKIWycheproof|TestSecpECDHWycheproof|TestSignSeedWycheproof|TestVerifyWycheproof|TestWycheproof|TestX509Limbo|TestX25519ECDHWycheproof)$'
+
+# Host limit: AF_UNIX sun_path caps at 108 bytes, so t.TempDir paths under the
+# deep harness $WORK tree overflow the cap and net TestUnixConnReadEOF fails at
+# bind; point TMPDIR at a fixed short path under /tmp so socket paths fit.
+mkdir /tmp/rt80
+env TMPDIR=/tmp/rt80
+
+# Host limit: os parallel tests exceed the host thread limit (fatal error:
+# thread exhaustion), and -p only caps package-level parallelism, so that
+# package runs serialized with -parallel 1 while the rest keep -p 4. The bulk
+# run covers std minus exactly os (os/exec, os/signal, os/user and the
+# vendored std packages stay in the parallel run); os gets its own serialized
+# run at each -O level, so every package is still covered at every level.
+logos test -p 4 -O=1 -skip $REDTEAM80_SKIP archive/... bufio/... bytes/... cmp/... compress/... container/... context/... crypto/... database/... debug/... embed/... encoding/... errors/... expvar/... flag/... fmt/... go/... hash/... html/... image/... index/... internal/... io/... iter/... log/... logos/... maps/... math/... mime/... net/... path/... plugin/... reflect/... regexp/... runtime/... slices/... sort/... strconv/... strings/... structs/... sync/... syscall/... testing/... text/... time/... unicode/... unique/... unsafe/... uuid/... weak/... os/exec os/exec/internal/fdtest os/signal os/user vendor/golang.org/x/crypto/chacha20 vendor/golang.org/x/crypto/chacha20poly1305 vendor/golang.org/x/crypto/cryptobyte vendor/golang.org/x/crypto/cryptobyte/asn1 vendor/golang.org/x/crypto/hkdf vendor/golang.org/x/crypto/internal/alias vendor/golang.org/x/crypto/internal/poly1305 vendor/golang.org/x/net/dns/dnsmessage vendor/golang.org/x/net/http/httpguts vendor/golang.org/x/net/http/httpproxy vendor/golang.org/x/net/http2/hpack vendor/golang.org/x/net/http3 vendor/golang.org/x/net/idna vendor/golang.org/x/net/internal/http3 vendor/golang.org/x/net/internal/httpcommon vendor/golang.org/x/net/internal/quic/quicwire vendor/golang.org/x/net/nettest vendor/golang.org/x/net/quic vendor/golang.org/x/sys/cpu vendor/golang.org/x/text/secure/bidirule vendor/golang.org/x/text/transform vendor/golang.org/x/text/unicode/bidi vendor/golang.org/x/text/unicode/norm cmd
+logos test -p 4 -O=1 -skip $REDTEAM80_SKIP -parallel 1 os
+logos test -p 4 -O=2 -skip $REDTEAM80_SKIP archive/... bufio/... bytes/... cmp/... compress/... container/... context/... crypto/... database/... debug/... embed/... encoding/... errors/... expvar/... flag/... fmt/... go/... hash/... html/... image/... index/... internal/... io/... iter/... log/... logos/... maps/... math/... mime/... net/... path/... plugin/... reflect/... regexp/... runtime/... slices/... sort/... strconv/... strings/... structs/... sync/... syscall/... testing/... text/... time/... unicode/... unique/... unsafe/... uuid/... weak/... os/exec os/exec/internal/fdtest os/signal os/user vendor/golang.org/x/crypto/chacha20 vendor/golang.org/x/crypto/chacha20poly1305 vendor/golang.org/x/crypto/cryptobyte vendor/golang.org/x/crypto/cryptobyte/asn1 vendor/golang.org/x/crypto/hkdf vendor/golang.org/x/crypto/internal/alias vendor/golang.org/x/crypto/internal/poly1305 vendor/golang.org/x/net/dns/dnsmessage vendor/golang.org/x/net/http/httpguts vendor/golang.org/x/net/http/httpproxy vendor/golang.org/x/net/http2/hpack vendor/golang.org/x/net/http3 vendor/golang.org/x/net/idna vendor/golang.org/x/net/internal/http3 vendor/golang.org/x/net/internal/httpcommon vendor/golang.org/x/net/internal/quic/quicwire vendor/golang.org/x/net/nettest vendor/golang.org/x/net/quic vendor/golang.org/x/sys/cpu vendor/golang.org/x/text/secure/bidirule vendor/golang.org/x/text/transform vendor/golang.org/x/text/unicode/bidi vendor/golang.org/x/text/unicode/norm cmd
+logos test -p 4 -O=2 -skip $REDTEAM80_SKIP -parallel 1 os
+logos test -p 4 -O=3 -skip $REDTEAM80_SKIP archive/... bufio/... bytes/... cmp/... compress/... container/... context/... crypto/... database/... debug/... embed/... encoding/... errors/... expvar/... flag/... fmt/... go/... hash/... html/... image/... index/... internal/... io/... iter/... log/... logos/... maps/... math/... mime/... net/... path/... plugin/... reflect/... regexp/... runtime/... slices/... sort/... strconv/... strings/... structs/... sync/... syscall/... testing/... text/... time/... unicode/... unique/... unsafe/... uuid/... weak/... os/exec os/exec/internal/fdtest os/signal os/user vendor/golang.org/x/crypto/chacha20 vendor/golang.org/x/crypto/chacha20poly1305 vendor/golang.org/x/crypto/cryptobyte vendor/golang.org/x/crypto/cryptobyte/asn1 vendor/golang.org/x/crypto/hkdf vendor/golang.org/x/crypto/internal/alias vendor/golang.org/x/crypto/internal/poly1305 vendor/golang.org/x/net/dns/dnsmessage vendor/golang.org/x/net/http/httpguts vendor/golang.org/x/net/http/httpproxy vendor/golang.org/x/net/http2/hpack vendor/golang.org/x/net/http3 vendor/golang.org/x/net/idna vendor/golang.org/x/net/internal/http3 vendor/golang.org/x/net/internal/httpcommon vendor/golang.org/x/net/internal/quic/quicwire vendor/golang.org/x/net/nettest vendor/golang.org/x/net/quic vendor/golang.org/x/sys/cpu vendor/golang.org/x/text/secure/bidirule vendor/golang.org/x/text/transform vendor/golang.org/x/text/unicode/bidi vendor/golang.org/x/text/unicode/norm cmd
+logos test -p 4 -O=3 -skip $REDTEAM80_SKIP -parallel 1 os
+# M22-S1 requires the same -O=1|2|3 std cmd matrix under plain go (no logos
+# wrapper) as under logos: each O level gets a bulk run plus a serialized os
+# run, so a logos-only pass cannot hide a plain-go regression at any -O.
+go test -p 4 -O=1 -skip $REDTEAM80_SKIP archive/... bufio/... bytes/... cmp/... compress/... container/... context/... crypto/... database/... debug/... embed/... encoding/... errors/... expvar/... flag/... fmt/... go/... hash/... html/... image/... index/... internal/... io/... iter/... log/... logos/... maps/... math/... mime/... net/... path/... plugin/... reflect/... regexp/... runtime/... slices/... sort/... strconv/... strings/... structs/... sync/... syscall/... testing/... text/... time/... unicode/... unique/... unsafe/... uuid/... weak/... os/exec os/exec/internal/fdtest os/signal os/user vendor/golang.org/x/crypto/chacha20 vendor/golang.org/x/crypto/chacha20poly1305 vendor/golang.org/x/crypto/cryptobyte vendor/golang.org/x/crypto/cryptobyte/asn1 vendor/golang.org/x/crypto/hkdf vendor/golang.org/x/crypto/internal/alias vendor/golang.org/x/crypto/internal/poly1305 vendor/golang.org/x/net/dns/dnsmessage vendor/golang.org/x/net/http/httpguts vendor/golang.org/x/net/http/httpproxy vendor/golang.org/x/net/http2/hpack vendor/golang.org/x/net/http3 vendor/golang.org/x/net/idna vendor/golang.org/x/net/internal/http3 vendor/golang.org/x/net/internal/httpcommon vendor/golang.org/x/net/internal/quic/quicwire vendor/golang.org/x/net/nettest vendor/golang.org/x/net/quic vendor/golang.org/x/sys/cpu vendor/golang.org/x/text/secure/bidirule vendor/golang.org/x/text/transform vendor/golang.org/x/text/unicode/bidi vendor/golang.org/x/text/unicode/norm cmd
+go test -p 4 -O=1 -skip $REDTEAM80_SKIP -parallel 1 os
+go test -p 4 -O=2 -skip $REDTEAM80_SKIP archive/... bufio/... bytes/... cmp/... compress/... container/... context/... crypto/... database/... debug/... embed/... encoding/... errors/... expvar/... flag/... fmt/... go/... hash/... html/... image/... index/... internal/... io/... iter/... log/... logos/... maps/... math/... mime/... net/... path/... plugin/... reflect/... regexp/... runtime/... slices/... sort/... strconv/... strings/... structs/... sync/... syscall/... testing/... text/... time/... unicode/... unique/... unsafe/... uuid/... weak/... os/exec os/exec/internal/fdtest os/signal os/user vendor/golang.org/x/crypto/chacha20 vendor/golang.org/x/crypto/chacha20poly1305 vendor/golang.org/x/crypto/cryptobyte vendor/golang.org/x/crypto/cryptobyte/asn1 vendor/golang.org/x/crypto/hkdf vendor/golang.org/x/crypto/internal/alias vendor/golang.org/x/crypto/internal/poly1305 vendor/golang.org/x/net/dns/dnsmessage vendor/golang.org/x/net/http/httpguts vendor/golang.org/x/net/http/httpproxy vendor/golang.org/x/net/http2/hpack vendor/golang.org/x/net/http3 vendor/golang.org/x/net/idna vendor/golang.org/x/net/internal/http3 vendor/golang.org/x/net/internal/httpcommon vendor/golang.org/x/net/internal/quic/quicwire vendor/golang.org/x/net/nettest vendor/golang.org/x/net/quic vendor/golang.org/x/sys/cpu vendor/golang.org/x/text/secure/bidirule vendor/golang.org/x/text/transform vendor/golang.org/x/text/unicode/bidi vendor/golang.org/x/text/unicode/norm cmd
+go test -p 4 -O=2 -skip $REDTEAM80_SKIP -parallel 1 os
+go test -p 4 -O=3 -skip $REDTEAM80_SKIP archive/... bufio/... bytes/... cmp/... compress/... container/... context/... crypto/... database/... debug/... embed/... encoding/... errors/... expvar/... flag/... fmt/... go/... hash/... html/... image/... index/... internal/... io/... iter/... log/... logos/... maps/... math/... mime/... net/... path/... plugin/... reflect/... regexp/... runtime/... slices/... sort/... strconv/... strings/... structs/... sync/... syscall/... testing/... text/... time/... unicode/... unique/... unsafe/... uuid/... weak/... os/exec os/exec/internal/fdtest os/signal os/user vendor/golang.org/x/crypto/chacha20 vendor/golang.org/x/crypto/chacha20poly1305 vendor/golang.org/x/crypto/cryptobyte vendor/golang.org/x/crypto/cryptobyte/asn1 vendor/golang.org/x/crypto/hkdf vendor/golang.org/x/crypto/internal/alias vendor/golang.org/x/crypto/internal/poly1305 vendor/golang.org/x/net/dns/dnsmessage vendor/golang.org/x/net/http/httpguts vendor/golang.org/x/net/http/httpproxy vendor/golang.org/x/net/http2/hpack vendor/golang.org/x/net/http3 vendor/golang.org/x/net/idna vendor/golang.org/x/net/internal/http3 vendor/golang.org/x/net/internal/httpcommon vendor/golang.org/x/net/internal/quic/quicwire vendor/golang.org/x/net/nettest vendor/golang.org/x/net/quic vendor/golang.org/x/sys/cpu vendor/golang.org/x/text/secure/bidirule vendor/golang.org/x/text/transform vendor/golang.org/x/text/unicode/bidi vendor/golang.org/x/text/unicode/norm cmd
+go test -p 4 -O=3 -skip $REDTEAM80_SKIP -parallel 1 os
+rm /tmp/rt80
+
+-- go.mod --
+module example.com/redteam80
+
+go 1.27
