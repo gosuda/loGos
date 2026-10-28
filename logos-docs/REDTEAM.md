@@ -70,7 +70,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #64 | M6 | test/logos/run/interp.lgo (nextID once, tag order) | tested |
 | #65 | M7 | test/logos/run/const_for.lgo; src/cmd/go/testdata/script/logos_comptime_cross.txt | tested |
 | #66 |M1| test/logos/redteam/attack_066_errdefer_unnamed_results | tested |
-| #67 | M6, M13 | M6 half: src/cmd/compile/internal/logos/m6gaps_test.go (TestChainSumPairwise); test/logos/run/chains.lgo (sum order). M13: (planned: no dedicated redteam67 attack file; cross-arch FMA sum-drift attack missing, arm64 leg still uncovered) | planned |
+| #67 | M6, M13 | M6 half: src/cmd/compile/internal/logos/m6gaps_test.go (TestChainSumPairwise); test/logos/run/chains.lgo (sum order). M13 half: blocked on the arm64 leg, which this host cannot execute; no dedicated redteam67 attack fixture exists yet, and a cross-architecture FMA sum-drift attack needs both architectures to mean anything | blocked |
 | #68 | M8 | src/logos/rt/group_test.go (FirstErrorWins, CancelReachesSibling); test/logos/run/group_exit.lgo | tested |
 | #69 | M10 | src/cmd/go/testdata/script/logos_next.txt; src/cmd/compile/internal/logos/next_test.go | tested |
 | #70 | M5 | test/logos/codegen/rodata.lgo | tested |
