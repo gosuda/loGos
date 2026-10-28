@@ -553,7 +553,12 @@ func zgcPublishToSpaceSpans(pg *zgcPage) {
 		}
 		zgcScrubToSpaceMarks(s)
 		atomic.Store(&s.sweepgen, mheap_.sweepgen)
-		if s.allocCount == 0 {
+		// A destination span with no free slot left belongs on fullSwept.
+		// cacheSpan pops partialSwept expecting a free object and throws
+		// "span has no free objects" when there is none, which is what a
+		// to-space span filled to nelems would do. The ordinary sweep
+		// makes the same split on nalloc == nelems.
+		if s.allocCount == 0 || s.allocCount == s.nelems || s.freeindex == s.nelems {
 			mheap_.central[s.spanclass].mcentral.fullSwept(mheap_.sweepgen).push(s)
 		} else {
 			mheap_.central[s.spanclass].mcentral.partialSwept(mheap_.sweepgen).push(s)
