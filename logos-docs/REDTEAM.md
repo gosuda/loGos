@@ -84,7 +84,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #78 | M16 | test/logos/codegen/wasm_align.lgo | tested |
 | #79 |M1| test/logos/redteam/attack_079_import_alias_collision | tested |
 | #80 | M22 | src/cmd/go/testdata/script/logos_redteam_80.txt (planned: script exists, no executed test/logos attack run) | planned |
-| #81 | M18 | src/cmd/go/testdata/script/logos_redteam_81.txt (planned: script exists, no executed test/logos attack run) | planned |
+| #81 | M18 | src/cmd/go/testdata/script/logos_redteam_81.txt (executed 2026-10-28: `go test cmd/go -run 'Script/^logos_redteam_81$'` passes, race leg included) | tested |
 | #82 |M2| test/logos/redteam/attack_082_union_gc_shape | tested |
 | #83 | M5 | test/logos/run/zerocopy.lgo | tested |
 | #84 | M6 | src/cmd/compile/internal/logos/m6gaps_test.go (TestChainFuseOneLoop) | tested |
@@ -109,7 +109,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #103 | M5 | src/internal/types/testdata/logos/ctfe.lgo | tested |
 | #104 | M13 | test/logos/codegen/cold_frame_pointer.lgo | tested |
 | #105 | M13 | test/logos/redteam/attack_105_no_cold_section.lgo | tested |
-| #106 | M18 | src/cmd/go/testdata/script/logos_redteam_106.txt (planned: script exists, no executed test/logos attack run) | planned |
+| #106 | M18 | src/cmd/go/testdata/script/logos_redteam_106.txt (executed 2026-10-28: `go test cmd/go -run 'Script/^logos_redteam_106$'` passes, race leg included) | tested |
 | #107 | M13 | src/cmd/go/testdata/script/logos_opt_levels.txt | tested |
 | #108 | M7 | src/cmd/go/testdata/script/logos_eject_const_switch.txt; src/cmd/compile/internal/logos (TestEjectMatchesLowering) | tested |
 | #109 | M10 | src/cmd/go/testdata/script/logos_next.txt (goldens, ! logos fmt) | tested |
