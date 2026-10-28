@@ -466,6 +466,12 @@ func (s *mspan) ensureSwept() {
 	// Caller must disable preemption.
 	// Otherwise when this function returns the span can become unswept again
 	// (if GC is triggered on another goroutine).
+	if zgcQuarantineBypass(s) {
+		// A quarantined source span never rejoins the sweep: its
+		// sweepgen is pinned past the sweeper and its slots die with
+		// the page. Waiting for its sweep would spin forever.
+		return
+	}
 	gp := getg()
 	if gp.m.locks == 0 && gp.m.mallocing == 0 && gp != gp.m.g0 {
 		throw("mspan.ensureSwept: m is not locked")
@@ -515,6 +521,10 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		// We'll release ownership of this span. Nil it out to
 		// prevent the caller from accidentally using it.
 		sl.mspan = nil
+	}
+
+	if zgcSweepGuard(s) {
+		return false
 	}
 
 	sweepgen := mheap_.sweepgen
@@ -623,7 +633,7 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		spanHasNoSpecials(s)
 	}
 
-	if traceAllocFreeEnabled() || debug.clobberfree != 0 || raceenabled || msanenabled || asanenabled {
+	if traceAllocFreeEnabled() || debug.clobberfree != 0 || raceenabled || msanenabled || asanenabled || zgcIdentityTracking() {
 		// Find all newly freed objects.
 		mbits := s.markBitsForBase()
 		abits := s.allocBitsForIndex(0)
@@ -652,6 +662,9 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				}
 				if valgrindenabled && !s.isUserArenaChunk {
 					valgrindFree(unsafe.Pointer(x))
+				}
+				if zgcIdentityTracking() {
+					zgcIdentitySweepFree(x)
 				}
 			}
 			mbits.advance()

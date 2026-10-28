@@ -887,7 +887,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 
 	any := false
 	for i, param := range params {
-		if p.needsPointerCheck(f, param.Go, args[i]) {
+		if p.needsPointerCheck(f, param.Go, args[i]) || p.needsCanonicalize(f, param.Go) {
 			any = true
 			break
 		}
@@ -973,8 +973,12 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	sb.WriteString("{ ")
 
 	// Define _cgoN for each argument value.
-	// Write _cgoCheckPointer calls to sbCheck.
-	var sbCheck bytes.Buffer
+	// Write _cgoCheckPointer calls to sbCheck, and the zgc
+	// canonicalization fixups to sbCanonical. The fixup canonicalizes
+	// the nested pointer words of each pointer-bearing argument on the
+	// _cgoN copy the call passes, so the frame C reads is canonical
+	// under the zgc collector; identity otherwise.
+	var sbCheck, sbCanonical bytes.Buffer
 	for i, param := range params {
 		origArg := args[i]
 		arg, nu := p.mangle(f, &args[i], true)
@@ -986,39 +990,56 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 		// constants to the parameter type, to avoid a type mismatch.
 		ptype := p.rewriteUnsafe(param.Go)
 
-		if !p.needsPointerCheck(f, param.Go, args[i]) || param.BadPointer || p.checkUnsafeStringData(args[i]) {
+		checked := p.needsPointerCheck(f, param.Go, args[i])
+		if !checked || param.BadPointer || p.checkUnsafeStringData(args[i]) {
 			if ptype != param.Go {
 				needsUnsafe = true
 			}
 			fmt.Fprintf(&sb, "var _cgo%d %s = %s; ", i,
 				gofmt(ptype), gofmtPos(arg, origArg.Pos()))
+			if !param.BadPointer && !p.checkUnsafeStringData(args[i]) && p.needsCanonicalize(f, param.Go) {
+				// Unchecked pointer-bearing argument: canonicalize
+				// its nested words even when cgocheck skips it.
+				fmt.Fprintf(&sbCanonical, "_cgoCanonicalizeSlot(_cgo%d, _cgo_unsafe.Pointer(&_cgo%d)); ", i, i)
+			}
 			continue
 		}
 
 		// Check for &a[i].
-		if p.checkIndex(&sb, &sbCheck, arg, i) {
+		if p.checkIndex(&sb, &sbCanonical, &sbCheck, arg, i) {
 			continue
 		}
 
 		// Check for &x.
-		if p.checkAddr(&sb, &sbCheck, arg, i) {
+		if p.checkAddr(&sb, &sbCanonical, &sbCheck, arg, i) {
 			continue
 		}
 
 		// Check for a[:].
-		if p.checkSlice(&sb, &sbCheck, arg, i) {
+		if p.checkSlice(&sb, &sbCanonical, &sbCheck, arg, i) {
 			continue
 		}
 
 		fmt.Fprintf(&sb, "_cgo%d := %s; ", i, gofmtPos(arg, origArg.Pos()))
+		if p.needsCanonicalize(f, param.Go) {
+			fmt.Fprintf(&sbCanonical, "_cgoCanonicalizeSlot(_cgo%d, _cgo_unsafe.Pointer(&_cgo%d)); ", i, i)
+		}
 		fmt.Fprintf(&sbCheck, "_cgoCheckPointer(_cgo%d, nil); ", i)
+	}
+
+	if sbCanonical.Len() != 0 {
+		// The fixups reference _cgo_unsafe.Pointer (the only unsafe
+		// spelling the generated file imports), so the generated
+		// file needs the unsafe import even when no check wanted it.
+		needsUnsafe = true
 	}
 
 	if call.Deferred {
 		sb.WriteString("return func() { ")
 	}
 
-	// Write out the calls to _cgoCheckPointer.
+	// Canonicalize first (identity without zgc), then check.
+	sb.WriteString(sbCanonical.String())
 	sb.WriteString(sbCheck.String())
 
 	if result {
@@ -1206,6 +1227,15 @@ func (p *Package) mangle(f *File, arg *ast.Expr, addPosition bool) (ast.Expr, bo
 	return *arg, needsUnsafe
 }
 
+// needsCanonicalize reports whether a value of type t, when passed to C,
+// must have its nested pointer words canonicalized before the frame is
+// built. The same reachability surface the pointer check uses: a type
+// that can carry a Go pointer to Go pointers needs the fixup; plain
+// scalars and opaque words do not.
+func (p *Package) needsCanonicalize(f *File, t ast.Expr) bool {
+	return p.hasPointer(f, t, true)
+}
+
 // checkIndex checks whether arg has the form &a[i], possibly inside
 // type conversions. If so, then in the general case it writes
 //
@@ -1226,7 +1256,7 @@ func (p *Package) mangle(f *File, arg *ast.Expr, addPosition bool) (ast.Expr, bo
 //
 // This tells _cgoCheckPointer to check the complete contents of the
 // slice or array being indexed, but no other part of the memory allocation.
-func (p *Package) checkIndex(sb, sbCheck *bytes.Buffer, arg ast.Expr, i int) bool {
+func (p *Package) checkIndex(sb, sbCanonical, sbCheck *bytes.Buffer, arg ast.Expr, i int) bool {
 	// Strip type conversions.
 	x := arg
 	for {
@@ -1264,6 +1294,10 @@ func (p *Package) checkIndex(sb, sbCheck *bytes.Buffer, arg ast.Expr, i int) boo
 	fmt.Fprintf(sb, "_cgo%d := %s; ", i, gofmtPos(arg, arg.Pos()))
 	index.X = origX
 
+	// Canonicalize the nested pointer words the _cgoN copy carries;
+	// identity without the zgc cycle.
+	fmt.Fprintf(sbCanonical, "_cgoCanonicalizeSlot(_cgo%d, _cgo_unsafe.Pointer(&_cgo%d)); ", i, i)
+
 	fmt.Fprintf(sbCheck, "_cgoCheckPointer(_cgo%d, %s_cgoIndex%d); ", i, deref, i)
 
 	return true
@@ -1283,7 +1317,7 @@ func (p *Package) checkIndex(sb, sbCheck *bytes.Buffer, arg ast.Expr, i int) boo
 // just the contents of the pointer being passed, not any other part
 // of the memory allocation. This is run after checkIndex, which looks
 // for the special case of &a[i], which requires different checks.
-func (p *Package) checkAddr(sb, sbCheck *bytes.Buffer, arg ast.Expr, i int) bool {
+func (p *Package) checkAddr(sb, sbCanonical, sbCheck *bytes.Buffer, arg ast.Expr, i int) bool {
 	// Strip type conversions.
 	px := &arg
 	for {
@@ -1307,6 +1341,10 @@ func (p *Package) checkAddr(sb, sbCheck *bytes.Buffer, arg ast.Expr, i int) bool
 	fmt.Fprintf(sb, "_cgo%d := %s; ", i, gofmtPos(arg, arg.Pos()))
 	*px = origX
 
+	// Canonicalize the nested pointer words the _cgoN copy carries;
+	// identity without the zgc cycle.
+	fmt.Fprintf(sbCanonical, "_cgoCanonicalizeSlot(_cgo%d, _cgo_unsafe.Pointer(&_cgo%d)); ", i, i)
+
 	// Use "0 == 0" to do the right thing in the unlikely event
 	// that "true" is shadowed.
 	fmt.Fprintf(sbCheck, "_cgoCheckPointer(_cgoBase%d, 0 == 0); ", i)
@@ -1327,7 +1365,7 @@ func (p *Package) checkAddr(sb, sbCheck *bytes.Buffer, arg ast.Expr, i int) bool
 // to sbCheck, and returns true. This tells _cgoCheckPointer to check
 // just the contents of the slice being passed, not any other part
 // of the memory allocation.
-func (p *Package) checkSlice(sb, sbCheck *bytes.Buffer, arg ast.Expr, i int) bool {
+func (p *Package) checkSlice(sb, sbCanonical, sbCheck *bytes.Buffer, arg ast.Expr, i int) bool {
 	// Strip type conversions.
 	px := &arg
 	for {
@@ -1350,6 +1388,10 @@ func (p *Package) checkSlice(sb, sbCheck *bytes.Buffer, arg ast.Expr, i int) boo
 	*px = ast.NewIdent(fmt.Sprintf("_cgoSlice%d", i))
 	fmt.Fprintf(sb, "_cgo%d := %s; ", i, gofmtPos(arg, arg.Pos()))
 	*px = origX
+
+	// Canonicalize the nested pointer words the _cgoN copy carries;
+	// identity without the zgc cycle.
+	fmt.Fprintf(sbCanonical, "_cgoCanonicalizeSlot(_cgo%d, _cgo_unsafe.Pointer(&_cgo%d)); ", i, i)
 
 	// Use 0 == 0 to do the right thing in the unlikely event
 	// that "true" is shadowed.

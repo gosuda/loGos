@@ -380,7 +380,17 @@ func (s *logosPurity) visitCall(c *syntax.CallExpr) bool {
 		}
 	case *syntax.SelectorExpr:
 		if x, ok := syntax.Unparen(fun.X).(*syntax.Name); ok {
-			if _, ok := s.pkgName(x); ok {
+			if pn, ok := s.pkgName(x); ok {
+				path := ""
+				if imp := pn.Imported(); imp != nil {
+					path = imp.Path()
+				}
+				if admitted, detail := check.logosAdmitImportedConstFunc(path, fun.Sel.Value); admitted {
+					return true
+				} else if detail != "" {
+					s.fail(c, "call to imported function %s in const func: %s", selText(fun), detail)
+					return false
+				}
 				s.fail(c, "call to imported function %s in const func", selText(fun))
 				return false
 			}

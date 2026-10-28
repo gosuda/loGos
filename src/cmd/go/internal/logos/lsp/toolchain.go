@@ -120,7 +120,7 @@ func (t *toolchain) newOverlay(buffers map[string][]byte) (*overlay, error) {
 }
 
 // release removes the overlay files.
-func (ov *overlay) release() { os.RemoveAll(ov.root) }
+func (ov *overlay) release() error { return os.RemoveAll(ov.root) }
 
 // source returns the source path a compiler path refers to: the path of
 // the buffer when file is one of the backing files, else file itself.
@@ -157,9 +157,9 @@ func (t *toolchain) runEnv(ctx context.Context, dir string, env []string, args .
 
 // closure lists the packages the package in dir depends on, itself
 // included, with the flags in extra added to the list command.
-func (t *toolchain) closure(ctx context.Context, dir string, ov *overlay, extra ...string) ([]pkgInfo, error) {
+func (t *toolchain) closure(ctx context.Context, dir string, env []string, ov *overlay, extra ...string) ([]pkgInfo, error) {
 	args := append([]string{"list", "-e", "-deps", "-overlay=" + ov.json, "-f", listTemplate}, extra...)
-	out, stderr, err := t.run(ctx, dir, append(args, ".")...)
+	out, stderr, err := t.runEnv(ctx, dir, env, append(args, ".")...)
 	if err != nil {
 		return nil, err
 	}
@@ -212,17 +212,21 @@ func gcflag(importPath string, flags ...string) (string, error) {
 }
 
 // Lower implements Compiler.
-func (t *toolchain) Lower(ctx context.Context, dir string, buffers map[string][]byte) (*Lowering, error) {
+func (t *toolchain) Lower(ctx context.Context, dir string, buffers map[string][]byte) (low *Lowering, err error) {
 	ov, err := t.newOverlay(buffers)
 	if err != nil {
 		return nil, err
 	}
-	defer ov.release()
-	pkgs, err := t.closure(ctx, dir, ov)
+	defer func() {
+		if rerr := ov.release(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
+	pkgs, err := t.closure(ctx, dir, nil, ov)
 	if err != nil {
 		return nil, err
 	}
-	low := &Lowering{}
+	low = &Lowering{}
 	var targets []pkgInfo
 	for _, p := range pkgs {
 		if p.standard {
@@ -245,12 +249,16 @@ func (t *toolchain) Lower(ctx context.Context, dir string, buffers map[string][]
 // eject builds the packages of targets with the eject flag, so the
 // compiler writes their lowered files. A package that fails to compile
 // writes nothing; the caller finds out by its missing files.
-func (t *toolchain) eject(ctx context.Context, dir string, ov *overlay, targets []pkgInfo) error {
+func (t *toolchain) eject(ctx context.Context, dir string, ov *overlay, targets []pkgInfo) (err error) {
 	if len(targets) == 0 {
 		return nil
 	}
 	bin := filepath.Join(t.stage, "bin")
-	defer os.RemoveAll(bin)
+	defer func() {
+		if rerr := os.RemoveAll(bin); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	output, err := executableDirFlag(targets, bin)
 	if err != nil {
 		return err
@@ -336,17 +344,20 @@ func sourceText(path string, buffers map[string][]byte) ([]byte, error) {
 
 // Diagnose implements Compiler. It runs logos lint, which type-checks the
 // package and runs the compiler lints without building a binary.
-func (t *toolchain) Diagnose(ctx context.Context, dir string, buffers map[string][]byte) ([]Diagnostic, error) {
+func (t *toolchain) Diagnose(ctx context.Context, dir string, buffers map[string][]byte) (diags []Diagnostic, err error) {
 	ov, err := t.newOverlay(buffers)
 	if err != nil {
 		return nil, err
 	}
-	defer ov.release()
+	defer func() {
+		if rerr := ov.release(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	_, stderr, err := t.run(ctx, dir, "lint", "--json-diagnostics", "-overlay="+ov.json, ".")
 	if err != nil {
 		return nil, err
 	}
-	var diags []Diagnostic
 	for line := range bytes.SplitSeq(stderr, []byte("\n")) {
 		if d, ok := parseDiagnostic(line); ok {
 			d.File = ov.source(d.File)
@@ -363,13 +374,21 @@ func (t *toolchain) Diagnose(ctx context.Context, dir string, buffers map[string
 // runs directly: the export data of the package's imports comes from
 // logos list -export, and the sources are the package's own files, with
 // the text of unsaved buffers in place of the files on disk.
-func (t *toolchain) Hints(ctx context.Context, dir string, buffers map[string][]byte) (json.RawMessage, error) {
+func (t *toolchain) Hints(ctx context.Context, dir string, buffers map[string][]byte) (_ json.RawMessage, err error) {
 	ov, err := t.newOverlay(buffers)
 	if err != nil {
 		return nil, err
 	}
-	defer ov.release()
-	pkgs, err := t.closure(ctx, dir, ov, "-export")
+	defer func() {
+		if rerr := ov.release(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
+	env, err := t.managedHintsEnv(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	pkgs, err := t.closure(ctx, dir, env, ov, "-export")
 	if err != nil {
 		return nil, err
 	}
@@ -381,13 +400,17 @@ func (t *toolchain) Hints(ctx context.Context, dir string, buffers map[string][]
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(work)
-	return t.compileHints(ctx, work, pkgs[i], pkgs, buffers)
+	defer func() {
+		if rerr := os.RemoveAll(work); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
+	return t.compileHints(ctx, work, env, pkgs[i], pkgs, buffers)
 }
 
 // compileHints writes the importcfg and sources of target under work and
 // runs the compiler in hints mode.
-func (t *toolchain) compileHints(ctx context.Context, work string, target pkgInfo, pkgs []pkgInfo, buffers map[string][]byte) (json.RawMessage, error) {
+func (t *toolchain) compileHints(ctx context.Context, work string, env []string, target pkgInfo, pkgs []pkgInfo, buffers map[string][]byte) (json.RawMessage, error) {
 	importcfg := filepath.Join(work, "importcfg")
 	if err := os.WriteFile(importcfg, importConfig(pkgs, target), 0o666); err != nil {
 		return nil, err
@@ -399,7 +422,7 @@ func (t *toolchain) compileHints(ctx context.Context, work string, target pkgInf
 	out := filepath.Join(work, "hints.json")
 	args := []string{"tool", "compile", "-p", target.importPath, "-importcfg", importcfg,
 		"-logos.mode=hints", "-logos.hintsout=" + out, "-o", filepath.Join(work, "x.a")}
-	stdout, stderr, err := t.runEnv(ctx, target.dir, hintsEnv(target.dir), append(args, files...)...)
+	stdout, stderr, err := t.runEnv(ctx, target.dir, env, append(args, files...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -409,6 +432,40 @@ func (t *toolchain) compileHints(ctx context.Context, work string, target pkgInf
 		return nil, fmt.Errorf("no hints for %s: %s", target.importPath, detail)
 	}
 	return json.RawMessage(data), nil
+}
+
+// managedHintsEnv returns the environment for the hints runner: hintsEnv(dir)
+// merged with the GOEXPERIMENT and CGO_ENABLED the logos driver selected for dir.
+func (t *toolchain) managedHintsEnv(ctx context.Context, dir string) ([]string, error) {
+	stdout, stderr, err := t.run(ctx, dir, "env", "-json", "GOEXPERIMENT", "CGO_ENABLED")
+	if err != nil {
+		return nil, err
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	var vals map[string]string
+	if err := json.Unmarshal(stdout, &vals); err != nil {
+		return nil, fmt.Errorf("logos env: %v: %s", err, strings.TrimSpace(string(stderr)))
+	}
+	return overrideEnv(hintsEnv(dir), vals), nil
+}
+
+// overrideEnv returns a fresh copy of base with keys in vals replaced or added.
+func overrideEnv(base []string, vals map[string]string) []string {
+	keep := make([]string, 0, len(base)+len(vals))
+	for _, kv := range base {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			if _, override := vals[k]; override {
+				continue
+			}
+		}
+		keep = append(keep, kv)
+	}
+	for _, k := range slices.Sorted(maps.Keys(vals)) {
+		keep = append(keep, k+"="+vals[k])
+	}
+	return keep
 }
 
 // hintsEnv returns the environment for the direct hints compile: the

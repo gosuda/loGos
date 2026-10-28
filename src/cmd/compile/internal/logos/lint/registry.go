@@ -27,4 +27,11 @@ var registry = []Rule{
 	aliasExtension,
 	unclosedIOCloser,
 	unboundedChannelOp,
+	printfMisuse,
+	copyLock,
+	structtagMalformed,
+	stringIntconv,
+	selfAssignment,
+	deferInLoop,
+	httpResponse,
 }

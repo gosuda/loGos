@@ -13,4 +13,5 @@ func init() {
 	for _, arch := range sys.Archs {
 		wantIntrinsics[testIntrinsicKey{arch.Name, "logos/rt", "Cold"}] = struct{}{}
 	}
+	wantIntrinsics[testIntrinsicKey{"amd64", "runtime", "logosArenaBump"}] = struct{}{}
 }

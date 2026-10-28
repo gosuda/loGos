@@ -37,11 +37,11 @@ func TestPosMapKeepsOperandOfQuestionStatement(t *testing.T) {
 	srcLine := lineOf(src, 5)
 	for _, word := range []string{"data", "os", "ReadFile", "path"} {
 		orig := Position{Line: 5, Character: strings.Index(srcLine, word)}
-		low := pm.toLowered(orig, leading)
+		low := pm.toLowered(orig)
 		if got := lineOf(out, low.Line)[low.Character:]; !strings.HasPrefix(got, word) {
 			t.Errorf("%s: source %v maps to lowered %v, which starts %q", word, orig, low, got)
 		}
-		if back := pm.toOriginal(low, leading); back != orig {
+		if back := pm.toOriginal(low); back != orig {
 			t.Errorf("%s: round trip %v -> %v -> %v", word, orig, low, back)
 		}
 	}
@@ -61,7 +61,7 @@ func TestPosMapGeneratedLinesMapToQuestionStatement(t *testing.T) {
 	for line := 5; line <= 7; line++ {
 		text := lineOf(out, line)
 		for col := 0; col <= len(text); col++ {
-			orig := pm.toOriginal(Position{Line: line, Character: col}, leading)
+			orig := pm.toOriginal(Position{Line: line, Character: col})
 			if orig.Line != 5 || orig.Character > len(srcLine) {
 				t.Errorf("lowered %d:%d maps to %v, outside source line 5", line, col, orig)
 			}
@@ -71,7 +71,7 @@ func TestPosMapGeneratedLinesMapToQuestionStatement(t *testing.T) {
 		}
 	}
 	q := Position{Line: 5, Character: qcol}
-	low := pm.toLowered(q, leading)
+	low := pm.toLowered(q)
 	if low.Line != 5 || low.Character != len(lineOf(out, 5)) {
 		t.Errorf("? at %v maps to %v, want the end of lowered line 5", q, low)
 	}
@@ -133,7 +133,7 @@ func TestPosMapDeletion(t *testing.T) {
 	if got := pm.origOffset(0, trailing); got != 0 {
 		t.Errorf("trailing seam maps to %d, want before the deleted line", got)
 	}
-	if got := pm.toLowered(Position{Line: 1, Character: 0}, leading); got != (Position{Line: 0, Character: 0}) {
+	if got := pm.toLowered(Position{Line: 1, Character: 0}); got != (Position{Line: 0, Character: 0}) {
 		t.Errorf("the line after the deletion maps to %v, want 0:0", got)
 	}
 }

@@ -6,6 +6,7 @@ package logos
 
 import (
 	"encoding/json"
+	"internal/buildcfg"
 	"internal/testenv"
 	"os"
 	"os/exec"
@@ -144,23 +145,30 @@ func TestCompileHintsLgoPackage(t *testing.T) {
 	for _, s := range f.Sites {
 		kinds[s.Kind]++
 	}
-	for _, k := range []string{SiteTry, SiteInterp, SiteConstSwitch} {
+	for _, k := range []string{SiteTry, SiteInterp, SiteConstSwitch, SiteConstFor} {
 		if kinds[k] != 1 {
 			t.Errorf("%d %s sites, want 1", kinds[k], k)
 		}
 	}
+	wantArena := TierStack
+	if buildcfg.Experiment.LogosArena {
+		wantArena = TierArena
+	}
+	makeParen := positionAt(src, strings.Index(string(src), "make([]byte, n)")+len("make"))
 	for _, c := range []struct {
-		needle string
-		tier   string
+		pos  HintPos
+		name string
+		tier string
 	}{
-		{"&User{Name: \"ada\"}", TierHeap},
-		{"&User{Name: \"kept\"}", TierHeap},
-		{"&User{Name: \"tmp\"}", TierStack},
-		{"primes", TierRodata},
+		{startOf(t, src, "&User{Name: \"ada\"}"), "&User{Name: \"ada\"}", TierHeap},
+		{startOf(t, src, "&User{Name: \"kept\"}"), "&User{Name: \"kept\"}", TierHeap},
+		{startOf(t, src, "&User{Name: \"tmp\"}"), "&User{Name: \"tmp\"}", TierStack},
+		{startOf(t, src, "primes"), "primes", TierRodata},
+		{makeParen, "make([]byte, n)", wantArena},
 	} {
-		a, ok := allocAt(f.Allocs, startOf(t, src, c.needle))
+		a, ok := allocAt(f.Allocs, c.pos)
 		if !ok || a.Tier != c.tier {
-			t.Errorf("allocation at %s: got %+v (found %v), want tier %s", c.needle, a, ok, c.tier)
+			t.Errorf("allocation at %s: got %+v (found %v), want tier %s", c.name, a, ok, c.tier)
 		}
 	}
 }

@@ -1,0 +1,28 @@
+// run
+
+package main
+
+import "fmt"
+
+func pair() (int, int) { return 1, 2 }
+
+func f() (a, b int) {
+	{
+		scope defer func() { a++ }()
+		return pair()
+	}
+}
+
+func bare() (a int) {
+	{
+		scope defer func() { a++ }()
+		a = 41
+		return
+	}
+}
+
+func main() {
+	a, b := f()
+	fmt.Println(a, b)
+	fmt.Println(bare())
+}

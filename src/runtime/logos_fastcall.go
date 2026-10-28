@@ -42,6 +42,16 @@ func logosCgocallFast(fn, arg unsafe.Pointer) int32 {
 		throw("cgocall nil")
 	}
 
+	// The fast branch bypasses cgocall, whose top-level untag never
+	// runs here. Untag before logosRecordFastCall records the frame
+	// pointer and before reentersyscall and asmcgocall use it, so the
+	// record and the C call see a canonical frame pointer. With
+	// colors inert this is the identity, preserving the exact default
+	// behavior; foreign words pass through. The nested typed graph is
+	// canonicalized at the generated call site (the W2 emission), not
+	// here: this nosplit path cannot walk types.
+	arg = logosZgcUntagArg(arg)
+
 	mp := getg().m
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(&racecgosync))

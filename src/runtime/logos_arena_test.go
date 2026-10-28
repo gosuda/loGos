@@ -8,8 +8,10 @@ package runtime_test
 
 import (
 	"fmt"
+	"internal/goexperiment"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -684,6 +686,149 @@ func TestLogosArenaScanOverNoscanDirt(t *testing.T) {
 		}
 		if !checkBytes(q, size, 0) {
 			t.Error("scan object over dirtied noscan bytes is not zero")
+		}
+	})
+}
+
+// M18-S2 (SPEC Sec 8.3): the consent token is one-shot. Taking it returns
+// what the caller set and clears it, so a later take sees no consent.
+func TestLogosArenaRetTokenIsOneShot(t *testing.T) {
+	inFreshGoroutine(t, func() {
+		if runtime.LogosArenaRetTake() {
+			t.Error("fresh goroutine holds a consent token")
+		}
+		runtime.LogosArenaRetSet(true)
+		if !runtime.LogosArenaRetTake() {
+			t.Error("take after set(true) = false")
+		}
+		if runtime.LogosArenaRetTake() {
+			t.Error("second take after one set = true: the token was not cleared")
+		}
+		runtime.LogosArenaRetSet(true)
+		runtime.LogosArenaRetSet(false)
+		if runtime.LogosArenaRetTake() {
+			t.Error("take after set(true) then set(false) = true")
+		}
+	})
+}
+
+// M18-S2: the flat word pair from LogosArenaMarkSave round-trips through
+// LogosArenaMarkRestore: allocating after the save and restoring returns
+// the watermark to exactly the saved words, for both regions.
+func TestLogosArenaMarkWordPairRoundTrip(t *testing.T) {
+	inFreshGoroutine(t, func() {
+		chunk, noscan, scan := runtime.LogosArenaMarkSave()
+		if chunk != 0 || noscan != 0 || scan != 0 {
+			t.Errorf("empty arena MarkSave = (%d, %d, %d), want zero triple", chunk, noscan, scan)
+		}
+		if p := runtime.LogosArenaAlloc(byte(0), 64); p == nil {
+			t.Fatal("LogosArenaAlloc returned nil")
+		}
+		if st := runtime.LogosArenaStat(); st.NoscanUsed == 0 {
+			t.Error("NoscanUsed = 0 after allocation, want > 0")
+		}
+		runtime.LogosArenaMarkRestore(chunk, noscan, scan)
+		if st := runtime.LogosArenaStat(); st.NoscanUsed != 0 || st.ScanUsed != 0 {
+			t.Errorf("after restoring the zero triple: NoscanUsed=%d ScanUsed=%d, want 0, 0", st.NoscanUsed, st.ScanUsed)
+		}
+		if p := runtime.LogosArenaAlloc(byte(0), 32); p == nil {
+			t.Fatal("LogosArenaAlloc returned nil")
+		}
+		base := runtime.LogosArenaStat()
+		chunk, noscan, scan = runtime.LogosArenaMarkSave()
+		if chunk == 0 {
+			t.Error("MarkSave after allocation returned a zero chunk word")
+		}
+		if p := runtime.LogosArenaAlloc(byte(0), 64); p == nil {
+			t.Fatal("LogosArenaAlloc returned nil")
+		}
+		if p := runtime.LogosArenaAllocScan((*int)(nil), 64); p == nil {
+			t.Fatal("LogosArenaAllocScan returned nil")
+		}
+		runtime.LogosArenaMarkRestore(chunk, noscan, scan)
+		if st := runtime.LogosArenaStat(); st != base {
+			t.Errorf("after word-pair restore: stat = %+v, want %+v", st, base)
+		}
+	})
+}
+
+// M18-S2: an exiting goroutine clears an unconsumed token, so a goroutine
+// that reuses its g never starts with someone else's consent.
+func TestLogosArenaExitClearsToken(t *testing.T) {
+	var wg sync.WaitGroup
+	for range 64 {
+		wg.Go(func() {
+			runtime.LogosArenaRetSet(true)
+			runtime.Goexit()
+		})
+	}
+	wg.Wait()
+	var stale atomic.Int32
+	for range 64 {
+		wg.Go(func() {
+			if runtime.LogosArenaRetTake() {
+				stale.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	if n := stale.Load(); n != 0 {
+		t.Errorf("%d goroutines started with a stale consent token", n)
+	}
+}
+
+// M18-S2/S3: g.logosArena sits immediately after stackguard1, at offset
+// 4*PtrSize (stack is two words, then stackguard0, then stackguard1). The
+// compiler's inline bump (S8) hard-codes this offset; this test is its pin.
+func TestLogosArenaFieldOffset(t *testing.T) {
+	if want := 4 * unsafe.Sizeof(uintptr(0)); runtime.LogosArenaFieldOffset != want {
+		t.Errorf("unsafe.Offsetof(g{}.logosArena) = %d, want %d (4*PtrSize)", runtime.LogosArenaFieldOffset, want)
+	}
+}
+
+//go:noinline
+func arenaEligibleMake(n int) uintptr {
+	b := make([]byte, n)
+	if len(b) > 0 {
+		b[0] = 42
+	}
+	during := runtime.LogosArenaStat().NoscanUsed
+	if len(b) > 0 && b[0] != 42 {
+		panic("memory corrupted")
+	}
+	return during
+}
+
+// M18-S3: an arena-eligible make of dynamic size allocates from the arena
+// bump allocator, advancing the watermark, and restores the watermark when
+// the frame exits.
+func TestLogosArenaDynamicMakeWatermark(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	inFreshGoroutine(t, func() {
+		before := runtime.LogosArenaStat().NoscanUsed
+
+		// First call: dynamic make of 1024 bytes.
+		during1 := arenaEligibleMake(1024)
+		after1 := runtime.LogosArenaStat().NoscanUsed
+
+		if during1 <= before {
+			t.Errorf("call 1: watermark during make = %d, want > %d (watermark did not advance)", during1, before)
+		}
+		if after1 != before {
+			t.Errorf("call 1: watermark after frame exit = %d, want %d (watermark did not fall back)", after1, before)
+		}
+
+		// Second call: dynamic make of 2048 bytes.
+		during2 := arenaEligibleMake(2048)
+		after2 := runtime.LogosArenaStat().NoscanUsed
+
+		if during2 <= before {
+			t.Errorf("call 2: watermark during make = %d, want > %d (watermark did not advance)", during2, before)
+		}
+		if after2 != before {
+			t.Errorf("call 2: watermark after frame exit = %d, want %d (watermark did not fall back)", after2, before)
 		}
 	})
 }

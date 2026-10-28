@@ -213,6 +213,7 @@ func bootstrapBuildTools() {
 			return nil
 		})
 	}
+	bootstrapCopyLogosVendor(base)
 
 	// Set up environment for invoking Go bootstrap toolchains go command.
 	// GOROOT points at Go bootstrap GOROOT,
@@ -370,6 +371,7 @@ func bootstrapFixImports(srcFile string) string {
 		}
 
 		path := m[2]
+		path = bootstrapRewriteLogosImport(path)
 		if strings.HasPrefix(path, "cmd/") {
 			path = "bootstrap/" + path
 		} else {

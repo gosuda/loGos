@@ -6,15 +6,17 @@ package rt
 
 import (
 	"reflect"
-	"unsafe"
 )
 
 // Reinterpret returns the value at p viewed as an S. A `const switch` exact
 // case rebinds each variable whose type names the switched type to the case
 // type through it. The checker admits the rebinding only when the two types
 // are identical after substitution, so the layouts agree (SPEC Sec 2.5).
+// Every legitimate compiler call proves S == T, so the safe pointer assertion
+// below preserves those calls and panics deterministically otherwise,
+// without an unsafe cast or checkptr fatal.
 func Reinterpret[S, T any](p *T) S {
-	return *(*S)(unsafe.Pointer(p))
+	return *any(p).(*S)
 }
 
 // TildeIs reports whether the underlying type of T has the same kind as the

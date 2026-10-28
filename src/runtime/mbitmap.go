@@ -1367,6 +1367,9 @@ func badPointer(s *mspan, p, refBase, refOff uintptr) {
 //go:linkname findObject
 //go:nosplit
 func findObject(p, refBase, refOff uintptr) (base uintptr, s *mspan, objIndex uintptr) {
+	if zgcCycleEnabled() {
+		p = zgcCanonical(p)
+	}
 	s = spanOf(p)
 	// If s is nil, the virtual address has never been part of the heap.
 	// This pointer may be to some mmap'd region, so we allow it.
@@ -1383,6 +1386,10 @@ func findObject(p, refBase, refOff uintptr) (base uintptr, s *mspan, objIndex ui
 	//
 	// Check s.state to synchronize with span initialization
 	// before checking other fields. See also spanOfHeap.
+	if zgcCycleEnabled() && zgcSpanQuarantined(s) {
+		base, s, objIndex = 0, nil, 0
+		return
+	}
 	if state := s.state.get(); state != mSpanInUse || p < s.base() || p >= s.limit {
 		// Pointers into stacks are also ok, the runtime manages these explicitly.
 		if state == mSpanManual {

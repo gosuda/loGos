@@ -55,7 +55,7 @@ func loadFixture(t *testing.T, path string) fixture {
 // imports and returns its path.
 func importConfig(t *testing.T, dir string) string {
 	t.Helper()
-	cmd := exec.Command(testenv.GoToolPath(t), "list", "-export", "-deps",
+	cmd := exec.CommandContext(t.Context(), testenv.GoToolPath(t), "list", "-export", "-deps",
 		"-f", "{{if .Export}}packagefile {{.ImportPath}}={{.Export}}{{end}}", "logos/rt", "strconv")
 	cmd.Dir = dir
 	out, err := cmd.Output()
@@ -77,7 +77,7 @@ func compile(t *testing.T, f fixture, flags ...string) []byte {
 	dir := t.TempDir()
 	args := []string{"tool", "compile", "-p", "p", "-importcfg", importConfig(t, dir), "-o", filepath.Join(dir, "o.a")}
 	args = append(append(args, flags...), f.path)
-	cmd := exec.Command(testenv.GoToolPath(t), args...)
+	cmd := exec.CommandContext(t.Context(), testenv.GoToolPath(t), args...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Run(); err != nil {
@@ -239,8 +239,8 @@ func TestInlayUnknownFile(t *testing.T) {
 	}
 }
 
-// TestHoverLoweredSites checks the hover of `?`, `const switch T`, and
-// `$"..."`: the lowered code of the site (SPEC Sec 21.3).
+// TestHoverLoweredSites checks the hover of `?`, `const for`, `const switch T`,
+// and `$"..."`: the lowered code of the site (SPEC Sec 21.3).
 func TestHoverLoweredSites(t *testing.T) {
 	f := compilerFixture(t, "sites.lgo")
 	r, _ := compileHints(t, f)
@@ -251,6 +251,7 @@ func TestHoverLoweredSites(t *testing.T) {
 		inCode []string
 	}{
 		{"try", startOf(t, f.src, "?\n\t_ = n"), "`?`", []string{"get()", "!= nil", "return"}},
+		{"const for", startOf(t, f.src, "const for"), "`const for`", []string{`out = append(out, "Name")`}},
 		{"const switch", startOf(t, f.src, "const switch"), "`const switch`", []string{"switch"}},
 		{"interpolation", startOf(t, f.src, `$"user {name}!"`), "`$\"...\"`", []string{"make([]byte, 0, 6+len("}},
 	} {

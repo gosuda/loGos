@@ -41,28 +41,79 @@ func readLogosFacts(f *os.File, path, data string) (bool, error) {
 	return true, err
 }
 
-// logosImporters records the importers serving loGo/s packages. It is
+// logosImporterState records the importer configuration: isLogos preserves
+// execution-language identity (keeping dual-use unions legal across recheck),
+// while restoreOverlay controls whether first-pass Option/ConstView qualifiers
+// are restored onto imported packages.
+type logosImporterState struct {
+	isLogos        bool
+	restoreOverlay bool
+}
+
+// logosImporters records the importer state serving loGo/s packages. It is
 // keyed by importer because gcimports is an upstream type that takes
 // hook lines only. A missing entry means a Go importer: it rejects a
 // dual-use union at the import (M2-S7), while a loGo/s importer keeps
 // the full union.
-var logosImporters = make(map[*gcimports]bool)
+var logosImporters = make(map[*gcimports]logosImporterState)
 
-// logosMarkImporter records whether m imports for a loGo/s package. It
-// sets the entry unconditionally so a recycled importer address never
-// inherits a stale kind across typecheck rechecks.
-func logosMarkImporter(m *gcimports, isLogos bool) {
-	logosImporters[m] = isLogos
+// logosMarkImporter records whether m imports for a loGo/s package and whether
+// overlays should be restored. It sets the entry unconditionally so a recycled
+// importer address never inherits a stale kind across typecheck rechecks.
+func logosMarkImporter(m *gcimports, isLogos, restoreOverlay bool) {
+	logosImporters[m] = logosImporterState{
+		isLogos:        isLogos,
+		restoreOverlay: restoreOverlay,
+	}
 }
 
-// logosImportFrom imports path for m, selecting the package kind from
-// the importer mark: only the loGo/s kind keeps dual-use unions legal.
+// logosImportFrom imports path for m, selecting the package kind and overlay
+// restoration from the importer mark: only the loGo/s kind keeps dual-use
+// unions legal, while overlay restoration is disabled during lowered recheck.
 func logosImportFrom(m *gcimports, path string) (*types2.Package, error) {
-	_, pkg, err := readImportFileImpl(path, typecheck.Target, m.ctxt, m.packages, logosImporters[m])
+	st := logosImporters[m]
+	_, pkg, err := readImportFileImpl(path, typecheck.Target, m.ctxt, m.packages, st.isLogos, st.restoreOverlay)
 	return pkg, err
 }
 
-func readImportFileImpl(path string, target *ir.Package, env *types2.Context, packages map[string]*types2.Package, isLogos bool) (pkg1 *types.Pkg, pkg2 *types2.Package, err error) {
+// preloadLogosOwners imports every package named by pr's SectionPkg table
+// before pr itself decodes, so foreign nominals resolve to the canonical
+// owner object. Without this, importing b before a captures a's types as
+// lowered stubs from b's export; the later overlay of a replaces
+// packages[a] with a clone, leaving b.Make's result (stale a.Box) distinct
+// from the canonical a.Box. With the preload, b decodes against the already
+// overlaid a, and both import orders share one Named/alias/instance origin.
+// Generic instances also canonicalize because instantiation uses the
+// preloaded origin.
+func preloadLogosOwners(target *ir.Package, env *types2.Context, packages map[string]*types2.Package, pr *pkgbits.PkgDecoder, selfPath string, st logosImporterState) error {
+	if !st.restoreOverlay || packages == nil || pr == nil {
+		return nil
+	}
+	n := pr.NumElems(pkgbits.SectionPkg)
+	seen := make(map[string]struct{}, n)
+	for i := range n {
+		dep := pr.PeekPkgPath(pkgbits.RelElemIdx(i))
+		if dep == "" || dep == "builtin" || dep == "unsafe" {
+			continue
+		}
+		if dep == selfPath {
+			continue
+		}
+		if _, ok := seen[dep]; ok {
+			continue
+		}
+		seen[dep] = struct{}{}
+		if pkg, ok := packages[dep]; ok && pkg.Complete() {
+			continue
+		}
+		if _, _, err := readImportFileImpl(dep, target, env, packages, st.isLogos, st.restoreOverlay); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readImportFileImpl(path string, target *ir.Package, env *types2.Context, packages map[string]*types2.Package, isLogos, restoreOverlay bool) (pkg1 *types.Pkg, pkg2 *types2.Package, err error) {
 	path, err = resolveImportPath(path)
 	if err != nil {
 		return
@@ -117,6 +168,20 @@ func readImportFileImpl(path string, target *ir.Package, env *types2.Context, pa
 
 	pr := pkgbits.NewPkgDecoder(pkg1.Path, data)
 
+	// Hydrate owners before the dependent decodes: the unified export
+	// carries only the dependent's lowered view of foreign nominals, so
+	// decoding B first would capture A as a stale *types2.Named. The
+	// later overlay of A clones into a new package, orphaning B's
+	// signatures (reverse order fails while forward works). Preloading
+	// every SectionPkg dependency with the same importer kind makes the
+	// canonical overlaid A the object B's lazy scopes resolve to, so
+	// both orders share one Named/alias/generic identity. Only the
+	// first-pass loGo/s view clones (restoreOverlay); Go importers keep
+	// the lowered package object, so they skip the preload.
+	if err = preloadLogosOwners(target, env, packages, &pr, path, logosImporterState{isLogos: isLogos, restoreOverlay: restoreOverlay}); err != nil {
+		return
+	}
+
 	// The union-import check needs the package scope, but resolving a
 	// foreign lazy scope tripped importer asserts. Gate it on the
 	// export naming a loGo/s source file, which plain-Go archives
@@ -127,7 +192,7 @@ func readImportFileImpl(path string, target *ir.Package, env *types2.Context, pa
 	// Read package descriptors for both types2 and compiler backend.
 	readPackage(newPkgReader(pr), pkg1, false)
 	pkg2 = importer.ReadPackage(env, packages, pr)
-	if pkg2 != nil && isLogos {
+	if pkg2 != nil && restoreOverlay {
 		pkg2 = applyLogosOverlayForLgoImporter(path, pkg2, packages) // logos M3-S7 hook: .lgo importers see Option types.
 	}
 	if pkg2 != nil && checkLogosUnion {

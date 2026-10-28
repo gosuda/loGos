@@ -6,6 +6,8 @@ package base
 
 import (
 	"flag"
+	"internal/buildcfg"
+	"log"
 )
 
 // LogosEject is the -logos.eject output directory. After checkFiles
@@ -67,4 +69,29 @@ func logosRegisterFlags() {
 	flag.StringVar(&LogosHintsOut, "logos.hintsout", "", "write the logos editor hints of the package to `file`")
 	flag.StringVar(&LogosNextOut, "logos.nextout", "", "append logos next scan results to `file`")
 	flag.IntVar(&LogosComptimeNodes, "logos.comptime_nodes", 4096, "cap expanded nodes per comptime expansion")
+	flag.BoolVar(&LogosLoadBarrier, "lb", false, "emit zgc load barriers on pointer loads")
+}
+
+// LogosLoadBarrier is the -lb flag, which the go command passes under
+// -gc=zgc (SPEC Sec 8.4, M19-S5 phase 2): every pointer load tests the
+// color of the loaded word and calls runtime.zgcLoadBarrierSlow on a
+// mismatch. The runtime half exists only under GOEXPERIMENT=logosgcmoving
+// on amd64 and arm64.
+var LogosLoadBarrier bool
+
+// logosCheckFlags checks the loGoS compiler flags once CompilingRuntime is
+// known. Under -gc=zgc the runtime and internal/runtime/maps compile with
+// -lb too: most of their pointer loads take the barrier while the
+// excluded files (barrier implementation, GC scanners, allocator
+// bit-manipulation, signal delivery, stack growth) and the named
+// runtime syscall entries keep plain loads with explicit
+// canonicalization. Write barriers in the runtime stay on; only user
+// packages compile with -wb=false.
+func logosCheckFlags() {
+	if !LogosLoadBarrier {
+		return
+	}
+	if !buildcfg.Experiment.LogosGCMoving || (buildcfg.GOARCH != "amd64" && buildcfg.GOARCH != "arm64") {
+		log.Fatalf("-lb requires GOEXPERIMENT=logosgcmoving on amd64 or arm64")
+	}
 }

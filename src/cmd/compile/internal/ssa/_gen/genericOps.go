@@ -399,8 +399,9 @@ var genericOps = []opData{
 	// for type size, use the size in AuxInt.
 	// The "inline runtime.memmove" rewrite rule generates Moves with inaccurate types,
 	// such as type byte instead of the more accurate type [8]byte.
-	{name: "Move", argLength: 3, typ: "Mem", aux: "TypSize"}, // arg0=destptr, arg1=srcptr, arg2=mem, auxint=size, aux=type.  Returns memory.
-	{name: "Zero", argLength: 2, typ: "Mem", aux: "TypSize"}, // arg0=destptr, arg1=mem, auxint=size, aux=type. Returns memory.
+	{name: "Move", argLength: 3, typ: "Mem", aux: "TypSize"},                                                                  // arg0=destptr, arg1=srcptr, arg2=mem, auxint=size, aux=type.  Returns memory.
+	{name: "Zero", argLength: 2, typ: "Mem", aux: "TypSize"},                                                                  // arg0=destptr, arg1=mem, auxint=size, aux=type. Returns memory.
+	{name: "LogosArenaBump", argLength: 2, aux: "Int64", typ: "(UnsafePointer,Mem)", hasSideEffects: true, unsafePoint: true}, // arg0=arena chunk (nil-safe), arg1=memory, auxint=rounded size. Bump-allocates in the noscan region, returning (ptr, mem), or (nil, mem); lowered per-arch (M18-S3).
 
 	// Memory operations with write barriers.
 	// Expand to runtime calls. Write barrier will be removed if write on stack.

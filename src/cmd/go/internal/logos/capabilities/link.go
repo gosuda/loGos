@@ -133,19 +133,20 @@ func SnapshotLinkPolicy(cf *config.File, mainModules []string, err error) {
 // action ID hash, so a policy change forces a relink and its audit. It
 // writes nothing outside logos mode, leaving plain go action IDs
 // byte-identical to upstream.
-func HashLinkPolicy(h io.Writer) {
+func HashLinkPolicy(h io.Writer) error {
 	if !cfg.Logos {
-		return
+		return nil
 	}
 	linkPolicySnapshot.Lock()
 	data := linkPolicySnapshot.data
 	set := linkPolicySnapshot.set
 	linkPolicySnapshot.Unlock()
 	if !set {
-		return
+		return nil
 	}
 	sum := sha256.Sum256(data)
-	fmt.Fprintf(h, "logoslinkcap %x\n", sum)
+	_, err := fmt.Fprintf(h, "logoslinkcap %x\n", sum)
+	return err
 }
 
 // AppendLinkCapFlag appends the linker flag carrying the capabilities

@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"go/ast"
+	"go/build/constraint"
 	"go/format"
 	"go/parser"
 	"go/token"
@@ -121,13 +122,17 @@ type ejectModule struct {
 
 // ejectPlan splits the reachable packages into the main module, the
 // ejected loGo/s dependency modules, and the emission targets.
+// provenance retains every loaded package by import path for read-only
+// declaration provenance, including standard packages (never writable)
+// and test variants. Emission still uses main/deps/logos only.
 type ejectPlan struct {
-	main      *ejectModule
-	deps      []*ejectModule
-	depByPath map[string]*ejectModule
-	logos     []*load.Package
-	known     map[*load.Package]bool
-	testBuilt map[*load.Package]bool
+	main       *ejectModule
+	deps       []*ejectModule
+	depByPath  map[string]*ejectModule
+	logos      []*load.Package
+	known      map[*load.Package]bool
+	testBuilt  map[*load.Package]bool
+	provenance map[string][]*load.Package
 }
 
 // testBuild holds the test variant of one package for emission of its
@@ -152,7 +157,11 @@ func ejectToDir(ctx context.Context, out string) {
 	if err != nil {
 		base.Fatalf("logos eject: %v", err)
 	}
-	defer os.RemoveAll(staging)
+	defer func() {
+		if err := os.RemoveAll(staging); err != nil {
+			base.Errorf("logos eject: %v", err)
+		}
+	}()
 	load.ArmLogosEject(staging)
 	defer load.DisarmLogosEject()
 	opts := load.PackageOpts{AutoVCS: true}
@@ -204,12 +213,14 @@ func arrangeEjectPlan(pkgs []*load.Package) *ejectPlan {
 		base.Fatalf("logos eject: no main module (run inside a module)")
 	}
 	plan := &ejectPlan{
-		main:      &ejectModule{dir: filepath.Dir(gomod)},
-		depByPath: map[string]*ejectModule{},
-		known:     map[*load.Package]bool{},
-		testBuilt: map[*load.Package]bool{},
+		main:       &ejectModule{dir: filepath.Dir(gomod)},
+		depByPath:  map[string]*ejectModule{},
+		known:      map[*load.Package]bool{},
+		testBuilt:  map[*load.Package]bool{},
+		provenance: map[string][]*load.Package{},
 	}
 	for _, p := range load.PackageList(pkgs) {
+		plan.provenance[p.ImportPath] = append(plan.provenance[p.ImportPath], p)
 		plan.addPackage(p)
 	}
 	resortEjectPlan(plan)
@@ -324,6 +335,16 @@ func collectTestBuilds(moduleLoader *modload.Loader, ctx context.Context, opts l
 		mains = append(mains, t.main)
 	}
 	for _, p := range load.PackageList(mains) {
+		found := false
+		for _, q := range plan.provenance[p.ImportPath] {
+			if q == p {
+				found = true
+				break
+			}
+		}
+		if !found {
+			plan.provenance[p.ImportPath] = append(plan.provenance[p.ImportPath], p)
+		}
 		plan.addPackage(p)
 	}
 	resortEjectPlan(plan)
@@ -467,6 +488,14 @@ func writeEjectedTree(plan *ejectPlan, staging, out string) {
 			}
 		}
 	}
+	// Owned helpers land after package copy, so generated files only ever
+	// appear in the output tree, and before go.mod rewriting, so modules
+	// pulled in only by an owned helper still get their require lines.
+	if usesOwned, err := emitOwnedHelpers(plan, staging, out, ejected); err != nil {
+		base.Fatalf("logos eject: %v", err)
+	} else if usesOwned {
+		usedRT = true
+	}
 	var rtDir string
 	if usedRT {
 		rtDir = filepath.Join(out, "_logos_deps", "rt")
@@ -496,19 +525,43 @@ func emitPackageGoFiles(p *load.Package, plan *ejectPlan, staging, dstRoot, modR
 		base.Fatalf("logos eject: package %s outside module", p.ImportPath)
 	}
 	names := slices.Clone(p.GoFiles)
+	names = append(names, p.CgoFiles...)
+	for _, name := range p.IgnoredGoFiles {
+		if strings.HasSuffix(logosStem(name), "_test") && !plan.testBuilt[p] {
+			continue
+		}
+		names = append(names, name)
+	}
 	if plan.testBuilt[p] {
 		names = append(names, p.TestGoFiles...)
 		names = append(names, p.XTestGoFiles...)
 	}
+	ignoredSet := make(map[string]bool, len(p.IgnoredGoFiles))
+	for _, name := range p.IgnoredGoFiles {
+		ignoredSet[name] = true
+	}
 	used := false
+	seen := make(map[string]bool, len(names))
 	for _, name := range names {
-		if !cfg.IsLogosFile(name) {
+		if seen[name] || !cfg.IsLogosFile(name) {
 			continue
 		}
+		seen[name] = true
 		stem := logosStem(name)
 		raw, err := os.ReadFile(filepath.Join(staging, filepath.FromSlash(p.ImportPath), stem+".go"))
 		if err != nil {
-			base.Fatalf("logos eject: missing ejected output for %s", filepath.Join(p.Dir, name))
+			if os.IsNotExist(err) && ignoredSet[name] {
+				srcData, readErr := os.ReadFile(filepath.Join(p.Dir, name))
+				if readErr != nil {
+					base.Fatalf("logos eject: missing ejected output for %s: %v", filepath.Join(p.Dir, name), readErr)
+				}
+				if isBuildIgnored(srcData) {
+					continue
+				}
+				raw = srcData
+			} else {
+				base.Fatalf("logos eject: missing ejected output for %s: %v", filepath.Join(p.Dir, name), err)
+			}
 		}
 		fixed, uses := rewriteEjectedGo(raw, name)
 		if uses {
@@ -523,6 +576,41 @@ func emitPackageGoFiles(p *load.Package, plan *ejectPlan, staging, dstRoot, modR
 		}
 	}
 	return used
+}
+
+// isBuildIgnored reports whether source declares an ignore build constraint
+// such as //go:build ignore or // +build ignore. It inspects only comments
+// before the package clause, so syntax in the file body never interferes.
+func isBuildIgnored(source []byte) bool {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", source, parser.PackageClauseOnly|parser.ParseComments)
+	if err != nil {
+		return false
+	}
+	expr, err := ownedHeaderExpr(f)
+	if err != nil || expr == nil {
+		return false
+	}
+	return hasIgnoreTag(expr)
+}
+
+// hasIgnoreTag reports whether the constraint expression requires the
+// special "ignore" build tag.
+func hasIgnoreTag(x constraint.Expr) bool {
+	if x == nil {
+		return false
+	}
+	switch e := x.(type) {
+	case *constraint.TagExpr:
+		return e.Tag == "ignore"
+	case *constraint.NotExpr:
+		return false
+	case *constraint.AndExpr:
+		return hasIgnoreTag(e.X) || hasIgnoreTag(e.Y)
+	case *constraint.OrExpr:
+		return hasIgnoreTag(e.X) && hasIgnoreTag(e.Y)
+	}
+	return false
 }
 
 // logosStem returns name without its loGo/s extension, keeping a _test
@@ -799,7 +887,56 @@ func rewriteMainGoMod(out string, plan *ejectPlan) {
 		ensureGoRequire(f, m.path, m.version)
 		setGoReplace(f, m.path, m.version, "./_logos_deps/"+m.path+"@"+m.version)
 	}
+	rebaseLocalReplaces(f, plan.main.dir, out, ejectedPaths(out, plan))
 	writeGoModFile(path, f)
+}
+
+func ejectedPaths(out string, plan *ejectPlan) map[string]string {
+	m := map[string]string{}
+	for _, dep := range plan.deps {
+		m[dep.path] = filepath.Join(out, "_logos_deps", dep.path+"@"+dep.version)
+	}
+	return m
+}
+
+func rebaseLocalReplaces(f *modfile.File, origDir, dstDir string, ejected map[string]string) {
+	absOrig, err := filepath.Abs(origDir)
+	if err != nil {
+		base.Fatalf("logos eject: %v", err)
+	}
+	absDst, err := filepath.Abs(dstDir)
+	if err != nil {
+		base.Fatalf("logos eject: %v", err)
+	}
+	type pending struct {
+		oldPath string
+		oldVers string
+		newPath string
+	}
+	var work []pending
+	for _, r := range slices.Clone(f.Replace) {
+		if _, ok := ejected[r.Old.Path]; ok {
+			continue
+		}
+		if r.New.Version != "" || r.New.Path == "" || filepath.IsAbs(r.New.Path) {
+			continue
+		}
+		target := filepath.Join(absOrig, filepath.FromSlash(r.New.Path))
+		if relOrig, err := filepath.Rel(absOrig, target); err == nil && relOrig != ".." && !strings.HasPrefix(relOrig, ".."+string(filepath.Separator)) {
+			dstTarget := filepath.Join(absDst, relOrig)
+			if fi, err := os.Stat(dstTarget); err == nil && fi.IsDir() {
+				target = dstTarget
+			}
+		}
+		rel, err := filepath.Rel(absDst, target)
+		if err != nil {
+			base.Fatalf("logos eject: %v", err)
+		}
+		work = append(work, pending{r.Old.Path, r.Old.Version, "./" + filepath.ToSlash(rel)})
+	}
+	for _, w := range work {
+		setGoReplace(f, w.oldPath, w.oldVers, w.newPath)
+	}
 }
 
 // addSupportRequire points one ejected go.mod at the support module
@@ -844,6 +981,7 @@ func rewriteDepGoMod(plan *ejectPlan, m *ejectModule, ejected map[string]string)
 	for _, o := range olds {
 		setGoReplace(f, o[0], o[1], relEjectTarget(dst, ejected[o[0]]))
 	}
+	rebaseLocalReplaces(f, m.dir, dst, ejected)
 	writeGoModFile(filepath.Join(dst, "go.mod"), f)
 }
 

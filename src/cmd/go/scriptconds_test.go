@@ -45,8 +45,32 @@ func scriptConditions(t *testing.T) map[string]script.Cond {
 	add("git-sha256", script.OnceCondition("the local 'git' version is recent enough to support sha256 object/commit hashes", gitSupportsSHA256))
 	add("trimpath", script.OnceCondition("test binary was built with -trimpath", isTrimpath))
 	add("default-cgo", lazyBool("when CGO_ENABLED=1|0 was set in make.bash", defaultCgo))
+	add("wasmfx", script.OnceCondition("node runs WebAssembly stack switching (cont.new/resume)", hasWasmFx))
 
 	return conds
+}
+
+// hasWasmFx reports whether node in PATH runs WebAssembly stack switching:
+// node must accept --experimental-wasm-wasmfx and compile a module with a
+// cont type. When LOGOS_REQUIRE_WASMFX is set, a missing engine fails the
+// test instead of skipping it, so required proof never passes as a skip.
+func hasWasmFx() (bool, error) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		return requireWasmFx("node not in PATH")
+	}
+	probe := `const bytes = new Uint8Array([0,97,115,109,1,0,0,0,1,6,2,96,0,0,93,0]); try { new WebAssembly.Module(bytes); } catch (e) { process.exit(1); }`
+	if err := exec.Command(node, "--experimental-wasm-wasmfx", "-e", probe).Run(); err != nil {
+		return requireWasmFx("node lacks --experimental-wasm-wasmfx stack switching")
+	}
+	return true, nil
+}
+
+func requireWasmFx(reason string) (bool, error) {
+	if os.Getenv("LOGOS_REQUIRE_WASMFX") != "" {
+		return false, errors.New("LOGOS_REQUIRE_WASMFX=1 but " + reason)
+	}
+	return false, nil
 }
 
 func defaultCCIsAbsolute(s *script.State) (bool, error) {

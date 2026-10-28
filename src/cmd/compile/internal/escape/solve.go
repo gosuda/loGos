@@ -27,7 +27,7 @@ func (b *batch) walkAll() {
 
 	// Queue of locations to walk. Has enough room for b.allLocs
 	// plus b.heapLoc, b.mutatorLoc, b.calleeLoc.
-	todo := newQueue(len(b.allLocs) + 3)
+	todo := newQueue(len(b.allLocs) + 4)
 
 	enqueue := func(loc *location) {
 		if !loc.queuedWalkAll {
@@ -51,10 +51,12 @@ func (b *batch) walkAll() {
 	todo.pushFront(&b.mutatorLoc)
 	todo.pushFront(&b.calleeLoc)
 	todo.pushFront(&b.heapLoc)
+	todo.pushFront(&b.foreignLoc)
 
 	b.mutatorLoc.queuedWalkAll = true
 	b.calleeLoc.queuedWalkAll = true
 	b.heapLoc.queuedWalkAll = true
+	b.foreignLoc.queuedWalkAll = true
 
 	var walkgen uint32
 	for todo.len() > 0 {
@@ -144,7 +146,9 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 		// that value flow for tagging the function
 		// later.
 		if l.param {
-			if b.outlives(root, l) {
+			if root == &b.foreignLoc {
+				l.paramEsc.AddForeign(derefs)
+			} else if b.outlives(root, l) {
 				if !l.hasAttr(attrEscapes) && (logopt.Enabled() || base.Flag.LowerM >= 2) {
 					if base.Flag.LowerM >= 2 {
 						fmt.Printf("%s: parameter %v leaks to %s for %v with derefs=%d:\n", base.FmtPos(l.n.Pos()), l.n, b.explainLoc(root), ir.FuncName(l.curfn), derefs)
@@ -281,6 +285,9 @@ func (b *batch) explainLoc(l *location) string {
 // outlives reports whether values stored in l may survive beyond
 // other's lifetime if stack allocated.
 func (b *batch) outlives(l, other *location) bool {
+	if l == &b.foreignLoc {
+		return foreignBacking(other)
+	}
 	// The heap outlives everything.
 	if l.hasAttr(attrEscapes) {
 		return true

@@ -42,7 +42,7 @@ func (tb *tables) toLowered() *rewriter {
 	return &rewriter{
 		route: func(uri string) *lowered { return tb.lookup(tb.bySrc, uri) },
 		name:  (*lowered).virtURI,
-		pos:   func(lw *lowered, p Position) Position { return lw.pm.toLowered(p, leading) },
+		pos:   func(lw *lowered, p Position) Position { return lw.pm.toLowered(p) },
 		rng:   func(lw *lowered, r Range) Range { return lw.pm.rangeToLowered(r) },
 	}
 }
@@ -54,7 +54,7 @@ func (tb *tables) toSource() *rewriter {
 	return &rewriter{
 		route:       func(uri string) *lowered { return tb.lookup(tb.byVirt, uri) },
 		name:        (*lowered).srcURI,
-		pos:         func(lw *lowered, p Position) Position { return lw.pm.toOriginal(p, leading) },
+		pos:         func(lw *lowered, p Position) Position { return lw.pm.toOriginal(p) },
 		rng:         func(lw *lowered, r Range) Range { return lw.pm.rangeToOriginal(r) },
 		dropVersion: true,
 	}

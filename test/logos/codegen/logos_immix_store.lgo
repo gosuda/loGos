@@ -1,0 +1,21 @@
+// asmcheck -goexperiment logosgcmoving
+
+package main
+
+// M19-S8 attack: a heap pointer store is routed through the Immix line-mark
+// helper, and does not call a card-mark barrier.
+type immixStoreNode struct {
+	value *immixStoreNode?
+}
+
+//go:noinline
+func immixHeapPointerStore(dst *immixStoreNode, value *immixStoreNode) {
+	// amd64:"CALL.*runtime\\.logosImmixStoreBarrier" -"CALL.*cardMark"
+	dst.value = value
+}
+
+var immixStoreSink immixStoreNode
+
+func main() {
+	immixHeapPointerStore(&immixStoreSink, &immixStoreSink)
+}

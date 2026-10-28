@@ -193,6 +193,13 @@ func mapfast(t *types.Type) int {
 	if t.Elem().Size() > abi.MapMaxElemBytes {
 		return mapslow
 	}
+	if a := algType(t.Key()); base.LogosLoadBarrier && (a == types.AMEM32 || a == types.AMEM64) && t.Key().HasPointers() {
+		// The fast32 and fast64 paths hash the key word inline, not
+		// through the type's hasher; under -gc=zgc a pointer key must
+		// hash by identity (runtime.zgcptrhash), so every map operation
+		// on it takes the hasher path.
+		return mapslow
+	}
 	switch algType(t.Key()) {
 	case types.AMEM32:
 		if !t.Key().HasPointers() {

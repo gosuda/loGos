@@ -1,0 +1,494 @@
+# M5-S4: nested const-map storage (SPEC T-Sec9).
+# Anchor: Tony Hoare, David Parnas, John Carmack
+#
+# Offline cases for map-bearing const maps in both lowerings:
+# 1. Small (switch) and big (table) direct nested maps with copy isolation,
+#    sorted range, early break, materialized reuse, and lookup isolation.
+# 2. Nil versus empty nested maps stay distinct.
+# 3. Nested struct/slice/array values carrying maps, plus private named
+#    boxed values through an owner package, in both switch and table sizes.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+cd consumer
+logos run .
+cp stdout $WORK/want.txt
+stdout '^nested-small-const: hit=100 miss=-1 mut=999 after=100 len=2$'
+stdout '^nested-small-lookup: a=100,true b=200,true miss=false$'
+stdout '^nested-small-copy: inner=100 const=100 hit-ok=true miss-ok=false$'
+stdout '^nested-small-order: 1,2,$'
+stdout '^nested-small-break: 1$'
+stdout '^nested-small-reuse: lookup-miss=false shared=true$'
+stdout '^nested-big-const: hit=100 miss=-1 len=9$'
+stdout '^nested-big-lookup: a=100,true i=900,true miss=false$'
+stdout '^nested-big-copy: inner=500 const=500$'
+stdout '^nested-big-order: 1,2,3,4,5,6,7,8,9,$'
+stdout '^nested-big-break: 1$'
+stdout '^nil-empty: nil-len=0 empty-len=0 nil-miss=false empty-miss=false nil-range=0 empty-range=0 nil-is-nil=true empty-is-nil=false$'
+stdout '^rec-small: m=10 s=10 a=10 len=2$'
+stdout '^rec-small-copy: m=10 const=10$'
+stdout '^rec-big-order: 1,2,3,4,5,6,7,8,9,$'
+stdout '^slice-small: v=100 len=2$'
+stdout '^slice-small-copy: v=100 const=100$'
+stdout '^array-small: v=100 len=2$'
+stdout '^boxed-small-const: hit=40 miss=-1 mut=999 after=40 len=5$'
+stdout '^boxed-small-lookup: b=20,true d=40,true miss=false$'
+stdout '^boxed-small-method: sum=.* tally=7$'
+stdout '^boxed-small-order: 1,2,3,4,5,$'
+stdout '^boxed-small-copy: m1=40 const=20 hit-ok=true miss-ok=false$'
+stdout '^boxed-big-const: hit=40 miss=-1 len=12$'
+stdout '^boxed-big-order: 1,2,3,4,5,6,7,8,9,10,11,12,$'
+stdout '^boxed-big-break: 1$'
+stdout '^boxed-types: map\[int\]nest\.boxed map\[int\]nest\.boxed$'
+
+logos eject -o ../eject_out
+exists ../eject_out/main.go
+cd ../eject_out
+go run .
+cmp stdout $WORK/want.txt
+cd ../consumer
+cd ..
+
+-- lib/go.mod --
+module example.com/nestlib
+
+go 1.27
+
+-- lib/nest/nest.lgo --
+package nest
+
+type innerMap map[int]int
+
+func (m innerMap) Get(k int) int {
+	v, ok := m[k]
+	if ok {
+		return v
+	}
+	return -1
+}
+
+type boxed struct {
+	m map[int]int
+	s []int
+	a [2]int
+	n innerMap
+}
+
+func (b boxed) Sum() int {
+	s := 0
+	for _, v := range b.m {
+		s += v
+	}
+	for _, v := range b.s {
+		s += v
+	}
+	for _, v := range b.a {
+		s += v
+	}
+	for _, v := range b.n {
+		s += v
+	}
+	return s
+}
+
+func (b boxed) First() int {
+	v, ok := b.m[1]
+	if ok {
+		return v
+	}
+	return -1
+}
+
+func (b boxed) Tally() int {
+	return len(b.m) + len(b.s) + len(b.a) + len(b.n)
+}
+
+const func MakeBoxed(base int) boxed {
+	return boxed{
+		m: map[int]int{1: base, 2: base * 2},
+		s: []int{base, base + 1},
+		a: [2]int{base, base * 10},
+		n: innerMap{3: base * 3},
+	}
+}
+
+const func MakeBoxedSmall() map[int]boxed {
+	return map[int]boxed{
+		3: MakeBoxed(30),
+		1: MakeBoxed(10),
+		5: MakeBoxed(50),
+		2: MakeBoxed(20),
+		4: MakeBoxed(40),
+	}
+}
+
+const func MakeBoxedBig() map[int]boxed {
+	return map[int]boxed{
+		7:  MakeBoxed(70),
+		3:  MakeBoxed(30),
+		11: MakeBoxed(110),
+		1:  MakeBoxed(10),
+		9:  MakeBoxed(90),
+		5:  MakeBoxed(50),
+		2:  MakeBoxed(20),
+		10: MakeBoxed(100),
+		4:  MakeBoxed(40),
+		8:  MakeBoxed(80),
+		6:  MakeBoxed(60),
+		12: MakeBoxed(120),
+	}
+}
+
+const func LookupBoxed(m map[int]boxed, k int) int {
+	b, ok := m[k]
+	if ok {
+		value, _ := b.m[1]
+		return value * 2
+	}
+	return -1
+}
+
+const func TouchBoxed(m map[int]boxed, k int, w int) int {
+	m[k] = MakeBoxed(w)
+	b, ok := m[k]
+	if ok {
+		value, _ := b.m[1]
+		return value
+	}
+	return 0
+}
+
+-- consumer/go.mod --
+module example.com/nestconsumer
+
+go 1.27
+
+require example.com/nestlib v0.0.0
+
+replace example.com/nestlib => ../lib
+
+-- consumer/main.lgo --
+package main
+
+import (
+	"fmt"
+	"maps"
+
+	"example.com/nestlib/nest"
+)
+
+const nestedSmall = map[int]map[int]int{
+	2: {20: 200},
+	1: {10: 100},
+}
+
+const nestedBig = map[int]map[int]int{
+	5: {50: 500},
+	3: {30: 300},
+	9: {90: 900},
+	1: {10: 100},
+	7: {70: 700},
+	2: {20: 200},
+	8: {80: 800},
+	4: {40: 400},
+	6: {60: 600},
+}
+
+const nilNested = map[int]map[int]int(nil)
+
+const emptyNested = map[int]map[int]int{}
+
+type Rec struct {
+	M map[int]int
+	S []int
+	A [2]int
+}
+
+const recSmall = map[int]Rec{
+	2: {M: map[int]int{2: 20}, S: []int{20, 21}, A: [2]int{20, 200}},
+	1: {M: map[int]int{1: 10}, S: []int{10, 11}, A: [2]int{10, 100}},
+}
+
+const recBig = map[int]Rec{
+	7: {M: map[int]int{7: 70}, S: []int{70}, A: [2]int{70, 700}},
+	3: {M: map[int]int{3: 30}, S: []int{30}, A: [2]int{30, 300}},
+	9: {M: map[int]int{9: 90}, S: []int{90}, A: [2]int{90, 900}},
+	1: {M: map[int]int{1: 10}, S: []int{10}, A: [2]int{10, 100}},
+	5: {M: map[int]int{5: 50}, S: []int{50}, A: [2]int{50, 500}},
+	2: {M: map[int]int{2: 20}, S: []int{20}, A: [2]int{20, 200}},
+	8: {M: map[int]int{8: 80}, S: []int{80}, A: [2]int{80, 800}},
+	4: {M: map[int]int{4: 40}, S: []int{40}, A: [2]int{40, 400}},
+	6: {M: map[int]int{6: 60}, S: []int{60}, A: [2]int{60, 600}},
+}
+
+const sliceSmall = map[int][]map[int]int{
+	2: {{20: 200}},
+	1: {{10: 100}},
+}
+
+const arraySmall = map[int][1]map[int]int{
+	2: {{20: 200}},
+	1: {{10: 100}},
+}
+
+const (
+	BoxedSmall = nest.MakeBoxedSmall()
+	BoxedBig   = nest.MakeBoxedBig()
+
+	BoxedSmallHit   = nest.LookupBoxed(BoxedSmall, 2)
+	BoxedSmallMiss  = nest.LookupBoxed(BoxedSmall, 99)
+	BoxedSmallMut   = nest.TouchBoxed(BoxedSmall, 2, 999)
+	BoxedSmallAfter = nest.LookupBoxed(BoxedSmall, 2)
+	BoxedSmallLen   = len(BoxedSmall)
+
+	BoxedBigHit  = nest.LookupBoxed(BoxedBig, 2)
+	BoxedBigMiss = nest.LookupBoxed(BoxedBig, 99)
+	BoxedBigLen  = len(BoxedBig)
+)
+
+const func GetNested(m map[int]map[int]int, o int, i int) int {
+	inner, ok := m[o]
+	if ok {
+		v, ok2 := inner[i]
+		if ok2 {
+			return v
+		}
+	}
+	return -1
+}
+
+const func TouchNested(m map[int]map[int]int, o int, i int, w int) int {
+	inner, ok := m[o]
+	if ok {
+		inner[i] = w
+		v, ok2 := inner[i]
+		if ok2 {
+			return v
+		}
+	}
+	return -1
+}
+
+const (
+	NestedSmallHit   = GetNested(nestedSmall, 1, 10)
+	NestedSmallMiss  = GetNested(nestedSmall, 9, 9)
+	NestedSmallMut   = TouchNested(nestedSmall, 1, 10, 999)
+	NestedSmallAfter = GetNested(nestedSmall, 1, 10)
+	NestedSmallLen   = len(nestedSmall)
+
+	NestedBigHit  = GetNested(nestedBig, 1, 10)
+	NestedBigMiss = GetNested(nestedBig, 99, 99)
+	NestedBigLen  = len(nestedBig)
+)
+
+func checkNestedSmall() {
+	fmt.Printf("nested-small-const: hit=%d miss=%d mut=%d after=%d len=%d\n",
+		NestedSmallHit, NestedSmallMiss, NestedSmallMut, NestedSmallAfter, NestedSmallLen)
+	a, okA := nestedSmall[1]
+	b, okB := nestedSmall[2]
+	_, okMiss := nestedSmall[9]
+	av := -1
+	if okA {
+		av, _ = a[10]
+	}
+	bv := -1
+	if okB {
+		bv, _ = b[20]
+	}
+	fmt.Printf("nested-small-lookup: a=%d,%t b=%d,%t miss=%t\n", av, okA, bv, okB, okMiss)
+	inner, ok := nestedSmall[1]
+	if ok {
+		inner[10] = 999
+	}
+	inner2, ok2 := nestedSmall[1]
+	v := -1
+	if ok2 {
+		v, _ = inner2[10]
+	}
+	fmt.Printf("nested-small-copy: inner=%d const=%d hit-ok=%t miss-ok=%t\n", v, 100, ok2, func() bool {
+		_, ok := nestedSmall[99]
+		return ok
+	}())
+	order := ""
+	for k := range nestedSmall {
+		order += fmt.Sprintf("%d,", k)
+	}
+	fmt.Printf("nested-small-order: %s\n", order)
+	first := 0
+	for k := range nestedSmall {
+		first = k
+		break
+	}
+	fmt.Printf("nested-small-break: %d\n", first)
+}
+
+func checkNestedSmallOnce() {
+	for k, inner := range maps.All(nestedSmall) {
+		if k == 1 {
+			inner[99] = 99
+		}
+	}
+	fresh, _ := nestedSmall[1]
+	_, okLookup := fresh[99]
+	okShared := false
+	for k, inner := range maps.All(nestedSmall) {
+		if k == 1 {
+			_, okShared = inner[99]
+		}
+	}
+	fmt.Printf("nested-small-reuse: lookup-miss=%t shared=%t\n", okLookup, okShared)
+}
+
+func checkNestedBig() {
+	fmt.Printf("nested-big-const: hit=%d miss=%d len=%d\n", NestedBigHit, NestedBigMiss, NestedBigLen)
+	a, okA := nestedBig[1]
+	b, okB := nestedBig[9]
+	_, okMiss := nestedBig[99]
+	av := -1
+	if okA {
+		av, _ = a[10]
+	}
+	bv := -1
+	if okB {
+		bv, _ = b[90]
+	}
+	fmt.Printf("nested-big-lookup: a=%d,%t i=%d,%t miss=%t\n", av, okA, bv, okB, okMiss)
+	inner, ok := nestedBig[5]
+	if ok {
+		inner[50] = 999
+	}
+	inner2, _ := nestedBig[5]
+	v, _ := inner2[50]
+	fmt.Printf("nested-big-copy: inner=%d const=%d\n", v, 500)
+	order := ""
+	for k := range nestedBig {
+		order += fmt.Sprintf("%d,", k)
+	}
+	fmt.Printf("nested-big-order: %s\n", order)
+	first := 0
+	for k := range nestedBig {
+		first = k
+		break
+	}
+	fmt.Printf("nested-big-break: %d\n", first)
+}
+
+func checkNilEmpty() {
+	_, okNil := nilNested[1]
+	_, okEmpty := emptyNested[1]
+	nNil := 0
+	for range nilNested {
+		nNil++
+	}
+	nEmpty := 0
+	for range emptyNested {
+		nEmpty++
+	}
+	fmt.Printf("nil-empty: nil-len=%d empty-len=%d nil-miss=%t empty-miss=%t nil-range=%d empty-range=%d nil-is-nil=%t empty-is-nil=%t\n",
+		len(nilNested), len(emptyNested), okNil, okEmpty, nNil, nEmpty, nilNested == nil, emptyNested == nil)
+}
+
+func checkRecSliceArray() {
+	r, ok := recSmall[1]
+	mv := -1
+	sv := -1
+	av := -1
+	if ok {
+		mv, _ = r.M[1]
+		if len(r.S) > 0 {
+			sv = r.S[0]
+		}
+		av = r.A[0]
+	}
+	fmt.Printf("rec-small: m=%d s=%d a=%d len=%d\n", mv, sv, av, len(recSmall))
+	r2, _ := recSmall[1]
+	r2.M[1] = 999
+	r3, _ := recSmall[1]
+	mv2, _ := r3.M[1]
+	fmt.Printf("rec-small-copy: m=%d const=%d\n", mv2, 10)
+	order := ""
+	for k := range recBig {
+		order += fmt.Sprintf("%d,", k)
+	}
+	fmt.Printf("rec-big-order: %s\n", order)
+	s, okS := sliceSmall[1]
+	sv2 := -1
+	if okS && len(s) > 0 {
+		sv2, _ = s[0][10]
+	}
+	fmt.Printf("slice-small: v=%d len=%d\n", sv2, len(sliceSmall))
+	s2, _ := sliceSmall[1]
+	s2[0][10] = 999
+	s3, _ := sliceSmall[1]
+	sv3, _ := s3[0][10]
+	fmt.Printf("slice-small-copy: v=%d const=%d\n", sv3, 100)
+	ar, okA := arraySmall[1]
+	arv := -1
+	if okA {
+		arv, _ = ar[0][10]
+	}
+	fmt.Printf("array-small: v=%d len=%d\n", arv, len(arraySmall))
+}
+
+func checkBoxed() {
+	fmt.Printf("boxed-small-const: hit=%d miss=%d mut=%d after=%d len=%d\n",
+		BoxedSmallHit, BoxedSmallMiss, BoxedSmallMut, BoxedSmallAfter, BoxedSmallLen)
+	b, okB := BoxedSmall[2]
+	d, okD := BoxedSmall[4]
+	_, okMiss := BoxedSmall[99]
+	bv := -1
+	if okB {
+		bv = b.First()
+	}
+	dv := -1
+	if okD {
+		dv = d.First()
+	}
+	fmt.Printf("boxed-small-lookup: b=%d,%t d=%d,%t miss=%t\n", bv, okB, dv, okD, okMiss)
+	fmt.Printf("boxed-small-method: sum=%d tally=%d\n", b.Sum(), b.Tally())
+	order := ""
+	for k := range BoxedSmall {
+		order += fmt.Sprintf("%d,", k)
+	}
+	fmt.Printf("boxed-small-order: %s\n", order)
+	m1 := maps.Collect(maps.All(BoxedSmall))
+	m1[2] = d
+	m1[99] = d
+	still, okStill := BoxedSmall[2]
+	_, okGone := BoxedSmall[99]
+	m1First, okM1 := m1[2]
+	m1Val := -1
+	if okM1 {
+		m1Val = m1First.First()
+	}
+	stillVal := -1
+	if okStill {
+		stillVal = still.First()
+	}
+	fmt.Printf("boxed-small-copy: m1=%d const=%d hit-ok=%t miss-ok=%t\n",
+		m1Val, stillVal, okStill, okGone)
+	fmt.Printf("boxed-big-const: hit=%d miss=%d len=%d\n", BoxedBigHit, BoxedBigMiss, BoxedBigLen)
+	orderBig := ""
+	for k := range BoxedBig {
+		orderBig += fmt.Sprintf("%d,", k)
+	}
+	fmt.Printf("boxed-big-order: %s\n", orderBig)
+	first := 0
+	for k := range BoxedBig {
+		first = k
+		break
+	}
+	fmt.Printf("boxed-big-break: %d\n", first)
+	bigCopy := maps.Collect(maps.All(BoxedBig))
+	fmt.Printf("boxed-types: %T %T\n", m1, bigCopy)
+}
+
+func main() {
+	checkNestedSmall()
+	checkNestedSmallOnce()
+	checkNestedBig()
+	checkNilEmpty()
+	checkRecSliceArray()
+	checkBoxed()
+}

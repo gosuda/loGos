@@ -137,6 +137,8 @@ func newProg() *obj.Prog {
 
 // rewrite turns each resume-point call to a pure callee into a call
 // without one. A call to deferreturn always keeps its resume point.
+// Under stack switching the remaining calls of a function outside the
+// runtime become ACALLCONT (see continuationCalls).
 func rewrite(text *obj.Prog) {
 	for p := text; p != nil; p = p.Link {
 		if p.As != obj.ACALL || p.To.Type != obj.TYPE_MEM || p.To.Sym == nil {
@@ -144,6 +146,34 @@ func rewrite(text *obj.Prog) {
 		}
 		if p.To.Sym != ir.Syms.Deferreturn && !calleeYield(p.To.Sym) {
 			p.As = wasm.ACALLNORESUME
+		}
+	}
+	continuationCalls(text)
+}
+
+// continuationCalls drops the resume points of the calls that may yield
+// when every goroutine runs on its own continuation: a goroutine switch
+// suspends the continuation and keeps this frame, so the frame is never
+// re-entered through its dispatch. Such a call still passes an unwind on
+// (ACALLCONT), because recovery and stack growth unwind to a frame below.
+// Two kinds of function keep every resume point: a function with defer,
+// because recovery re-enters it at deferreturn, and the runtime, whose
+// scheduler frames are re-entered on GOOS=js after a pause. A caller of
+// runtime.mcall outside the runtime also keeps its resume point: inlined
+// Gosched makes such a caller the target of a switch back, and the emitter
+// restores its resume point (obj/wasm keepSwitchTargets).
+func continuationCalls(text *obj.Prog) {
+	if !base.Ctxt.WasmStackSwitch || base.Flag.CompilingRuntime {
+		return
+	}
+	for p := text; p != nil; p = p.Link {
+		if p.As == obj.ACALL && p.To.Type == obj.TYPE_MEM && p.To.Sym == ir.Syms.Deferreturn {
+			return
+		}
+	}
+	for p := text; p != nil; p = p.Link {
+		if p.As == obj.ACALL {
+			p.As = wasm.ACALLCONT
 		}
 	}
 }

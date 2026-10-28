@@ -427,4 +427,6 @@ The available conditions are:
 	test binary was built with -trimpath
 [verbose]
 	testing.Verbose()
+[wasmfx]
+	node runs WebAssembly stack switching (cont.new/resume)
 

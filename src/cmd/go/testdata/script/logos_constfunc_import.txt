@@ -1,0 +1,221 @@
+# M5-S2: imported const func evaluation across separate modules (T-201, T-Sec6, R-U2).
+# Package calc in module example.com/constlib exports const funcs that evaluate
+# through private helpers, private types, private constants, and a transitive
+# const function in package transitive. Results cover scalars, arrays, slices,
+# structs, named exported types, and private named types consumed through
+# inference and exported fields/methods. A consumer module forces compile-time
+# evaluation using const declarations and a constant array bound. Native
+# execution and ejected upstream-Go output maintain full parity. A plain-Go
+# caller sees ordinary function semantics when driven with logos.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+# 1. Consumer module evaluates imported const funcs at compile time.
+cd consumer
+logos run .
+cp stdout $WORK/want.txt
+stdout '^closed: 25$'
+stdout '^bound: 32$'
+stdout '^score: 200$'
+stdout '^array: 10 11 12$'
+stdout '^slice: 3 6 9$'
+stdout '^matrix: 2 3 grid$'
+stdout '^summary: 50 batch 100 batch!$'
+stdout '^table-len: 32$'
+
+# 2. Eject consumer module to plain Go and verify parity.
+logos eject -o ../eject_out
+exists ../eject_out/main.go
+cd ../eject_out
+go run .
+cmp stdout $WORK/want.txt
+cd ../consumer
+cd ..
+
+# 3. Plain Go caller module sees ordinary function semantics, driven with logos.
+cd gocaller
+logos run .
+stdout '^gocaller: 25 32 1 4 plain-go 7 14$'
+cd ..
+
+-- lib/go.mod --
+module example.com/constlib
+
+go 1.27
+
+-- lib/transitive/transitive.lgo --
+package transitive
+
+// Step is a transitive const function in a third package.
+const func Step(x int) int {
+	return x * 10
+}
+
+-- lib/calc/calc.lgo --
+package calc
+
+import "example.com/constlib/transitive"
+
+// Private constant, private type, and private helper forming a closure.
+const privateBase = 10
+
+type privateFactor int
+
+const func privateHelper(x int, f privateFactor) int {
+	return x*int(f) + privateBase
+}
+
+// ComputeClosed is an exported const func evaluated through a private helper closure.
+const func ComputeClosed(x int) int {
+	return privateHelper(x, privateFactor(3))
+}
+
+// TransitiveCompute calls a transitive const function in package transitive.
+const func TransitiveCompute(x int) int {
+	return transitive.Step(x) + privateHelper(x, privateFactor(1))
+}
+
+// Score is a named exported scalar type for exact named constant arithmetic.
+type Score int64
+
+const (
+	BaseScore   Score = 100
+	ScaleFactor Score = 4
+)
+
+const func ScoreMath(s Score) Score {
+	return s*ScaleFactor + BaseScore
+}
+
+// MakeArray produces an observable array result.
+const func MakeArray(seed int) [3]int {
+	return [3]int{seed, seed + 1, seed + 2}
+}
+
+// MakeSlice produces an observable slice result.
+const func MakeSlice(start int) []int {
+	return []int{start, start * 2, start * 3}
+}
+
+// Matrix is a named exported struct result type.
+type Matrix struct {
+	Row int
+	Col int
+	Tag string
+}
+
+const func MakeMatrix(r, c int, tag string) Matrix {
+	return Matrix{Row: r, Col: c, Tag: tag}
+}
+
+// privateSummary is a private named struct result type.
+type privateSummary struct {
+	Total int
+	Kind  string
+}
+
+func (s privateSummary) Twice() int {
+	return s.Total * 2
+}
+
+func (s privateSummary) Desc() string {
+	return s.Kind + "!"
+}
+
+// Summarize returns a private named result consumed through inference/methods.
+const func Summarize(total int, kind string) privateSummary {
+	return privateSummary{Total: total, Kind: kind}
+}
+
+-- consumer/go.mod --
+module example.com/consumer
+
+go 1.27
+
+require example.com/constlib v0.0.0
+
+replace example.com/constlib => ../lib
+
+-- consumer/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/constlib/calc"
+)
+
+// Const initializers force compile-time evaluation of imported const funcs.
+const (
+	ClosedVal  = calc.ComputeClosed(5)
+	ArrayBound = calc.TransitiveCompute(2) // 2*10 + (2*1 + 10) = 32
+	ScoreVal   = calc.ScoreMath(25)        // 25*4 + 100 = 200
+	ArrayVal   = calc.MakeArray(10)        // [10, 11, 12]
+	SliceVal   = calc.MakeSlice(3)         // [3, 6, 9]
+	MatrixVal  = calc.MakeMatrix(2, 3, "grid")
+	SummaryVal = calc.Summarize(50, "batch")
+)
+
+// Constant array bound forces compile-time integer constant requirement.
+type FixedTable [ArrayBound]byte
+
+func main() {
+	var tbl FixedTable
+
+	// Verify named exported result type preservation and func signatures.
+	var _ func(calc.Score) calc.Score = calc.ScoreMath
+	var _ func(int, int, string) calc.Matrix = calc.MakeMatrix
+	var m calc.Matrix = MatrixVal
+
+	// Verify private named result consumed through inference and exported fields/methods.
+	s := SummaryVal
+	sTotal := s.Total
+	sKind := s.Kind
+	sTwice := s.Twice()
+	sDesc := s.Desc()
+
+	// Named constant arithmetic result type preservation.
+	var sc calc.Score = ScoreVal
+
+	fmt.Println("closed:", ClosedVal)
+	fmt.Println("bound:", ArrayBound)
+	fmt.Println("score:", int64(sc))
+	fmt.Println("array:", ArrayVal[0], ArrayVal[1], ArrayVal[2])
+	fmt.Println("slice:", SliceVal[0], SliceVal[1], SliceVal[2])
+	fmt.Println("matrix:", m.Row, m.Col, m.Tag)
+	fmt.Println("summary:", sTotal, sKind, sTwice, sDesc)
+	fmt.Println("table-len:", len(tbl))
+}
+
+-- gocaller/go.mod --
+module example.com/gocaller
+
+go 1.27
+
+require example.com/constlib v0.0.0
+
+replace example.com/constlib => ../lib
+
+-- gocaller/main.go --
+package main
+
+import (
+	"fmt"
+
+	"example.com/constlib/calc"
+)
+
+func main() {
+	// A Go importer sees calc.ComputeClosed as an ordinary function
+	// (SPEC T-201, T-Sec6, R-U2).
+	var _ func(int) int = calc.ComputeClosed
+	var _ func(int, int, string) calc.Matrix = calc.MakeMatrix
+	var _ func(calc.Score) calc.Score = calc.ScoreMath
+
+	c := calc.ComputeClosed(5)
+	t := calc.TransitiveCompute(2)
+	m := calc.MakeMatrix(1, 4, "plain-go")
+	s := calc.Summarize(7, "go")
+	fmt.Println("gocaller:", c, t, m.Row, m.Col, m.Tag, s.Total, s.Twice())
+}

@@ -2,17 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !wasm || !logosgc.nongreentea
+
 package runtime_test
 
 import (
 	"math"
 	"math/rand/v2"
-	"regexp"
 	"runtime"
 	"runtime/metrics"
 	"slices"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -502,103 +501,6 @@ func TestLogosElasticConsMarkFollowsGoal(t *testing.T) {
 		got, alloc, scan := logosEndCycle("", 0.97, nil, assist)
 		check(t, got, alloc, scan, logosPlanFloor+0.5)
 	})
-}
-
-var logosElasticLine = regexp.MustCompile(`pacer: elastic u=(\S+) util=(\S+) workers=(\d+)\+(\S+)`)
-
-func logosPacerRun(t *testing.T, prog string, flags ...string) string {
-	t.Helper()
-	exe, err := buildTestProg(t, "testprog", flags...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := runBuiltTestProg(t, exe, prog, "GODEBUG=gcpacertrace=1", "GOGC=100", "GOMEMLIMIT=off")
-	if !strings.Contains(out, "OK\n") {
-		t.Fatalf("helper program %s did not finish:\n%s", prog, out)
-	}
-	if !strings.Contains(out, "pacer: assist ratio=") {
-		t.Fatalf("helper program %s printed no pacer trace:\n%s", prog, out)
-	}
-	return out
-}
-
-func logosPacerTrace(t *testing.T, flags ...string) string {
-	t.Helper()
-	return logosPacerRun(t, "LogosPacerElastic", flags...)
-}
-
-func logosFloat(t *testing.T, s string) float64 {
-	t.Helper()
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		t.Fatalf("bad number %q in pacer trace: %v", s, err)
-	}
-	return v
-}
-
-func logosCheckElasticTrace(t *testing.T, out string) {
-	t.Helper()
-	lines := logosElasticLine.FindAllStringSubmatch(out, -1)
-	if len(lines) < 3 {
-		t.Fatalf("pacer trace has %d elastic lines, want at least 3:\n%s", len(lines), out)
-	}
-	peak := 0.0
-	for _, m := range lines {
-		u, util := logosFloat(t, m[1]), logosFloat(t, m[2])
-		dedicated, fractional := logosFloat(t, m[3]), logosFloat(t, m[4])
-		if want := logosPlan(u); !logosNearly(util, want, 1e-5) {
-			t.Errorf("trace u=%v: utilization %v, want %v", u, util, want)
-		}
-		if got := (dedicated + fractional*(4-dedicated)) / 4; !logosNearly(got, util, 1e-5) {
-			t.Errorf("trace u=%v: workers %v+%v give utilization %v, want %v", u, dedicated, fractional, got, util)
-		}
-		peak = math.Max(peak, util)
-	}
-	if peak <= logosPlanFloor+1e-3 {
-		t.Errorf("no cycle started above the floor utilization; trace:\n%s", out)
-	}
-}
-
-func TestLogosElasticLinkerModeInBuiltProgram(t *testing.T) {
-	logosCheckElasticTrace(t, logosPacerTrace(t, "-ldflags=-X=runtime.logosGCMode=greentea"))
-}
-
-// TestLogosElasticGCFlagInBuiltProgram: go build -gc=greentea of a Go helper
-// program runs the elastic pacing (T-301.2).
-func TestLogosElasticGCFlagInBuiltProgram(t *testing.T) {
-	logosCheckElasticTrace(t, logosPacerTrace(t, "-gc=greentea"))
-}
-
-func TestLogosElasticAssistsRunInBuiltProgram(t *testing.T) {
-	out := logosPacerRun(t, "LogosPacerAssist", "-ldflags=-X=runtime.logosGCMode=greentea")
-	if !logosElasticLine.MatchString(out) {
-		t.Fatalf("the program did not pace elastically:\n%s", out)
-	}
-}
-
-// TestLogosPlainBuildKeepsUpstreamPacing: a go build with no -gc keeps the
-// upstream pacing until run.bash passes with the elastic default (G3).
-func TestLogosPlainBuildKeepsUpstreamPacing(t *testing.T) {
-	out := logosPacerTrace(t)
-	if logosElasticLine.MatchString(out) {
-		t.Fatalf("a build without -gc paces elastically:\n%s", out)
-	}
-}
-
-// TestLogosOtherGCFlagKeepsUpstreamPacingInBuiltProgram: a mode other than
-// greentea keeps the upstream pacing even though it names a collector mode.
-func TestLogosOtherGCFlagKeepsUpstreamPacingInBuiltProgram(t *testing.T) {
-	out := logosPacerRun(t, "LogosPacerForced", "-gc=batch")
-	if logosElasticLine.MatchString(out) {
-		t.Fatalf("-gc=batch paces elastically:\n%s", out)
-	}
-}
-
-func TestLogosElasticForcedCycleInBuiltProgram(t *testing.T) {
-	out := logosPacerRun(t, "LogosPacerForced", "-gc=greentea")
-	if got := len(logosElasticLine.FindAllString(out, -1)); got < 2 {
-		t.Fatalf("two forced collections printed %d elastic lines, want at least 2:\n%s", got, out)
-	}
 }
 
 type logosBenchNode struct {

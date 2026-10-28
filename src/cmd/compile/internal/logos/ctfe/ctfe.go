@@ -132,19 +132,23 @@ const (
 )
 
 // Type is a compile-time type descriptor. Named carries a same-package
-// defined type name for literal synthesis; Opaque marks types that
-// cannot be spelled at the use site (lowering keeps the original call
-// for those instead of a literal); Impure carries a purity-class reason
-// for named types resolving behind pointers, channels, or uintptr.
+// defined type name for literal synthesis; PkgPath carries the defining
+// package path of a named type (empty for predeclared and structural
+// types), so later spelling can qualify or refuse foreign names without
+// a native compiler type; Opaque marks types that cannot be spelled at
+// the use site (lowering keeps the original call for those instead of
+// a literal); Impure carries a purity-class reason for named types
+// resolving behind pointers, channels, or uintptr.
 type Type struct {
-	Kind   Kind
-	Len    int64 // arrays
-	Elem   *Type // slice and array elements
-	Key    *Type // map keys
-	Fields []Field
-	Named  string
-	Opaque bool
-	Impure string
+	Kind    Kind
+	Len     int64 // arrays
+	Elem    *Type // slice and array elements
+	Key     *Type // map keys
+	Fields  []Field
+	Named   string
+	PkgPath string
+	Opaque  bool
+	Impure  string
 }
 
 // Field is one struct field.

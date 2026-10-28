@@ -4,15 +4,15 @@ description: Write, read, build, test, and eject loGo/s code. Use when files end
 license: BSD-3-Clause
 compatibility: Needs the logos command from github.com/gosuda/loGos on PATH.
 metadata:
-  version: "0.20.0"
-  milestone: "M20"
+  version: "0.22.0"
+  milestone: "M1"
 ---
 
 # loGo/s
 
 loGo/s is Go with checked error propagation. You write `.lgo` files. The `logos` command checks them, lowers them to plain Go, and builds them with the Go 1.27 backend.
 
-Coverage: M1 error propagation, M2 closed unions, M3 options and nil flow, M4 interface properties, M5 const composites with CTFE, read-only placement, const views, zero-copy conversions, const maps and `logos/rt.Freeze`, M6 interpolation, address-of, defaults, spread, tuples, lambdas, chains, leading-dot, yield and scope defer, M12 capabilities. Not shipped: M7–M11, M13–M21+. Do not use those forms.
+Coverage: M1 error propagation, M2 closed unions, M3 options and nil flow, M4 interface properties, M5 const composites with CTFE, read-only placement, const views, zero-copy conversions, const maps and `logos/rt.Freeze`, M6 interpolation, address-of, defaults, spread, tuples, lambdas, chains, leading-dot, yield and scope defer, M7 comptime (`const if`, `const for`, `const switch T`, `comptime.ViewAs`), M8 structured concurrency, M9 lints, M10 migration tooling, M11 static JSON, M12 capabilities, M13 optimization tiers (`-O`), M21 language server (`logos lsp`).
 
 ## Procedure
 
@@ -20,15 +20,18 @@ Coverage: M1 error propagation, M2 closed unions, M3 options and nil flow, M4 in
 2. Classify every module you touch (see "Module rules"). Done when each module holds one kind and each package holds one kind.
 3. Write new code with the "Syntax" tables. Done when each error path uses a shipped form and no hand-written `if err != nil { return ..., err }` remains where `?` applies.
 4. Apply "Best practices". Done when each practice holds.
-5. Build and test: run `logos build ./...` and `logos test ./...`. Done when both exit 0. Fix each diagnostic by its rule ID in the "Diagnostics" table.
-6. When the user needs plain Go, eject (see "Eject"). Done when `go build ./...` and `go test ./...` both exit 0 inside the ejected directory.
+5. Lint: run `logos lint ./...` to check against forbidden and denied lint rules. Fix each finding or silence a deny rule with `//logos:allow(<rule>)`.
+6. Build and test: run `logos build ./...` and `logos test ./...`. Done when both exit 0. Fix each diagnostic by its rule ID in the "Diagnostics" table. Tune performance with `-O=0|1|2|3|s|z` flags or `logos.toml [build] opt_level` and `target_cpu`.
+7. Context lookup: run `logos context <package>#<symbol>` to inspect declaration signatures without function bodies.
+8. Editor setup: run `logos lsp` to launch the language server proxy for gopls with `.lgo` position and overlay mapping.
+9. When the user needs plain Go, eject (see "Eject"). Done when `go build ./...` and `go test ./...` both exit 0 inside the ejected directory.
 
 ## Module rules
 
 - One kind per module: a loGo/s module holds only `.lgo` packages (tests are `_test.lgo`); a Go module holds only `.go` packages. A package holds one kind. A workspace may hold both kinds.
 - Imports cross kinds in both directions, per import: a `.lgo` package may import any Go package, and a Go package may import any loGo/s package. A Go package sees a loGo/s package through its plain-Go form, the one `logos eject` writes.
 - Build with `logos`. Plain `go` ignores `.lgo` files, so it cannot build a loGo/s package or a Go package that imports one.
-- `logos.toml` sits at the module root. It uses a strict TOML subset (tables, `key = value`, basic and literal strings, integers, booleans, string arrays, `#` comments; 1 MB cap). Unknown tables or keys are errors, reported as `logos.toml:<line>:<col>: <message>`. Keys shipped so far: `[project] name`, `edition`, `strict_files`; `[build] cgo`, `cgo_allowlist`; `[capabilities]` severity and allowlist keys (M12, below).
+- `logos.toml` sits at the module root. It uses a strict TOML subset (tables, `key = value`, basic and literal strings, integers, booleans, string arrays, `#` comments; 1 MB cap). Unknown tables or keys are errors, reported as `logos.toml:<line>:<col>: <message>`. Keys shipped so far: `[project] name`, `edition`, `strict_files`; `[build] cgo`, `cgo_allowlist`, `opt_level`, `target_cpu`, `synthetic_pgo`, `arena`, `gc`; `[capabilities]` severity and allowlist keys (M12, below).
 - cgo is off by default in loGo/s modules (`[build] cgo = "forbid"`). Set `"restricted"` with `cgo_allowlist` globs, or `"allow"`, to use it.
 - Closed unions (M2): a Go importer sees a value-used union as its methods-only interface, the declaration `logos eject` writes (terms dropped, methods kept, with a `// loGo/s union: A | B` comment). A union used both as a type constraint and as a value type has no Go form; the Go import fails with `logos build: union U is used as a type constraint and as a value type; Go cannot express both`.
 - Options and platform pointers (M3): declarations from Go packages are platform declarations for `.lgo` code. Call, field, and element results from Go are platform values: usable after the error check and comparable to nil. Storing a nil Go value into a declared non-nil location panics with `logos: nil from Go value stored into non-nil *T at <file>:<line>`. A Go importer sees `*T?` as a bare pointer (nil as none) or as `logos/rt.Option[T]`, and non-nil `*T` as a bare pointer. A Go caller built by `logos` gets the same nil-store panic on direct calls (calls through function values are not checked); code built by upstream `go` from ejected output has no checks.
@@ -36,6 +39,7 @@ Coverage: M1 error propagation, M2 closed unions, M3 options and nil flow, M4 in
 - Properties (M4): a Go importer sees each property element as its `Logos_GetF`/`Logos_SetF` accessor methods.
 - Const views (M5): a Go importer sees the plain type; views are erased.
 - Capabilities (M12; proven by `src/cmd/go/testdata/script/logos_cap_unsafe.txt`, `src/cmd/go/testdata/script/logos_cap_exec.txt`): `logos.toml` holds a `[capabilities]` table with severity keys `direct_reflect`, `transitive_reflect`, `transitive_exec`, `transitive_net`, `transitive_unsafe` (each `deny`, `warn`, or `allow`; every key defaults to `deny` except `transitive_reflect`, which defaults to `warn`) and allowlist keys `reflect_allowlist`, `transitive_exec_allowlist`, `transitive_net_allowlist`, `transitive_unsafe_allowlist` (path globs). `logos` fails the build when a dependency reaches a protected sink (reflect constructors, process spawn, socket creation, `unsafe`, cgo entry) unless the dependency is allowlisted; `warn` prints and continues. Plain `go` runs no audit.
+- Lint rules (M9): `logos lint` checks `.lgo` packages with all rules, and Go packages of the main module with language-neutral rules. Forbid rules on Go packages are clamped to deny so `//logos:allow(<rule>)` can silence false positives. `logos build` and plain `go` run no lints on Go packages.
 
 ## Syntax (M1)
 
@@ -176,6 +180,28 @@ Rules:
 - `yield e` is allowed only directly inside a function returning `iter.Seq[T]` (one value) or `iter.Seq2[K, V]` (two values), else `[correctness::yield_outside_generator]`; a closure inside the generator may not yield. Falling off the end finishes the sequence; a valued `return` acts as bare. Early `break` in the consumer stops the body.
 - `scope defer f()` runs when control leaves the enclosing block: last in, first out; arguments evaluated at the statement; every exit (`return`, `break`, `continue`, labeled forms, `goto` out of the block, panic) runs it first; a loop body runs it each iteration. Lowering is an armed-flag guarding `defer` plus inline exit stanzas (not a wrapper closure, so plain `defer` tails keep firing at function exit); a `goto` past the statement leaves it disarmed.
 
+## Syntax (M7)
+
+Proven by `test/logos/run/const_if_nested.lgo`, `test/logos/codegen/const_if_dead.lgo`, `test/logos/run/const_for_const_if.lgo`, `test/logos/run/const_switch_order.lgo`, `test/logos/run/const_for_lines.lgo`, `src/internal/types/testdata/logos/const_if.lgo`, `src/internal/types/testdata/logos/const_switch.lgo`, `src/internal/types/testdata/logos/viewas.lgo`, `src/cmd/go/testdata/script/logos_eject_const_for.txt`.
+
+Virtual package `comptime` provides compile-time reflection (`comptime.Fields[T]()`, `comptime.IsStruct[T]()`, `comptime.TypeOf[T]()`, `comptime.Error(msg)`, `comptime.ViewAs[T](b)`).
+
+| loGo/s | Plain Go |
+|---|---|
+| `const if comptime.IsStruct[T]() { ... }` | live branch retained, dead branch stripped before lowering |
+| `const for _, f := range comptime.Fields[T]() { _ = val.[f] }` | unrolled field access in declaration order; re-checked per copy |
+| `const switch T { case int: ...; case ~string: ... }` | specialized compile-time branch in comptime generics; runtime type switch elsewhere |
+| `hdr := comptime.ViewAs[Header](buf)` | zero-copy POD struct pointer view over bytes |
+
+Rules:
+
+* `const if` requires a constant boolean expression (including `comptime.IsStruct[T]()` and combinations with `!`, `&&`, `||`). Both branches type-check, but only the live branch reaches lowering. Non-constant conditions report `[comptime::not_constant]`.
+* `const for` iterates over struct fields in declaration order via `comptime.Fields[T]()`. Unexported fields of the current package are included; unexported fields of foreign packages are excluded. `val.[f]` reads or writes the projected field. Unrolled bodies take the `const for` source position for line reporting.
+* Comptime generics expand into non-generic copies `<f>·logosct<N>` per concrete type argument list. Linker pclntab strips the suffix so stack traces display the base function name. Circular instantiation reports `[comptime::circular_instantiation]`. Expansions exceeding the AST node limit report `[comptime::node_limit]`.
+* `const switch T` cases match top-down; shadowed cases report `[comptime::unreachable_case]`. Exact cases rebind `T`; `~` cases match underlying basic types; interface cases rebind with the interface method set. Outside comptime generics, lowering produces a runtime type switch on `any((*T)(nil))`.
+* `comptime.ViewAs[T](b)` requires `T` to be a POD struct without padding, booleans, pointers, interfaces, slices, maps, or strings, else `[comptime::viewas_not_pod]`. Buffers shorter than `sizeof(T)` panic at run time.
+* Comptime reflection constructs exist only at compile time; runtime use reports `[comptime::runtime_use]`.
+
 ## Best practices
 
 - Prefer `?` over hand-written error checks. Keep the happy path flat.
@@ -240,6 +266,36 @@ Rules:
 | `capabilities::unauthorized_reflect` | Allowlist the dependency under `reflect_allowlist`, or remove it. |
 | `capabilities::unauthorized_net` | Allowlist the dependency under `transitive_net_allowlist`, or remove it. |
 | `capabilities::unauthorized_cgo` | Allow cgo for the module with `[build] cgo = "allow"`, or remove the dependency. |
+| `comptime::not_constant` | Use a constant boolean expression in `const if`. |
+| `comptime::const_for_fields` | Range over `comptime.Fields[T]()` with a concrete struct type. |
+| `comptime::const_for_projection` | Project fields with `val.[f]` within an enclosing `const for`. |
+| `comptime::circular_instantiation` | Break recursive comptime generic type cycles. |
+| `comptime::unreachable_case` | Remove or reorder shadowed cases in `const switch`. |
+| `comptime::viewas_not_pod` | Use a plain POD struct without padding, bools, pointers, interfaces, slices, maps, or strings in `comptime.ViewAs`. |
+| `comptime::runtime_use` | Restrict `comptime` types and values to compile-time expressions. |
+| `comptime::node_limit` | Reduce comptime AST unrolling or raise `max_comptime_ast_nodes` in `logos.toml`. |
+| `correctness::arena_pointer_escape` | Do not store arena-allocated pointers into heap-visible locations. |
+| `correctness::infinite_recursion` | Terminate recursive call chains with a base case. |
+| `correctness::typed_nil_return` | Return untyped nil instead of typed nil pointer to interface result. |
+| `correctness::unclosed_io_closer` | Close io.Closer resources with defer close. |
+| `correctness::unbounded_channel_op` | Bound channel operations or handle cancellation with select. |
+| `correctness::nil_deref_unproven` | Guard pointer dereference with non-nil check or use ?. and ?? default. |
+| `correctness::defer_erases_errdefer_state` | Do not overwrite error return values in defer ahead of errdefer. |
+| `correctness::allow_forbidden_rule` | Do not attach an allow directive to a forbidden rule. |
+| `concurrency::unsupervised_goroutine` | Move bare go f() statements into a go group block. |
+| `concurrency::concurrent_multiword_race` | Protect multi-word structures across goroutines with mutex or atomic pointer. |
+| `concurrency::reentrant_withlock_deadlock` | Do not call WithLock on the same Locked receiver inside its callback. |
+| `slop::err_chain_reset` | Wrap errors with %w instead of formatting with %v or err.Error(). |
+| `slop::discarded_error` | Check or return error instead of ignoring it, or use ? in functions returning error. |
+| `slop::todo_placeholder` | Implement functionality or remove placeholder comments and panic stubs. |
+| `complexity::cognitive_overflow` | Decompose complex functions to stay within threshold limits. |
+| `perf::large_backing_array_pin` | Copy needed elements instead of slicing large backing arrays. |
+| `perf::time_after_in_loop` | Move timer outside loop or use time.NewTimer with proper reset and drain. |
+| `suspicious::side_effect_before_sort` | Avoid side-effect expressions in sort comparisons. |
+| `portability::serialized_unsized_int` | Use sized integers (int32, int64) in serialized binary layouts. |
+| `pedantic::exhaustive_union_switch` | Remove redundant default clause from exhaustive switch on closed union. |
+
+The `--json-diagnostics` flag prints one JSON object per line with fields `schema_version` ("1.0"), `severity`, `rule_id`, `file`, and `span`.
 
 ## Eject
 

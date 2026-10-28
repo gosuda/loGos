@@ -82,6 +82,8 @@ type location struct {
 	addrtaken  bool // has this variable's address been taken?
 	param      bool // is this variable a parameter (ONAME of class ir.PPARAM)?
 	paramOut   bool // is this variable an out parameter (ONAME of class ir.PPARAMOUT)?
+
+	logosNoRet bool // logos M18: shadow allocation that a returned value does not outlive
 }
 
 type locAttr uint8

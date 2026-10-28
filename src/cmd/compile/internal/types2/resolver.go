@@ -701,6 +701,7 @@ func (check *Checker) packageObjects() {
 		for _, obj := range aliasList {
 			check.objDecl(obj)
 		}
+		check.logosSynthStaticMethods() // logos M11 hook: serializer methods of eligible structs.
 		// phase 3: all other declarations
 		for _, obj := range othersList {
 			check.objDecl(obj)

@@ -52,6 +52,8 @@ const (
 	ALocalTee
 	AGlobalGet
 	AGlobalSet
+	ATableGet // opcode 0x25, loGos hook: stack switching (stackswitch_logos.go)
+	ATableSet
 
 	AI32Load // opcode 0x28
 	AI64Load
@@ -525,6 +527,15 @@ const (
 	AI16x8RelaxedDotI8x16I7x16S
 	AI32x4RelaxedDotI8x16I7x16AddS
 
+	// loGos hook: typed reference and stack-switching instructions
+	// (stackswitch_logos.go); assemble encodes them one by one.
+	ARefNullCont
+	ARefIsNull
+	ARefFunc
+	AContNew
+	ASuspend
+	AResume
+
 	ALast // Sentinel: End of low-level WebAssembly instructions.
 
 	ARESUMEPOINT
@@ -532,6 +543,11 @@ const (
 	// It is allowed inside of WebAssembly blocks, whereas obj.ACALL is not.
 	// However, it is not allowed to switch goroutines while inside of an ACALLNORESUME call.
 	ACALLNORESUME
+	// ACALLCONT is a call without a resume point that passes an unwind of
+	// the WebAssembly stack on to its caller (loGos hook, stackswitch_logos.go).
+	// Its callee never resumes the caller's own frame, so a call of
+	// runtime.mcall is not one: preprocess turns it back into obj.ACALL.
+	ACALLCONT
 
 	ARETUNWIND
 
@@ -631,6 +647,8 @@ const (
 	REG_V13
 	REG_V14
 	REG_V15
+
+	REG_MYSP // loGos hook: stack depth of the frame (g.stack.hi - SP) saved for stack-switching unwinds, i32
 
 	REG_PC_B // also first parameter, i32
 

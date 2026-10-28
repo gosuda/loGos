@@ -15,6 +15,7 @@ import (
 
 	"cmd/compile/internal/syntax"
 	"cmd/compile/internal/types2"
+	"cmd/internal/logosowned"
 )
 
 // Eject writes one ejected Go file per logos source into dir by applying
@@ -45,7 +46,35 @@ func Eject(dir string, files []*syntax.File, src map[*syntax.File][]byte, edits 
 			return err
 		}
 	}
-	return nil
+	return writeOwnedConstantRequests(dir)
+}
+
+// writeOwnedConstantRequests publishes one complete sidecar only after all
+// source files have been emitted. The rename keeps readers from observing
+// partially encoded requests.
+func writeOwnedConstantRequests(dir string) error {
+	requests, err := OwnedConstantRequests()
+	if err != nil {
+		return err
+	}
+	data, err := logosowned.Encode(requests)
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".logos-owned-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, filepath.Join(dir, logosowned.FileName))
 }
 
 // ejectedName maps a logos file name to its ejected Go file name.

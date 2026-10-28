@@ -1,0 +1,141 @@
+// run -goexperiment nojsonv2
+
+package main
+
+// M11-S4 call-site static JSON fixture under nojsonv2 (SPEC Sec 12.1, S8, S9, T-Sec12).
+// Anchor: Tony Hoare, Edsger W. Dijkstra
+//
+// Call-site contracts for eligible static JSON structs under GOEXPERIMENT=nojsonv2:
+// 1. json.Marshal(v) equals v.MarshalJSON() byte for byte.
+// 2. Pointer (&v) and interface (any(v)) forms agree with the value call.
+// 3. Struct with an interface field holding v produces matching JSON.
+// 4. json.NewEncoder(w).Encode(v) adds only the trailing newline.
+// 5. Parity holds under !goexperiment.jsonv2 as required by SPEC Sec 12.1.
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
+type User struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email,omitempty"`
+}
+
+type Container struct {
+	Payload any `json:"payload"`
+}
+
+func testCallSiteParityWithMarshalJSON() {
+	users := []User{
+		{ID: 101, Name: "Ada Lovelace", Email: "ada@example.com"},
+		{ID: 102, Name: "Alan Turing"},
+		{ID: 0, Name: ""},
+	}
+
+	for _, u := range users {
+		direct, err := u.MarshalJSON()
+		if err != nil {
+			panic(err)
+		}
+
+		viaJSON, err := json.Marshal(u)
+		if err != nil {
+			panic(err)
+		}
+
+		if !bytes.Equal(direct, viaJSON) {
+			panic(fmt.Sprintf("json.Marshal(%+v) = %s, MarshalJSON() = %s", u, viaJSON, direct))
+		}
+	}
+}
+
+func testPointerAndInterfaceFormsAgree() {
+	u := User{ID: 202, Name: "Grace Hopper", Email: "grace@navy.mil"}
+
+	valBytes, err := json.Marshal(u)
+	if err != nil {
+		panic(err)
+	}
+
+	ptrBytes, err := json.Marshal(&u)
+	if err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(ptrBytes, valBytes) {
+		panic(fmt.Sprintf("json.Marshal(&v) %s != json.Marshal(v) %s", ptrBytes, valBytes))
+	}
+
+	ifaceBytes, err := json.Marshal(any(u))
+	if err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(ifaceBytes, valBytes) {
+		panic(fmt.Sprintf("json.Marshal(any(v)) %s != json.Marshal(v) %s", ifaceBytes, valBytes))
+	}
+
+	ptrIfaceBytes, err := json.Marshal(any(&u))
+	if err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(ptrIfaceBytes, valBytes) {
+		panic(fmt.Sprintf("json.Marshal(any(&v)) %s != json.Marshal(v) %s", ptrIfaceBytes, valBytes))
+	}
+
+	cVal := Container{Payload: u}
+	cPtr := Container{Payload: &u}
+	bVal, err := json.Marshal(cVal)
+	if err != nil {
+		panic(err)
+	}
+	bPtr, err := json.Marshal(cPtr)
+	if err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(bVal, bPtr) {
+		panic(fmt.Sprintf("Container with interface field: val %s != ptr %s", bVal, bPtr))
+	}
+}
+
+func testEncoderAddsOnlyTrailingNewline() {
+	u := User{ID: 303, Name: "Edsger Dijkstra", Email: "ewd@utexas.edu"}
+
+	marshaled, err := json.Marshal(u)
+	if err != nil {
+		panic(err)
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	if err := enc.Encode(u); err != nil {
+		panic(err)
+	}
+
+	encoded := buf.Bytes()
+	if len(encoded) != len(marshaled)+1 {
+		panic(fmt.Sprintf("Encoder len %d != Marshal len %d + 1", len(encoded), len(marshaled)))
+	}
+	if encoded[len(encoded)-1] != '\n' {
+		panic(fmt.Sprintf("Encoder missing trailing newline: %q", encoded))
+	}
+	if !bytes.Equal(encoded[:len(encoded)-1], marshaled) {
+		panic(fmt.Sprintf("Encoder payload %s != Marshal payload %s", encoded[:len(encoded)-1], marshaled))
+	}
+
+	buf.Reset()
+	if err := enc.Encode(&u); err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(buf.Bytes(), encoded) {
+		panic(fmt.Sprintf("Encoder(&v) %s != Encoder(v) %s", buf.Bytes(), encoded))
+	}
+}
+
+func main() {
+	testCallSiteParityWithMarshalJSON()
+	testPointerAndInterfaceFormsAgree()
+	testEncoderAddsOnlyTrailingNewline()
+	fmt.Println("callsite nojsonv2 ok")
+}

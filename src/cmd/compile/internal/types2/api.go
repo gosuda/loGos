@@ -183,6 +183,13 @@ type Config struct {
 	// MAY raise it through max_ctfe_steps.
 	LogosCTFEMaxSteps int
 
+	// LogosOwnedTypes carries exact-node owned-type descriptors for the
+	// final recheck of native private-type support. Keys are
+	// compiler-created nodes; type nodes carry a full descriptor while
+	// literal and field-selector nodes register the zero descriptor.
+	// Nil for the first user-source check and for plain Go checks.
+	LogosOwnedTypes map[syntax.Expr]LogosOwnedType
+
 	// If a non-empty ErrorURL format string is provided, it is used
 	// to format an error URL link that is appended to the first line
 	// of an error message. ErrorURL must be a format string containing
@@ -331,12 +338,14 @@ type Info struct {
 	LogosCTFE        map[*Const]ctfe.Value                  // logos M5-S2 hook: evaluated const values (scalars and composites) for lowering.
 	LogosSpreads     map[*syntax.CompositeLit][]LogosSpread // logos M6-S4 hook: checked `..src` spreads per struct literal.
 
-	LogosConstIfDead map[syntax.Stmt]bool                             // logos M7-S1 hook: statements of dead `const if` branches, for comptime checks.
-	LogosConstSel    map[*syntax.SelectorExpr]*syntax.ConstSwitchCase // logos M7-S4 hook: interface-case selectors on the switched value, by their case.
-	LogosConstCases  map[*syntax.ConstSwitchCase]LogosConstCase       // logos M7-S4 hook: the case-scope substitution of each `const switch` case.
-	LogosConstFor    map[syntax.Node]*LogosConstFor                   // logos M7-S2 hook: checked `const for` statements for unrolling.
-	LogosDisqual     map[*syntax.BlockStmt][]map[string]bool          // logos M7-S2 hook: narrowing-disqualified names per function body, for copy checks.
-	LogosImporter    Importer                                         // logos M7-S3 hook: the importer of the check, for comptime copies that name packages the checked files do not import.
+	LogosConstIfDead  map[syntax.Stmt]bool                             // logos M7-S1 hook: statements of dead `const if` branches, for comptime checks.
+	LogosConstSel     map[*syntax.SelectorExpr]*syntax.ConstSwitchCase // logos M7-S4 hook: interface-case selectors on the switched value, by their case.
+	LogosConstCases   map[*syntax.ConstSwitchCase]LogosConstCase       // logos M7-S4 hook: the case-scope substitution of each `const switch` case.
+	LogosConstFor     map[syntax.Node]*LogosConstFor                   // logos M7-S2 hook: checked `const for` statements for unrolling.
+	LogosDisqual      map[*syntax.BlockStmt][]map[string]bool          // logos M7-S2 hook: narrowing-disqualified names per function body, for copy checks.
+	LogosImporter     Importer                                         // logos M7-S3 hook: the importer of the check, for comptime copies that name packages the checked files do not import.
+	LogosContext      *Context                                         // logos M7-S3 hook: the canonical context of the check, for comptime copies to share instance identity.
+	LogosCTFEMaxSteps int                                              // logos M5-S2 hook: step limit for CTFE and copy checkers.
 
 	LogosPlatformRets map[syntax.Pos][]LogosPlatformRet // logos M9-S2 hook: start positions of return operands holding platform pointers that convert to an interface result.
 }

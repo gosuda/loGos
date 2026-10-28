@@ -71,7 +71,7 @@ func LogosHintsWrite() {
 			File:    pos.RelFilename(),
 			Line:    int(pos.Line()),
 			Col:     int(pos.Col()),
-			Tier:    hintTier(d.Heap),
+			Tier:    hintTier(d),
 			Message: d.Message,
 			Reason:  d.Reason,
 		})
@@ -83,8 +83,11 @@ func LogosHintsWrite() {
 }
 
 // hintTier names the tier of an escape decision.
-func hintTier(heap bool) string {
-	if heap {
+func hintTier(d escape.LogosHintDecision) string {
+	if d.Arena {
+		return logos.TierArena
+	}
+	if d.Heap {
 		return logos.TierHeap
 	}
 	return logos.TierStack

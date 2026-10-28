@@ -468,15 +468,20 @@ func (fc *funcLower) lowerGroupRange(s *syntax.ForStmt, rc *syntax.RangeClause, 
 	headStart := fl.off(pos)
 	braceOff := fl.off(s.Body.Pos())
 	fl.add(headStart, braceOff, "for "+lhsPart+"range "+rtAlias+".Chan("+top.gctx+", "+chText+") ")
-	checkN := ifOf(pos, nil,
+	// The post-loop check is emitted after the loop, so it carries the
+	// loop body's closing position, not the loop's head position: scope
+	// marks are recorded in emission order and the head position would
+	// move them backwards past the loop body's close.
+	checkPos := s.Body.Rbrace
+	checkN := ifOf(checkPos, nil,
 		at(&syntax.Operation{
 			Op: syntax.Neq,
-			X:  callOf(pos, selOf(pos, nameOf(pos, top.gctx), "Err"), nil),
-			Y:  nilOf(pos),
-		}, pos),
+			X:  callOf(checkPos, selOf(checkPos, nameOf(checkPos, top.gctx), "Err"), nil),
+			Y:  nilOf(checkPos),
+		}, checkPos),
 		[]syntax.Stmt{
-			returnOf(pos, []syntax.Expr{
-				callOf(pos, selOf(pos, nameOf(pos, top.gctx), "Err"), nil),
+			returnOf(checkPos, []syntax.Expr{
+				callOf(checkPos, selOf(checkPos, nameOf(checkPos, top.gctx), "Err"), nil),
 			}),
 		})
 	end := fl.off(s.Body.Rbrace) + 1
@@ -503,8 +508,11 @@ func (fc *funcLower) groupAugmentSelect(s *syntax.SelectStmt) {
 	if !ok || groupSelectHasDefault(s) {
 		return
 	}
-	pos := s.Pos()
-	s.Body = append(s.Body, groupDoneClause(pos, top.gctx))
+	// The cancel arm is appended after every written clause, so it
+	// carries the select's closing position, not its head position:
+	// clause scope marks are recorded in emission order and the head
+	// position would move them backwards past the written clauses.
+	s.Body = append(s.Body, groupDoneClause(s.Rbrace, top.gctx))
 	rbraceOff := fc.fl.off(s.Rbrace)
 	fc.fl.add(rbraceOff, rbraceOff, "\n"+groupDoneText(top.gctx)+"\n")
 }

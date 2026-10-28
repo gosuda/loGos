@@ -63,3 +63,17 @@ func TestLogosGCFlagsScopedToTestPackage(t *testing.T) {
 		t.Fatalf("test-package element dropped flags or -e: %q", scoped)
 	}
 }
+
+// TestLogosTestCmd pins the argv of a staged _test.lgo run case: `logos test`
+// over the staged package, and with a fuzz time the -fuzz and -fuzztime flags
+// before the package argument.
+func TestLogosTestCmd(t *testing.T) {
+	got := strings.Join(logosTestCmd("logos", "-gcflags=all=", []string{"-race"}, ""), " ")
+	if want := "logos test -count=1 -gcflags=all= -race ."; got != want {
+		t.Fatalf("seed corpus argv = %q, want %q", got, want)
+	}
+	got = strings.Join(logosTestCmd("logos", "-gcflags=all=", nil, "60s"), " ")
+	if want := "logos test -count=1 -gcflags=all= -fuzz=^Fuzz -fuzztime=60s ."; got != want {
+		t.Fatalf("fuzz argv = %q, want %q", got, want)
+	}
+}

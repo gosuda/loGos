@@ -1987,6 +1987,12 @@ func (p *Package) load(ld *modload.Loader, ctx context.Context, opts PackageOpts
 		if needsLogosSimd(p) {
 			addImport("simd/archsimd", true)
 		}
+		// Generated static-JSON methods import logos/rt/json after
+		// the source imports resolve, so every logos package carries
+		// it (M11).
+		if needsLogosJSON(p) {
+			addImport("logos/rt/json", true)
+		}
 
 		// Interpolated strings lower to strconv appends and unsafe
 		// conversions, so every logos package carries both imports

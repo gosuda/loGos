@@ -153,13 +153,13 @@ func (s EditSpan) original(o, start int, e edge) int {
 }
 
 // toLowered maps a position of the original text to the lowered text.
-func (m *posMap) toLowered(p Position, e edge) Position {
-	return m.low.position(m.lowOffset(m.orig.offset(p), e))
+func (m *posMap) toLowered(p Position) Position {
+	return m.low.position(m.lowOffset(m.orig.offset(p), leading))
 }
 
 // toOriginal maps a position of the lowered text to the original text.
-func (m *posMap) toOriginal(p Position, e edge) Position {
-	return m.orig.position(m.origOffset(m.low.offset(p), e))
+func (m *posMap) toOriginal(p Position) Position {
+	return m.orig.position(m.origOffset(m.low.offset(p), leading))
 }
 
 // rangeToLowered maps a range of the original text to the lowered text. It

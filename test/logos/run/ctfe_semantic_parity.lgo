@@ -1,0 +1,290 @@
+// run
+
+package main
+
+// CTFE semantic parity (T-201): every result below must be computed at
+// compile time by the const evaluator with Go semantics. The constants
+// are the compile-time witnesses; main only prints and asserts them.
+// A constant array bound (probe) only compiles if folding succeeded.
+
+const func DblShift() int {
+	return 1 << uint8(8)
+}
+
+const func NegShift() int {
+	var s int8 = -8
+	return int(s >> 1)
+}
+
+const func WrappedShift() int {
+	var s int8 = -1
+	u := uint8(s)
+	return int(u >> 7)
+}
+
+const func FloatEq() int {
+	w := 0
+	if 1 == 1.0 {
+		w += 1
+	}
+	if 2.5 == 5/2 {
+		w += 10
+	}
+	if 3.0 == 3 {
+		w += 100
+	}
+	if 0.5*4 == 2 {
+		w += 1000
+	}
+	return w
+}
+
+const almostOne = 1.0000000000000000001
+
+const func AlmostOneEq() bool {
+	return almostOne == 1.0
+}
+
+const func AlmostOneAbove() bool {
+	return almostOne > 1.0
+}
+
+const func CopyVsAlias() int {
+	w := 0
+	a := [3]int{1, 2, 3}
+	b := a
+	b[0] = 9
+	if a[0] == 1 {
+		w += 1
+	}
+	s := []int{1, 2, 3}
+	t := s
+	t[0] = 9
+	if s[0] == 9 {
+		w += 10
+	}
+	return w
+}
+
+const func CapAndOverlap() int {
+	w := 0
+	buf := make([]int, 3, 8)
+	if cap(buf) == 8 && len(buf) == 3 {
+		w += 1
+	}
+	grown := append(buf, 4, 5, 6, 7, 8, 9)
+	if len(grown) == 9 && cap(grown) >= len(grown) &&
+		grown[0] == 0 && grown[1] == 0 && grown[2] == 0 &&
+		grown[3] == 4 && grown[4] == 5 && grown[5] == 6 &&
+		grown[6] == 7 && grown[7] == 8 && grown[8] == 9 {
+		w += 10
+	}
+	s2 := []int{1, 2, 3, 4, 5}
+	if cap(s2[:1]) == 5 && cap(s2[3:]) == 2 && len(s2[3:]) == 2 {
+		w += 1000
+	}
+	s := []int{1, 2, 3, 4, 5}
+	n := copy(s[1:], s)
+	if n == 4 && s[1] == 1 && s[2] == 2 && s[3] == 3 && s[4] == 4 {
+		w += 100
+	}
+	return w
+}
+
+const func Utf8Offsets() int {
+	w := 0
+	for i, r := range "héllo" {
+		w += i
+		if r == 'é' {
+			w += 100
+		}
+	}
+	if len("héllo") == 6 {
+		w += 1000
+	}
+	if "héllo"[1] == 195 {
+		w += 10000
+	}
+	return w
+}
+
+const func AssignOrder() int {
+	i := 0
+	arr := []int{0, 0}
+	i, arr[i] = 1, 2
+	return 100*i + 10*arr[0] + arr[1]
+}
+
+const func Pick(first byte, rest ...int) int {
+	total := int(first)
+	for _, v := range rest {
+		total += v
+	}
+	return total
+}
+
+const func VariadicChecks() int {
+	w := 0
+	if Pick(10, 1, 2, 3) == 16 {
+		w += 1
+	}
+	if Pick(7) == 7 {
+		w += 10
+	}
+	tail := []int{4, 5}
+	if Pick(3, tail...) == 12 {
+		w += 100
+	}
+	if Pick(200, 100, 100) == 400 {
+		w += 1000
+	}
+	return w
+}
+
+const func HalfFloat() float64 {
+	return 7 / 2
+}
+
+const func HalfFloatIsInt3() bool {
+	return HalfFloat() == 3.0 && HalfFloat() != 3.5
+}
+
+const func TruncConv() int {
+	f := 2.75
+	return int(f)
+}
+
+const func LabeledContinueCount() int {
+	count := 0
+outer:
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			if j == 1 {
+				continue outer
+			}
+			count++
+		}
+	}
+	return count
+}
+
+const func LabeledBreakCount() int {
+	count := 0
+outer:
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			if i == 1 && j == 2 {
+				break outer
+			}
+			count++
+		}
+	}
+	return count
+}
+
+const func LabelFlow() int {
+	w := 0
+	if LabeledContinueCount() == 3 {
+		w += 1
+	}
+	if LabeledBreakCount() == 5 {
+		w += 10
+	}
+	return w
+}
+
+const func FallThrough() int {
+	w := 0
+	switch 2 {
+	case 1:
+		w += 1
+	case 2:
+		w += 10
+		fallthrough
+	case 3:
+		w += 100
+	default:
+		w += 1000
+	}
+	return w
+}
+
+const func RangeInts() int {
+	w := 0
+	n := 3
+	count := 0
+	for i := range n {
+		count++
+		if i == 1 {
+			break
+		}
+	}
+	if count == 2 {
+		w += 1
+	}
+	// Above MaxInt64: folding the range count through int64 would
+	// truncate the iteration space.
+	var large uint64 = 10000000000000000000
+	steps := 0
+	for i := range large {
+		steps++
+		if i == 2 {
+			break
+		}
+	}
+	if steps == 3 {
+		w += 10
+	}
+	neg := -3
+	countN := 0
+	for range neg {
+		countN++
+	}
+	if countN == 0 {
+		w += 100
+	}
+	return w
+}
+
+const shift256 = DblShift()
+const negShift = NegShift()
+const wrappedShift = WrappedShift()
+const floatEq = FloatEq()
+const almostOneIsOne = AlmostOneEq()
+const almostOneAbove = AlmostOneAbove()
+const copyVsAlias = CopyVsAlias()
+const capAndOverlap = CapAndOverlap()
+const utf8Offsets = Utf8Offsets()
+const assignOrder = AssignOrder()
+const variadicChecks = VariadicChecks()
+const halfFloatOk = HalfFloatIsInt3()
+const truncConv = TruncConv()
+const labelFlow = LabelFlow()
+const fallThrough = FallThrough()
+const rangeInts = RangeInts()
+
+var probe [shift256]byte
+
+func main() {
+	if shift256 != 256 || labelFlow != 11 || rangeInts != 111 {
+		println("ctfe-semantic-parity-broken")
+		return
+	}
+	println(shift256)
+	println(negShift)
+	println(wrappedShift)
+	println(floatEq)
+	println(almostOneIsOne)
+	println(almostOneAbove)
+	println(copyVsAlias)
+	println(capAndOverlap)
+	println(utf8Offsets)
+	println(assignOrder)
+	println(variadicChecks)
+	println(halfFloatOk)
+	println(truncConv)
+	println(labelFlow)
+	println(fallThrough)
+	println(rangeInts)
+	println(len(probe))
+}

@@ -233,6 +233,10 @@ func ForceHost() {
 	// This will also update the BuildContext's tool tags to include the new
 	// experiment tags.
 	computeExperiment()
+	// Drop the logos wasm preemptibleloops default for the host target so a
+	// host tool build never inherits it; an explicit user preemptibleloops
+	// is kept. Per-target state, recomputed on every retarget.
+	RefreshLogosPreemptible()
 }
 
 // SetGOROOT sets GOROOT and associated variables to the given values.

@@ -1,0 +1,63 @@
+// run
+
+package main
+
+import "fmt"
+
+// #28: RVO destination aliasing: destination passing must not exist.
+// Self-aliased calls such as arr = Reverse(arr) must return correct results
+// without copy-back corruption.
+
+func Reverse(a [4]int) (res [4]int) {
+	res[0] = a[3]
+	res[1] = a[2]
+	res[2] = a[1]
+	res[3] = a[0]
+	return res
+}
+
+func ReversePtr(p *[4]int) (res [4]int) {
+	res[0] = p[3]
+	res[1] = p[2]
+	res[2] = p[1]
+	res[3] = p[0]
+	return res
+}
+
+func ReverseSliceAliased(s []int) (res []int) {
+	res = s
+	for i := 0; i < len(res)/2; i++ {
+		j := len(res) - 1 - i
+		res[i], res[j] = res[j], res[i]
+	}
+	return res
+}
+
+type Pair struct {
+	A int
+	B int
+}
+
+func SwapPair(p *Pair) (res Pair) {
+	res.A = p.B
+	res.B = p.A
+	return res
+}
+
+func main() {
+	arr := [4]int{1, 2, 3, 4}
+	arr = Reverse(arr)
+	fmt.Println("val:", arr)
+
+	arr2 := [4]int{10, 20, 30, 40}
+	arr2 = ReversePtr(&arr2)
+	fmt.Println("ptr:", arr2)
+
+	s := []int{100, 200, 300, 400}
+	s = ReverseSliceAliased(s)
+	fmt.Println("slice:", s)
+
+	pair := Pair{A: 1, B: 2}
+	pair = SwapPair(&pair)
+	fmt.Println("pair:", pair)
+}

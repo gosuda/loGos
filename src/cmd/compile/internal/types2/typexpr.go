@@ -21,6 +21,17 @@ func (check *Checker) ident(x *operand, e *syntax.Name, wantType bool) {
 	x.invalidate()
 	x.expr = e
 
+	if typ, ok := check.logosOwnedTypeOf(e); ok {
+		if !isValid(typ) {
+			x.invalidate()
+			x.typ_ = Typ[Invalid]
+			return
+		}
+		x.mode_ = typexpr
+		x.typ_ = typ
+		return
+	}
+
 	scope, obj := check.lookupScope(e.Value)
 	switch obj {
 	case nil:
@@ -247,6 +258,10 @@ func (check *Checker) typInternal(e0 syntax.Expr, def *TypeName) (T Type) {
 				check.trace(e0.Pos(), "=> %s (under = %s) // %s", T, under, goTypeName(T))
 			}
 		}()
+	}
+
+	if typ, ok := check.logosOwnedTypeOf(e0); ok {
+		return typ
 	}
 
 	switch e := e0.(type) {

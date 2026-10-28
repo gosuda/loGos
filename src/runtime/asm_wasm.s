@@ -32,6 +32,61 @@ TEXT runtime·mstart(SB),NOSPLIT|TOPFRAME,$0
 DATA  runtime·mainPC+0(SB)/8,$runtime·main(SB)
 GLOBL runtime·mainPC(SB),RODATA,$8
 
+#ifdef GOWASM_stackswitch
+// loGos M16-S1, --wasm-features=stack-switching (logos_stackswitch_wasm.go):
+// every goroutine runs on its own WebAssembly continuation. gogo installs
+// the target state as upstream does and then hands the switch to the root
+// loop (wasm_pc_f_loop), suspending the running continuation when it runs
+// on one. When the target goroutine owns the running continuation (stack
+// growth, recovery, a goroutine that switches to itself) gogo unwinds that
+// continuation to the target frame instead.
+TEXT runtime·gogo(SB), NOSPLIT, $16-8
+	MOVD buf+0(FP), R0
+	MOVD gobuf_g(R0), R1
+	MOVD 0(R1), R2	// make sure g != nil
+	// Find the continuation slot of the target while still on the
+	// current stack: the helper is a normal Go function.
+	MOVD R1, 0(SP)
+	CALLNORESUME runtime·wasmContSlot(SB)
+	MOVD 8(SP), R3 // continuation slot of the target, plus 1
+	MOVD buf+0(FP), R0
+	MOVD gobuf_g(R0), R1
+	MOVD R1, g
+	MOVD gobuf_sp(R0), SP
+
+	// Put target PC at -8(SP): the target frame or wasm_cont_entry picks it up
+	Get SP
+	I32Const $8
+	I32Sub
+	I64Load gobuf_pc(R0)
+	I64Store $0
+
+	MOVD gobuf_ctxt(R0), CTXT
+	// clear to help garbage collector
+	MOVD $0, gobuf_sp(R0)
+	MOVD $0, gobuf_ctxt(R0)
+
+	I32Const $runtime·wasmContCur(SB)
+	I64Load $0
+	Set R4
+	Get R3
+	Get R4
+	I64Eq
+	If
+		I32Const $1
+		Return
+	End
+	MOVD R3, runtime·wasmContNext(SB)
+	Get R4
+	I64Eqz
+	If
+		I32Const $1
+		Return
+	End
+	Suspend
+	I32Const $1
+	Return
+#else
 TEXT runtime·gogo(SB), NOSPLIT, $0-8
 	MOVD buf+0(FP), R0
 	MOVD gobuf_g(R0), R1
@@ -53,6 +108,7 @@ TEXT runtime·gogo(SB), NOSPLIT, $0-8
 
 	I32Const $1
 	Return
+#endif
 
 // func mcall(fn func(*g))
 // Switch to m->g0's stack, call fn(g).
@@ -497,6 +553,7 @@ TEXT runtime·gcWriteBarrier8<ABIInternal>(SB),NOSPLIT,$0
 	Call	gcWriteBarrier<>(SB)
 	Return
 
+#ifndef GOWASM_stackswitch
 TEXT wasm_pc_f_loop(SB),NOSPLIT,$0
 // Call the function for the current PC_F. Repeat until PAUSE != 0 indicates pause or exit.
 // The WebAssembly stack may unwind, e.g. when switching goroutines.
@@ -532,6 +589,7 @@ TEXT wasm_pc_f_loop(SB),NOSPLIT,$0
 	Set PAUSE
 
 	Return
+#endif
 
 // wasm_pc_f_loop_export is like wasm_pc_f_loop, except that this takes an
 // argument (on Wasm stack) that is a PC_F, and the loop stops when we get
@@ -588,11 +646,13 @@ outer:
 TEXT wasm_export_lib(SB),NOSPLIT,$0
 	UNDEF
 
+#ifndef GOWASM_stackswitch
 TEXT runtime·pause(SB), NOSPLIT, $0-8
 	MOVD newsp+0(FP), SP
 	I32Const $1
 	Set PAUSE
 	RETUNWIND
+#endif
 
 // Called if a wasmexport function is called before runtime initialization
 TEXT runtime·notInitialized(SB), NOSPLIT, $0
@@ -603,3 +663,161 @@ TEXT runtime·notInitialized(SB), NOSPLIT, $0
 	I32Const $0 // entry PC_B
 	Call runtime·abort(SB)
 	UNDEF
+
+#ifdef GOWASM_stackswitch
+// The root loop of the stack-switching mode (loGos M16-S1). It runs on the
+// module's main WebAssembly stack. With a switch pending (wasmContNext) it
+// resumes the continuation of the target goroutine; otherwise it calls the
+// function at -8(SP) as upstream does, which re-enters runtime frames on
+// GOOS=js after a pause. It returns when PAUSE indicates pause or exit.
+TEXT wasm_pc_f_loop(SB),NOSPLIT,$0
+	Get PAUSE
+	I32Eqz
+	If
+	loop:
+		Loop
+			I32Const $runtime·wasmContNext(SB)
+			I64Load $0
+			I64Eqz
+			If
+				Get SP
+				I32Const $8
+				I32Sub
+				I32Load16U $0 // PC_B
+
+				Get SP
+				I32Const $8
+				I32Sub
+				I32Load $2 // PC_F
+
+				CallIndirect $0
+				Drop
+			Else
+				Call wasm_cont_run(SB)
+			End
+
+			Get PAUSE
+			I32Eqz
+			BrIf loop
+		End
+	End
+
+	I32Const $0
+	Set PAUSE
+
+	Return
+
+// wasm_cont_run resumes the continuation in slot wasmContNext-1 of the
+// continuation table, creating it from wasm_cont_entry on first use. When
+// the continuation suspends, it stores the new continuation in the slot;
+// when it finishes (exit), the slot stays empty. R0 (i32) holds the slot.
+TEXT wasm_cont_run(SB),NOSPLIT,$0
+	I32Const $runtime·wasmContNext(SB)
+	I64Load $0
+	I32WrapI64
+	I32Const $1
+	I32Sub
+	Set R0
+
+	I32Const $runtime·wasmContCur(SB)
+	I32Const $runtime·wasmContNext(SB)
+	I64Load $0
+	I64Store $0
+
+	I32Const $runtime·wasmContNext(SB)
+	I64Const $0
+	I64Store $0
+
+	TableSize $1
+	Get R0
+	I32LeU
+	If
+		RefNullCont
+		Get R0
+		I32Const $64
+		I32Add
+		TableSize $1
+		I32Sub
+		TableGrow $1
+		Drop
+	End
+
+	Get R0
+	TableGet $1
+	RefIsNull
+	If
+		Get R0
+		RefFunc wasm_cont_entry(SB)
+		ContNew
+		TableSet $1
+	End
+
+	Block
+		Get R0
+		Block $-1 // handler of ContTag, result (ref cont)
+			Get R0
+			TableGet $1
+			Get R0
+			RefNullCont
+			TableSet $1
+			Resume $0
+			Br $1 // finished
+		End
+		TableSet $1 // suspended: keep the continuation in the slot
+	End
+
+	I32Const $runtime·wasmContCur(SB)
+	I64Const $0
+	I64Store $0
+	Return
+
+// wasm_cont_entry is the body of every goroutine continuation: the upstream
+// pc_f loop. It enters the function at -8(SP) and, after it returns or
+// after an unwind that no frame on the continuation claimed, the function
+// whose return address is next on the Go stack.
+TEXT wasm_cont_entry(SB),NOSPLIT,$0
+	loop:
+	Loop
+		Get SP
+		I32Const $8
+		I32Sub
+		I32Load16U $0 // PC_B
+
+		Get SP
+		I32Const $8
+		I32Sub
+		I32Load $2 // PC_F
+
+		CallIndirect $0
+		Drop
+
+		Get PAUSE
+		I32Eqz
+		BrIf loop
+	End
+	Return
+
+// pause returns control to JavaScript (GOOS=js). On a continuation it
+// suspends it into wasmContPaused; wasm_export_resume resumes it, and
+// then the continuation unwinds into handleEvent at the paused SP, as the
+// upstream wasm_export_resume calls handleEvent there.
+TEXT runtime·pause(SB), NOSPLIT, $0-8
+	MOVD newsp+0(FP), SP
+	I32Const $1
+	Set PAUSE
+	I32Const $runtime·wasmContCur(SB)
+	I64Load $0
+	Set R0
+	Get R0
+	I64Eqz
+	If
+		RETUNWIND
+	End
+	MOVD R0, runtime·wasmContPaused(SB)
+	Suspend
+	// RETUNWIND pops 8 bytes, so 0(SP) becomes -8(SP) for wasm_cont_entry.
+	Get SP
+	I64Const $runtime·handleEvent(SB)
+	I64Store $0
+	RETUNWIND
+#endif

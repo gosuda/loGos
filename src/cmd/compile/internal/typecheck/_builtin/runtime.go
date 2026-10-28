@@ -195,6 +195,13 @@ func block()
 func makeslice(typ *byte, len int, cap int) unsafe.Pointer
 func makeslice64(typ *byte, len int64, cap int64) unsafe.Pointer
 func makeslicecopy(typ *byte, tolen int, fromlen int, from unsafe.Pointer) unsafe.Pointer
+func logosArenaAlloc(typ *byte, size uintptr) unsafe.Pointer
+func logosArenaBump(size uintptr) unsafe.Pointer
+func logosArenaAllocScan(typ *byte, size uintptr) unsafe.Pointer
+func logosArenaMarkSave() (chunk, noscan, scan uintptr)
+func logosArenaMarkRestore(chunk, noscan, scan uintptr)
+func logosArenaRetTake() bool
+func logosArenaRetSet(ok bool)
 func growslice(oldPtr *any, newLen, oldCap, num int, et *byte) (ary []any)
 func growsliceBuf(oldPtr *any, newLen, oldCap, num int, et *byte, buf *any, bufLen int) (ary []any)
 func growsliceBufNoAlias(oldPtr *any, newLen, oldCap, num int, et *byte, buf *any, bufLen int) (ary []any)

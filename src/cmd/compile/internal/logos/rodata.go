@@ -91,15 +91,53 @@ func (fl *fileLower) markRodataMoved(vd *syntax.VarDecl, v ctfe.Value) {
 // rodataStaticValue reports whether v and every type nested in it
 // (slice, array, struct fields, map key and element) avoid maps.
 // Maps keep dynamic initialization until M5-S4 lowers them to static
-// tables. Opaque or invalid types are not static.
+// tables. The lowering has already realized the literal, so source
+// spellability does not change static storage eligibility.
 func rodataStaticValue(v ctfe.Value) bool {
 	return rodataStaticType(v.Type(), 0)
+}
+
+// rodataStaticKeptValue reports whether a kept-init value can init a
+// read-only var. The writer substitutes a static value for the kept
+// initializer or the build fails closed; only maps stay dynamic.
+func rodataStaticKeptValue(v ctfe.Value) bool {
+	t := v.Type()
+	return t != nil && rodataStaticKept(t, 0)
+}
+
+func rodataStaticKept(t *ctfe.Type, depth int) bool {
+	if t == nil || depth > 64 {
+		return false
+	}
+	switch t.Kind {
+	case ctfe.KMap:
+		return false
+	case ctfe.KSlice, ctfe.KArray:
+		return rodataStaticKept(t.Elem, depth+1)
+	case ctfe.KStruct:
+		for _, f := range t.Fields {
+			if !rodataStaticKept(f.Type, depth+1) {
+				return false
+			}
+		}
+		return true
+	}
+	return true
+}
+
+// markRodataKept records a kept-init var for read-only placement. The
+// writer substitutes a static value for the kept initializer, so the
+// backend sees static data.
+func (fl *fileLower) markRodataKept(vd *syntax.VarDecl, v ctfe.Value) {
+	if rodataStaticKeptValue(v) {
+		fl.rodataVars = append(fl.rodataVars, rodataVar{vd: vd})
+	}
 }
 
 // rodataStaticType walks a descriptor tree. Depth is bounded because
 // CTFE descriptors are finite trees; a cycle would also fail here.
 func rodataStaticType(t *ctfe.Type, depth int) bool {
-	if t == nil || depth > 64 || t.Opaque {
+	if t == nil || depth > 64 {
 		return false
 	}
 	switch t.Kind {

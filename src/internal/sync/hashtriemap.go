@@ -7,6 +7,7 @@ package sync
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
 	"sync/atomic"
 	"unsafe"
 )
@@ -48,7 +49,7 @@ func (ht *HashTrieMap[K, V]) initSlow() {
 	var m map[K]V
 	mapType := abi.TypeOf(m).MapType()
 	ht.root.Store(newIndirectNode[K, V](nil))
-	ht.keyHash = mapType.Hasher
+	ht.keyHash = pinningHasher(mapType.Key, mapType.Hasher)
 	ht.valEqual = mapType.Elem.Equal
 	ht.seed = uintptr(runtime_rand())
 
@@ -56,6 +57,18 @@ func (ht *HashTrieMap[K, V]) initSlow() {
 }
 
 type hashFunc func(unsafe.Pointer, uintptr) uintptr
+
+// pinningHasher wraps h so that, under the moving collector, hashing a key
+// first pins the objects whose addresses it hashes.
+func pinningHasher(key *abi.Type, h hashFunc) hashFunc {
+	if !goexperiment.LogosGCMoving || !key.Pointers() {
+		return h
+	}
+	return func(p unsafe.Pointer, seed uintptr) uintptr {
+		logosPinMapKey(key, p)
+		return h(p, seed)
+	}
+}
 type equalFunc func(unsafe.Pointer, unsafe.Pointer) bool
 
 // Load returns the value stored in the map for a key, or nil if no

@@ -131,6 +131,7 @@ func MergePropFacts(pkg *types2.Package, info *types2.Info) {
 		merged.Consts = cur.Consts
 		merged.Fns = cur.Fns
 		merged.Comptimes = cur.Comptimes
+		merged.ConstFuncs = cur.ConstFuncs
 		merged.Defaults = cur.Defaults // M6-S3: struct field defaults pass through.
 	}
 	if prop := EmitPropFacts(pkg, info); prop != nil {

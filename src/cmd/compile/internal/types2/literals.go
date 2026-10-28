@@ -164,10 +164,10 @@ func (check *Checker) compositeLit(x *operand, e *syntax.CompositeLit, hint Type
 		if _, ok := e.ElemList[0].(*syntax.KeyValueExpr); ok {
 			// all elements must have keys
 			visited := make(trie[*Var])
-			for _, e := range e.ElemList {
-				kv, _ := e.(*syntax.KeyValueExpr)
+			for _, el := range e.ElemList {
+				kv, _ := el.(*syntax.KeyValueExpr)
 				if kv == nil {
-					check.error(e, MixedStructLit, "mixture of field:value and value elements in struct literal")
+					check.error(el, MixedStructLit, "mixture of field:value and value elements in struct literal")
 					continue
 				}
 				key, _ := kv.Key.(*syntax.Name)
@@ -179,6 +179,9 @@ func (check *Checker) compositeLit(x *operand, e *syntax.CompositeLit, hint Type
 					continue
 				}
 				obj, index, indirect := lookupFieldOrMethod(utyp, false, check.pkg, key.Value, false)
+				if check.logosOwnedLitSkip(e, utyp, key.Value, &obj, &index, &indirect) { // logos M5-S4 hook: exact owned literal fields.
+					continue
+				}
 				if obj == nil {
 					alt, _, _ := lookupFieldOrMethod(utyp, false, check.pkg, key.Value, true)
 					msg := check.lookupError(base, key.Value, alt, true)
@@ -212,12 +215,12 @@ func (check *Checker) compositeLit(x *operand, e *syntax.CompositeLit, hint Type
 			}
 		} else {
 			// no element must have a key
-			for i, e := range e.ElemList {
-				if kv, _ := e.(*syntax.KeyValueExpr); kv != nil {
+			for i, el := range e.ElemList {
+				if kv, _ := el.(*syntax.KeyValueExpr); kv != nil {
 					check.error(kv, MixedStructLit, "mixture of field:value and value elements in struct literal")
 					continue
 				}
-				check.genericExpr(x, e, nil)
+				check.genericExpr(x, el, nil)
 				if i >= len(fields) {
 					check.errorf(x, InvalidStructLit, "too many values in struct literal of type %s", base)
 					break // cannot continue
@@ -225,8 +228,10 @@ func (check *Checker) compositeLit(x *operand, e *syntax.CompositeLit, hint Type
 				// i < len(fields)
 				fld := fields[i]
 				if !fld.Exported() && fld.pkg != check.pkg {
-					check.errorf(x, UnexportedLitField, "implicit assignment to unexported field %s in struct literal of type %s", fld.name, base)
-					continue
+					if !check.logosOwnedPosLitField(e) {
+						check.errorf(x, UnexportedLitField, "implicit assignment to unexported field %s in struct literal of type %s", fld.name, base)
+						continue
+					}
 				}
 				etyp := fld.typ
 				check.assignment(x, etyp, "struct literal")

@@ -1,0 +1,152 @@
+// run
+
+package jsoncallsite
+
+// M11-S4 call-site static JSON fixture (SPEC Sec 12.1, S8, S9, T-Sec12).
+// Anchor: Tony Hoare, Edsger W. Dijkstra
+//
+// Call-site contracts for eligible static JSON structs under default jsonv2:
+// 1. json.Marshal(v) equals v.MarshalJSON() byte for byte.
+// 2. Pointer (&v) and interface (any(v)) forms agree with the value call.
+// 3. Struct with an interface field holding v produces matching JSON.
+// 4. json.NewEncoder(w).Encode(v) adds only the trailing newline.
+// 5. No call site is rewritten (codegen twin test/logos/codegen/json_callsite.lgo
+//    asserts the call still targets encoding/json.Marshal).
+
+import (
+	"bytes"
+	"encoding/json"
+	"testing"
+)
+
+type User struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email,omitempty"`
+}
+
+type Container struct {
+	Payload any `json:"payload"`
+}
+
+// TestCallSiteParityWithMarshalJSON asserts that json.Marshal(v) equals
+// v.MarshalJSON() byte for byte for eligible structs.
+func TestCallSiteParityWithMarshalJSON(t *testing.T) {
+	users := []User{
+		{ID: 101, Name: "Ada Lovelace", Email: "ada@example.com"},
+		{ID: 102, Name: "Alan Turing"},
+		{ID: 0, Name: ""},
+	}
+
+	for _, u := range users {
+		direct, err := u.MarshalJSON()
+		if err != nil {
+			panic(err)
+		}
+
+		viaJSON, err := json.Marshal(u)
+		if err != nil {
+			panic(err)
+		}
+
+		if !bytes.Equal(direct, viaJSON) {
+			t.Fatalf("json.Marshal(%+v) = %s, MarshalJSON() = %s", u, viaJSON, direct)
+			return
+		}
+	}
+}
+
+// TestPointerAndInterfaceFormsAgree asserts that json.Marshal(&v) and
+// json.Marshal(any(v)) produce identical bytes to json.Marshal(v).
+func TestPointerAndInterfaceFormsAgree(t *testing.T) {
+	u := User{ID: 202, Name: "Grace Hopper", Email: "grace@navy.mil"}
+
+	valBytes, err := json.Marshal(u)
+	if err != nil {
+		panic(err)
+	}
+
+	ptrBytes, err := json.Marshal(&u)
+	if err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(ptrBytes, valBytes) {
+		t.Fatalf("json.Marshal(&v) %s != json.Marshal(v) %s", ptrBytes, valBytes)
+		return
+	}
+
+	ifaceBytes, err := json.Marshal(any(u))
+	if err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(ifaceBytes, valBytes) {
+		t.Fatalf("json.Marshal(any(v)) %s != json.Marshal(v) %s", ifaceBytes, valBytes)
+		return
+	}
+
+	ptrIfaceBytes, err := json.Marshal(any(&u))
+	if err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(ptrIfaceBytes, valBytes) {
+		t.Fatalf("json.Marshal(any(&v)) %s != json.Marshal(v) %s", ptrIfaceBytes, valBytes)
+		return
+	}
+
+	// Interface field holding the struct value vs pointer.
+	cVal := Container{Payload: u}
+	cPtr := Container{Payload: &u}
+	bVal, err := json.Marshal(cVal)
+	if err != nil {
+		panic(err)
+	}
+	bPtr, err := json.Marshal(cPtr)
+	if err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(bVal, bPtr) {
+		t.Fatalf("Container with interface field: val %s != ptr %s", bVal, bPtr)
+		return
+	}
+}
+
+// TestEncoderAddsOnlyTrailingNewline asserts that json.NewEncoder adds exactly
+// a single trailing newline ('\n') to the marshaled representation.
+func TestEncoderAddsOnlyTrailingNewline(t *testing.T) {
+	u := User{ID: 303, Name: "Edsger Dijkstra", Email: "ewd@utexas.edu"}
+
+	marshaled, err := json.Marshal(u)
+	if err != nil {
+		panic(err)
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	if err := enc.Encode(u); err != nil {
+		panic(err)
+	}
+
+	encoded := buf.Bytes()
+	if len(encoded) != len(marshaled)+1 {
+		t.Fatalf("Encoder len %d != Marshal len %d + 1", len(encoded), len(marshaled))
+		return
+	}
+	if encoded[len(encoded)-1] != '\n' {
+		t.Fatalf("Encoder missing trailing newline: %q", encoded)
+		return
+	}
+	if !bytes.Equal(encoded[:len(encoded)-1], marshaled) {
+		t.Fatalf("Encoder payload %s != Marshal payload %s", encoded[:len(encoded)-1], marshaled)
+		return
+	}
+
+	// Pointer encoding through Encoder agrees.
+	buf.Reset()
+	if err := enc.Encode(&u); err != nil {
+		panic(err)
+	}
+	if !bytes.Equal(buf.Bytes(), encoded) {
+		t.Fatalf("Encoder(&v) %s != Encoder(v) %s", buf.Bytes(), encoded)
+		return
+	}
+}

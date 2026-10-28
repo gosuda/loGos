@@ -165,10 +165,10 @@ func (check *Checker) compositeLit(x *operand, e *ast.CompositeLit, hint Type) {
 		if _, ok := e.Elts[0].(*ast.KeyValueExpr); ok {
 			// all elements must have keys
 			visited := make(trie[*Var])
-			for _, e := range e.Elts {
-				kv, _ := e.(*ast.KeyValueExpr)
+			for _, el := range e.Elts {
+				kv, _ := el.(*ast.KeyValueExpr)
 				if kv == nil {
-					check.error(e, MixedStructLit, "mixture of field:value and value elements in struct literal")
+					check.error(el, MixedStructLit, "mixture of field:value and value elements in struct literal")
 					continue
 				}
 				key, _ := kv.Key.(*ast.Ident)
@@ -213,12 +213,12 @@ func (check *Checker) compositeLit(x *operand, e *ast.CompositeLit, hint Type) {
 			}
 		} else {
 			// no element must have a key
-			for i, e := range e.Elts {
-				if kv, _ := e.(*ast.KeyValueExpr); kv != nil {
+			for i, el := range e.Elts {
+				if kv, _ := el.(*ast.KeyValueExpr); kv != nil {
 					check.error(kv, MixedStructLit, "mixture of field:value and value elements in struct literal")
 					continue
 				}
-				check.genericExpr(x, e, nil)
+				check.genericExpr(x, el, nil)
 				if i >= len(fields) {
 					check.errorf(x, InvalidStructLit, "too many values in struct literal of type %s", base)
 					break // cannot continue

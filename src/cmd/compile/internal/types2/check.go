@@ -117,13 +117,16 @@ type Checker struct {
 	ctxt *Context // context for de-duplicating instances
 	pkg  *Package
 	*Info
-	nextID           uint64                      // unique Id for type parameters (first valid Id is 1)
-	objMap           map[Object]*declInfo        // maps package-level objects and (non-interface) methods to declaration info
-	objList          []Object                    // source-ordered keys of objMap
-	logosBodies      map[string]*syntax.FuncDecl // logos M5-S2: plain function bodies by name for transitive const evaluation
-	logosConstSyntax map[*syntax.FuncDecl]bool   // logos M5-S2: inner FuncDecls declared through `const func`
-	logosMemoized    map[syntax.Expr]ctfeMemo    // logos M5-S2: one const evaluation per initializer
-	impMap           map[importKey]*Package      // maps (import path, source directory) to (complete or fake) package
+	nextID            uint64                                // unique Id for type parameters (first valid Id is 1)
+	objMap            map[Object]*declInfo                  // maps package-level objects and (non-interface) methods to declaration info
+	objList           []Object                              // source-ordered keys of objMap
+	logosBodies       map[string]*syntax.FuncDecl           // logos M5-S2: plain function bodies by name for transitive const evaluation
+	logosConstSyntax  map[*syntax.FuncDecl]bool             // logos M5-S2: inner FuncDecls declared through `const func`
+	logosMemoized     map[syntax.Expr]ctfeMemo              // logos M5-S2: one const evaluation per initializer
+	logosConstFnUnits map[string]*logosConstFnUnit          // logos constfn: parsed imported constfn records by path+"\x00"+object
+	logosConstFnBases map[*syntax.PosBase]*logosConstFnUnit // logos constfn: defining-context lookup by record file base
+	logosConstFnBusy  map[string]bool                       // logos constfn: in-progress admission by path+"\x00"+object
+	impMap            map[importKey]*Package                // maps (import path, source directory) to (complete or fake) package
 	// see TODO in validtype.go
 	// valids  instanceLookup      // valid *Named (incl. instantiated) types per the validType check
 
@@ -454,6 +457,7 @@ func (check *Checker) checkFiles(files []*syntax.File) {
 
 	if check.conf.Logos {
 		check.Info.LogosImporter = check.conf.Importer // logos M7-S3 hook: comptime copies open the packages their text names.
+		check.Info.LogosContext = check.context()      // logos M7-S3 hook: comptime copies share the canonical instance context.
 	}
 
 	print("== initFiles ==")

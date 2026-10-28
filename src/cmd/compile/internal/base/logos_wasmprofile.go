@@ -57,14 +57,14 @@ func logosWasmApply() {
 	Ctxt.KeepProgs = LogosWasmProfile
 }
 
-// logosWasmCheckFeatures rejects an unknown feature name and, for a known
-// one, reports that the backend for it does not exist: the compiler never
-// falls back to resume points when the build asked for stack switching.
+// logosWasmCheckFeatures rejects an unknown feature name and switches on
+// the backend of each known one: stack-switching runs every goroutine on
+// a WebAssembly continuation (obj/wasm/stackswitch_logos.go).
 func logosWasmCheckFeatures() {
 	for f := range strings.SplitSeq(LogosWasmFeatures, ",") {
 		if !slices.Contains(logosWasmFeatureNames, f) {
 			log.Fatalf("unsupported -logos.wasmfeatures entry %q (want stack-switching)", f)
 		}
+		Ctxt.WasmStackSwitch = true
 	}
-	log.Fatalf("-logos.wasmfeatures=%s: the wasm stack-switching backend (cont.new, resume) is not implemented", LogosWasmFeatures)
 }

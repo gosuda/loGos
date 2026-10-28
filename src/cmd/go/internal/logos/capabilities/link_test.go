@@ -60,7 +60,9 @@ func TestSnapshotHashFlagRoundTrip(t *testing.T) {
 	mains := []string{"example.com/m"}
 	SnapshotLinkPolicy(testConfigFile(), mains, nil)
 	var h bytes.Buffer
-	HashLinkPolicy(&h)
+	if err := HashLinkPolicy(&h); err != nil {
+		t.Fatal(err)
+	}
 	if !strings.HasPrefix(h.String(), "logoslinkcap ") {
 		t.Fatalf("HashLinkPolicy wrote %q, want logoslinkcap prefix", h.String())
 	}
@@ -90,7 +92,9 @@ func TestSnapshotErrorAppendsNothing(t *testing.T) {
 	setLogosMode(t)
 	SnapshotLinkPolicy(nil, nil, errors.New("broken"))
 	var h bytes.Buffer
-	HashLinkPolicy(&h)
+	if err := HashLinkPolicy(&h); err != nil {
+		t.Fatal(err)
+	}
 	if h.Len() != 0 {
 		t.Errorf("HashLinkPolicy wrote %q after error snapshot", h.String())
 	}

@@ -179,6 +179,15 @@ func lowerLogosHook(pkg *types2.Package, info *types2.Info, files []*syntax.File
 	return true
 }
 
+// logosConfigureOwnedConstants grants generated nodes access only during
+// the final lowered-tree check. The first user check and ordinary Go
+// compilation never receive these registrations.
+func logosConfigureOwnedConstants(conf *types2.Config, lowered bool) {
+	if lowered {
+		conf.LogosOwnedTypes = logos.OwnedTypeNodes()
+	}
+}
+
 // writeLogosEject writes ejected Go sources when -logos.eject is set.
 func writeLogosEject(files []*syntax.File) {
 	dir := base.LogosEject

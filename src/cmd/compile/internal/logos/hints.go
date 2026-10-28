@@ -26,9 +26,10 @@ const HintsVersion = "1.0"
 
 // Allocation tiers of AllocHint.
 const (
+	TierRodata = "rodata"
+	TierArena  = "arena"
 	TierStack  = "stack"
 	TierHeap   = "heap"
-	TierRodata = "rodata"
 )
 
 // Site kinds of SiteHint.
@@ -121,9 +122,33 @@ type Alloc struct {
 	Reason  string
 }
 
-// tierRank orders the tiers by cost; the worst tier of one source position
-// wins.
-var tierRank = map[string]int{TierRodata: 0, TierStack: 1, TierHeap: 2}
+// tierRank orders the tiers by allocation tier: rodata is 0, arena is 1,
+// stack is 2, heap is 3. TierArena sits between rodata and stack in the
+// hierarchy; tierWorse enforces that arena beats stack when both are possible
+// and heap beats both.
+var tierRank = map[string]int{TierRodata: 0, TierArena: 1, TierStack: 2, TierHeap: 3}
+
+// tierWorse reports whether tier a supersedes tier b when two allocation
+// decisions land at the same source position. Heap beats both arena and stack;
+// arena beats stack when both are possible; all three beat rodata.
+func tierWorse(a, b string) bool {
+	if a == b {
+		return false
+	}
+	if a == TierHeap {
+		return true
+	}
+	if b == TierHeap {
+		return false
+	}
+	if a == TierArena && b == TierStack {
+		return true
+	}
+	if a == TierStack && b == TierArena {
+		return false
+	}
+	return tierRank[a] > tierRank[b]
+}
 
 // Hints builds the report of one package.
 type Hints struct {
@@ -178,7 +203,7 @@ func (h *Hints) AddAlloc(a Alloc) {
 // addAlloc records a, keeping the worse tier of a duplicate.
 func (f *hintFile) addAlloc(a AllocHint) {
 	if i, dup := f.allocs[a.Position]; dup {
-		if tierRank[a.Tier] > tierRank[f.hints.Allocs[i].Tier] {
+		if tierWorse(a.Tier, f.hints.Allocs[i].Tier) {
 			f.hints.Allocs[i] = a
 		}
 		return

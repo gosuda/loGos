@@ -124,6 +124,9 @@ func (c *sideStackChunk) popScan(to uintptr) {
 		throw("logosArena: scan watermark restored out of range")
 	}
 	c.scanCur = to
+	if raceenabled && to > old {
+		racefree(unsafe.Pointer(old), to-old)
+	}
 	memclrNoHeapPointers(unsafe.Pointer(old), to-old)
 }
 
@@ -173,6 +176,9 @@ func logosArenaAlloc(typ *_type, size uintptr) unsafe.Pointer {
 		return mallocgc(size, typ, true)
 	}
 	memclrNoHeapPointers(p, size)
+	if raceenabled {
+		racemalloc(p, size)
+	}
 	return p
 }
 
@@ -230,6 +236,9 @@ func logosArenaAllocScan(typ *_type, size uintptr) unsafe.Pointer {
 	if p == nil {
 		return mallocgc(size, typ, true)
 	}
+	if raceenabled {
+		racemalloc(p, size)
+	}
 	return p
 }
 
@@ -268,7 +277,53 @@ func logosArenaRestore(m logosArenaMark) {
 		throw("logosArenaRestore: mark does not match the arena chain")
 	}
 	c.popScan(m.scan)
+	if raceenabled && m.noscan < c.noscanCur {
+		racefree(unsafe.Pointer(m.noscan), c.noscanCur-m.noscan)
+	}
 	c.noscanCur = m.noscan
+}
+
+// logosArenaMarkSave returns the calling goroutine's arena watermark as the
+// same three words the compiler's inline bump spills at frame entry: the
+// newest chunk, the noscan watermark, and the scan watermark. The zero
+// triple stands for an empty arena, exactly like the zero logosArenaMark.
+func logosArenaMarkSave() (chunk, noscan, scan uintptr) {
+	m := logosArenaSave()
+	return uintptr(unsafe.Pointer(m.chunk)), m.noscan, m.scan
+}
+
+// logosArenaMarkRestore pops the calling goroutine's arena back to the
+// watermark the three words describe (AR2). It is logosArenaRestore for the
+// values logosArenaMarkSave returned. The chunk word came from a
+// *sideStackChunk, but the memory is a manual span the checkptr tables do
+// not know, so the round trip back to a pointer skips instrumentation.
+//
+//go:nocheckptr
+func logosArenaMarkRestore(chunk, noscan, scan uintptr) {
+	logosArenaRestore(logosArenaMark{chunk: (*sideStackChunk)(unsafe.Pointer(chunk)), noscan: noscan, scan: scan})
+}
+
+// logosArenaRetSet records that the call the compiler emits right after it
+// consents to the callee allocating returned objects in the caller's arena
+// region (SPEC Sec 8.3). The compiler emits it only after every argument has
+// been evaluated and only before a static call to a function that takes the
+// token first thing, so no other code can run between the set and the take.
+// A function that sets the token passes it down only through a callee that
+// takes it, which is why the token never outlives that one call.
+func logosArenaRetSet(ok bool) {
+	getg().logosArenaRetOK = ok
+}
+
+// logosArenaRetTake returns the consent token and clears it. A function that
+// receives true may allocate objects that flow only to its results in the
+// arena without restoring the watermark at exit: the caller keeps them until
+// its own exit. False means the caller did not consent, so such objects must
+// come from the heap.
+func logosArenaRetTake() bool {
+	gp := getg()
+	ok := gp.logosArenaRetOK
+	gp.logosArenaRetOK = false
+	return ok
 }
 
 // logosArenaPush leases a chunk and links it as the newest chunk of gp. It
@@ -369,7 +424,11 @@ func logosArenaParkChain(gp *g) {
 // logosArenaExit is the gdestroy hook: an exiting goroutine returns its
 // chunks even when an unwind skipped the frame restores.
 func logosArenaExit(gp *g) {
-	if goexperiment.LogosArena && gp.logosArena != nil {
+	if !goexperiment.LogosArena {
+		return
+	}
+	gp.logosArenaRetOK = false
+	if gp.logosArena != nil {
 		logosArenaDrop(gp)
 	}
 }

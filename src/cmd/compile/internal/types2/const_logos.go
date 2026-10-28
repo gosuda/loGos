@@ -27,7 +27,7 @@ import (
 // (index, slice, dereference, and binary reads), range.go (const
 // elements), stmt.go (numeric unwrapping for ++), assignments.go
 // (stores and conversions back), and builtins.go (append, copy,
-// delete, clear, len, cap). The parser only produces
+// delete, clear, close, panic, len, cap). The parser only produces
 // *syntax.ConstType in LogosMode, so the checker hooks are unreachable
 // in plain Go. Imported callees fail closed: without a visible
 // ParamMutated=0 fact the checker refuses a reference-carrying view,
@@ -148,6 +148,19 @@ func (check *Checker) logosConstAssign(x *operand, T Type, context string) bool 
 	check.errorf(x, IncompatibleAssign, "%s cannot %s through const view %s in %s", logosConstEscape, op, ExprString(x.expr), context)
 	x.invalidate()
 	return true
+}
+
+// logosConstInferVar unwraps a const-map or reference-free view only
+// when a short variable declaration chose its type from that view.
+func (check *Checker) logosConstInferVar(lhs *Var) {
+	if !check.conf.Logos {
+		return
+	}
+	if csrc := logosAsConstView(lhs.typ); csrc != nil {
+		if logosReferenceFree(csrc.Elem) || csrc.ConstMap {
+			lhs.typ = csrc.Elem
+		}
+	}
 }
 
 // logosConstWrap checks a plain value wrapping into a const view: the
@@ -371,8 +384,10 @@ func (check *Checker) logosConstConvert(x *operand, T Type) bool {
 }
 
 // logosConstBuiltin checks built-in calls with const view arguments
-// (SPEC T-201): append to, copy into, delete from, and clear of a view
-// are refused; every other built-in reads, so const operands unwrap.
+// (SPEC T-201): append to, copy into, delete from, clear of, and close of
+// a view are refused with const_view_mutation; panic passes to any so
+// reference-carrying views escape with const_view_escape (checked via
+// assignment); read-only built-ins (len, cap, etc.) unwrap their operands.
 func (check *Checker) logosConstBuiltin(x *operand, call *syntax.CallExpr, id builtinId, args []*operand) bool {
 	if !check.conf.Logos {
 		return false
@@ -417,6 +432,17 @@ func (check *Checker) logosConstBuiltin(x *operand, call *syntax.CallExpr, id bu
 			check.errorf(args[0], IncompatibleAssign, "%s cannot clear through const view %s", logosConstMutation, ExprString(args[0].expr))
 			return true
 		}
+	case _Close:
+		if len(args) > 0 && constView(args[0]) {
+			check.errorf(args[0], IncompatibleAssign, "%s cannot close through const view %s", logosConstMutation, ExprString(args[0].expr))
+			return true
+		}
+	case _Panic:
+		// panic passes its argument to any (recoverable).
+		// Reference-carrying views must not unwrap: check.assignment
+		// will report const_view_escape via logosConstAssign, while
+		// reference-free views (scalars) are safely unwrapped there.
+		return false
 	default:
 		for _, a := range args {
 			unwrap(a)

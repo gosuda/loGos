@@ -1,5 +1,7 @@
 package p
 
+import "comptime"
+
 type User struct{ Name string }
 
 func (u *User) Greet() string { return "hi " + u.Name }
@@ -75,4 +77,17 @@ func kind[T any](v T) string {
 		return "int"
 	}
 	return "other"
+}
+
+func names() []string {
+	var out []string
+	const for _, f := range comptime.Fields[User]() {
+		out = append(out, f.Name)
+	}
+	return out
+}
+
+func arenaBuffer(n int) int {
+	buf := make([]byte, n)
+	return len(buf)
 }

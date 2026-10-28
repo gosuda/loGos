@@ -76,6 +76,9 @@ func selectLogosGC(ld *modload.Loader) (mode string, selected bool) {
 // action ID, and reaches the compiler through load's gcflags hook, which
 // reads cfg.LogosGC.
 func initLogosGC(ld *modload.Loader) {
+	if slices.Contains(cfg.BuildContext.BuildTags, load.LogosPacerInactiveTag) {
+		base.Fatalf("%s build: internal build tag %q must not be set with -tags", logosGCProgram(), load.LogosPacerInactiveTag)
+	}
 	mode, selected := selectLogosGC(ld)
 	if !selected {
 		return
@@ -88,4 +91,7 @@ func initLogosGC(ld *modload.Loader) {
 	}
 	cfg.LogosGC = mode
 	forcedLdflags = append(forcedLdflags, "-X=runtime.logosGCMode="+mode)
+	if load.LogosPacerOmitElastic(mode) && !slices.Contains(cfg.BuildContext.ToolTags, load.LogosPacerInactiveTag) {
+		cfg.BuildContext.ToolTags = append(cfg.BuildContext.ToolTags, load.LogosPacerInactiveTag)
+	}
 }

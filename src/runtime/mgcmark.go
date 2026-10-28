@@ -72,6 +72,10 @@ func (gp *g) internalBlocked() bool {
 func allGsSnapshotSortedForGC() ([]*g, int) {
 	assertWorldStoppedOrLockHeld(&allglock)
 
+	if gs, n, ok := logosCheckmarkStackRoots(); ok {
+		return gs, n
+	}
+
 	// Reset the status of leaked goroutines in order to improve
 	// the precision of goroutine leak detection.
 	for _, gp := range allgs {
@@ -1508,6 +1512,10 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 			if bits&1 != 0 {
 				// Same work as in scanObject; see comments there.
 				p := *(*uintptr)(unsafe.Pointer(b + i))
+				if zgcCycleEnabled() {
+					zgcHealScanSlot((*uintptr)(unsafe.Pointer(b + i)))
+					p = *(*uintptr)(unsafe.Pointer(b + i))
+				}
 				if p != 0 {
 					if stk != nil && p >= stk.stack.lo && p < stk.stack.hi {
 						stk.putPtr(p, false)
@@ -1651,6 +1659,12 @@ func shade(b uintptr) {
 //
 //go:nowritebarrierrec
 func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintptr) {
+	if zgcCycleEnabled() {
+		var ok bool
+		if obj, span, objIndex, ok = zgcResolveScanTarget(obj, span, objIndex); !ok {
+			return
+		}
+	}
 	// obj should be start of allocation, and so must be at least pointer-aligned.
 	if obj&(goarch.PtrSize-1) != 0 {
 		throw("greyobject: obj not pointer-aligned")

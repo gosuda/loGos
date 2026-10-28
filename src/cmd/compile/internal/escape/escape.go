@@ -96,7 +96,10 @@ type batch struct {
 	heapLoc    location
 	mutatorLoc location
 	calleeLoc  location
+	foreignLoc location
 	blankLoc   location
+
+	logosArena logosArenaBatch // logos M18: shadow locations for caller-region returns.
 }
 
 // A closure holds a closure expression and its spill hole (i.e.,
@@ -119,7 +122,8 @@ type escape struct {
 	// curfn. It increments within each "for" loop and at each
 	// label with a corresponding backwards "goto" (i.e.,
 	// unstructured loop).
-	loopDepth int
+	loopDepth         int
+	compilerKeepAlive bool
 }
 
 func Funcs(all []*ir.Func) {
@@ -178,7 +182,9 @@ func Batch(fns []*ir.Func, reassignOracles map[*ir.Func]*ir.ReassignOracle) {
 
 	b.walkAll()
 	b.finish(fns)
-	b.logosCollect() // logos M9: escaping subslices of large backing stores.
+	b.logosCollect()      // logos M9: escaping subslices of large backing stores.
+	b.logosArenaMark(fns) // logos M18-S2: arena vetoes and caller-region verdicts.
+	b.logosCollectHints() // logos M18-S2: hints mode escape and arena decisions.
 }
 
 func (b *batch) with(fn *ir.Func) *escape {

@@ -35,6 +35,8 @@ func RefreshLogosArena(mainRoots []string) {
 	if !Logos {
 		return
 	}
+	defer RefreshLogosFastCgo()
+	defer RefreshLogosPreemptible()
 	roots := mainRoots
 	if len(roots) == 0 {
 		if root := cwdModuleRoot(); root != "" {
@@ -71,10 +73,7 @@ func logosAnyRootArena(roots []string) bool {
 // withLogosArena appends the arena experiment to a GOEXPERIMENT value. The
 // later entry wins over an earlier nologosarena.
 func withLogosArena(raw string) string {
-	if raw == "" {
-		return logosArenaExperiment
-	}
-	return raw + "," + logosArenaExperiment
+	return appendExperiment(raw, logosArenaExperiment)
 }
 
 // recomputeExperiment drops the experiment tool tags computed for the

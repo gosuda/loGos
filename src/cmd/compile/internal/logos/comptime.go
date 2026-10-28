@@ -464,9 +464,16 @@ func (fl *fileLower) cfDemoteErasedImports() {
 		if !ok || imp.Path == nil {
 			continue
 		}
-		if local, ok := fl.cfImportLocalName(imp); ok && !used[local] {
-			fl.cfBlankImport(imp)
+		local, ok := fl.cfImportLocalName(imp)
+		if !ok || used[local] {
+			continue
 		}
+		path, _ := strconv.Unquote(imp.Path.Value)
+		if _, ejectUsed := ownedEjectImports[fl.file][path]; !ejectUsed {
+			fl.cfBlankImportText(imp)
+		}
+		imp.LocalPkgName = nameOf(imp.Path.Pos(), "_")
+		fl.changed = true
 	}
 }
 
@@ -503,14 +510,16 @@ func (fl *fileLower) cfImportLocalName(imp *syntax.ImportDecl) (string, bool) {
 		obj = fl.pkg.info.Implicits[imp]
 	}
 	pn, ok := obj.(*types2.PkgName)
-	if !ok || pn.Name() == "_" || pn.Name() == "." || pn.Imported().Path() == "comptime" {
-		return "", false
+	if ok && pn.Name() != "_" && pn.Name() != "." && pn.Imported().Path() != "comptime" {
+		return pn.Name(), true
 	}
-	return pn.Name(), true
+	if imp.LocalPkgName != nil && imp.LocalPkgName.Value != "" && imp.LocalPkgName.Value != "_" && imp.LocalPkgName.Value != "." {
+		return imp.LocalPkgName.Value, true
+	}
+	return "", false
 }
 
-// cfBlankImport rewrites one import to bind the blank identifier.
-func (fl *fileLower) cfBlankImport(imp *syntax.ImportDecl) {
+func (fl *fileLower) cfBlankImportText(imp *syntax.ImportDecl) {
 	if imp.LocalPkgName != nil {
 		start := fl.off(imp.LocalPkgName.Pos())
 		fl.add(start, start+len(imp.LocalPkgName.Value), "_")
@@ -518,8 +527,6 @@ func (fl *fileLower) cfBlankImport(imp *syntax.ImportDecl) {
 		start := fl.off(imp.Path.Pos())
 		fl.add(start, start, "_ ")
 	}
-	imp.LocalPkgName = nameOf(imp.Path.Pos(), "_")
-	fl.changed = true
 }
 
 // cfRejectGenericMethods reports methods of generic types that use
@@ -855,6 +862,11 @@ func (fl *fileLower) cfLazySpelling(compute func() (string, bool), fail func()) 
 // check looks members up through it. It reports the diagnostic at pos and
 // false when the package cannot load.
 func (fl *fileLower) cfImportQualifier(path string, pos syntax.Pos) (string, bool) {
+	if reg := fl.getGenImports(); reg != nil {
+		if q, ok := reg.qual[path]; ok && q != "" {
+			return q, true
+		}
+	}
 	var own []string
 	for pkg, spelling := range fl.importNames() {
 		if pkg.Path() == path && spelling != "" {
@@ -1007,7 +1019,14 @@ func (fl *fileLower) cfEmitCopy(text string, site *cfSite) {
 // the copy answers for, and returns whether the copy is valid.
 func (fl *fileLower) cfCheckCopyFunc(fn *syntax.FuncDecl, pos syntax.Pos) bool {
 	exp := fl.pkg.ctExp
-	ctx := types2.LogosCopyContext{Scope: fl.pkg.info.Scopes[fl.file], Funcs: exp.copyFuncs, Aliases: fl.cfAliases()}
+	ctx := types2.LogosCopyContext{
+		Scope:    fl.pkg.info.Scopes[fl.file],
+		Funcs:    exp.copyFuncs,
+		Aliases:  fl.cfAliases(),
+		MaxSteps: fl.pkg.info.LogosCTFEMaxSteps,
+		Importer: fl.pkg.info.LogosImporter,
+		Context:  fl.pkg.info.LogosContext,
+	}
 	obj, errs := types2.LogosCheckCopyFunc(fl.pkg.tpkg, fl.pkg.info, ctx, fn)
 	if obj != nil {
 		exp.copyFuncs = append(exp.copyFuncs, obj)

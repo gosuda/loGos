@@ -31,6 +31,12 @@ func (h *ctfeHost) WordSize() int64 {
 // Resolve maps an identifier to its entity.
 func (h *ctfeHost) Resolve(id *syntax.Name) ctfe.Entity {
 	check := h.check
+	if u := check.logosUnitForNode(id); u != nil {
+		if ent, ok := h.resolveUnitName(u, id); ok {
+			return ent
+		}
+		return ctfe.Entity{Kind: ctfe.EntNone, Name: id.Value}
+	}
 	if obj := check.Info.Uses[id]; obj != nil {
 		if ent, ok := h.entityOf(obj, id.Value); ok {
 			return ent
@@ -63,6 +69,12 @@ func (h *ctfeHost) entityOf(obj Object, name string) (ctfe.Entity, bool) {
 				return ctfe.Entity{}, false
 			}
 			return ctfe.Entity{Kind: ctfe.EntConst, Const: v}, true
+		}
+		if obj.parent == check.pkg.scope {
+			if obj.typ == nil || obj.val == nil {
+				check.objDecl(obj)
+			}
+			check.addDeclDep(obj)
 		}
 		if obj.typ == Typ[Invalid] || obj.val == nil {
 			return ctfe.Entity{}, false
@@ -122,6 +134,9 @@ func (h *ctfeHost) entityOf(obj Object, name string) (ctfe.Entity, bool) {
 
 // ResolveSel maps a selector to its entity.
 func (h *ctfeHost) ResolveSel(sel *syntax.SelectorExpr) ctfe.Entity {
+	if u := h.check.logosUnitForNode(sel); u != nil {
+		return h.resolveUnitSel(u, sel)
+	}
 	x, ok := syntax.Unparen(sel.X).(*syntax.Name)
 	if !ok {
 		return ctfe.Entity{}
@@ -151,6 +166,17 @@ func (h *ctfeHost) ResolveSel(sel *syntax.SelectorExpr) ctfe.Entity {
 	case *Var:
 		return ctfe.Entity{Kind: ctfe.EntPackageVar, Name: pkgName.name + "." + obj.name}
 	case *Func:
+		// Admitted const targets execute from the validated record
+		// body; every other shape keeps EntImport so evaluation
+		// reports the established detail. Admission failures cannot
+		// reach here unreported: initializers prescan (and abort) in
+		// logosConstCompute, bodies report in the purity check.
+		if u, fn, body, err := h.check.logosResolveImportedConstFunc(imp.path, obj.name); err == nil && u != nil {
+			if callee := h.buildFunc(fn, body); callee != nil {
+				callee.Const = true
+				return ctfe.Entity{Kind: ctfe.EntConstFunc, Fn: callee}
+			}
+		}
 		return ctfe.Entity{Kind: ctfe.EntImport, Name: imp.path + "." + obj.name}
 	case *TypeName:
 		return ctfe.Entity{Kind: ctfe.EntType}
@@ -199,11 +225,31 @@ func (h *ctfeHost) constToValue(c constant.Value, t *ctfe.Type) (ctfe.Value, boo
 		}
 		return ctfe.IntValue(n, typ), true
 	case constant.Float:
-		f, _ := constant.Float64Val(c)
+		if t != nil && t.Kind == ctfe.KFloat32 {
+			f32, _ := constant.Float32Val(c)
+			return ctfe.FloatValue(float64(f32), t), true
+		}
+		if t != nil && t.Kind == ctfe.KFloat64 {
+			f, _ := constant.Float64Val(c)
+			return ctfe.FloatValue(f, t), true
+		}
 		typ := ctfe.UntypedFloat()
-		if t != nil && (t.Kind == ctfe.KFloat32 || t.Kind == ctfe.KFloat64) {
+		if t != nil && t.Kind == ctfe.KUntypedFloat {
 			typ = t
 		}
+		switch v := constant.Val(c).(type) {
+		case *big.Rat:
+			return ctfe.ExactFloatValue(v, typ), true
+		case *big.Float:
+			r, _ := v.Rat(nil)
+			if r != nil {
+				return ctfe.ExactFloatValue(r, typ), true
+			}
+		}
+		if r, ok := new(big.Rat).SetString(c.ExactString()); ok {
+			return ctfe.ExactFloatValue(r, typ), true
+		}
+		f, _ := constant.Float64Val(c)
 		return ctfe.FloatValue(f, typ), true
 	}
 	return ctfe.Value{}, false
@@ -214,6 +260,9 @@ func (h *ctfeHost) constToValue(c constant.Value, t *ctfe.Type) (ctfe.Value, boo
 // structurally through package scope, universe, and imports.
 func (h *ctfeHost) TypeOf(e syntax.Expr) *ctfe.Type {
 	check := h.check
+	if u := check.logosUnitForNode(e); u != nil {
+		return h.resolveUnitTypeExpr(u, e)
+	}
 	if tv, ok := check.Info.Types[e]; ok && tv.Type != nil {
 		if t := h.fromType(tv.Type); t != nil {
 			return t
@@ -437,6 +486,9 @@ func (h *ctfeHost) fromType(t Type) *ctfe.Type {
 		}
 		under.Named = obj.Name()
 		under.Opaque = obj.Pkg() != h.check.pkg
+		if obj.Pkg() != nil {
+			under.PkgPath = obj.Pkg().Path()
+		}
 		return under
 	case *Pointer:
 		return &ctfe.Type{Impure: "pointer type in const func"}
@@ -462,21 +514,19 @@ func (h *ctfeHost) buildFunc(obj *Func, body *syntax.FuncDecl) *ctfe.Func {
 	}
 	n := 0
 	for _, f := range body.Type.ParamList {
-		names := []*syntax.Name{f.Name}
-		if f.Name == nil {
-			names = nil
+		name := f.Name
+		if name == nil {
+			// Anonymous parameter: retain a discard entry with the
+			// checked type so arity and positional binding match the
+			// signature. The empty name is unreferenceable.
+			name = syntax.NewName(syntax.StartPos(f.Type), "")
 		}
-		for _, name := range names {
-			var pt *ctfe.Type
-			if params := sig.Params(); n < params.Len() {
-				pt = h.fromType(params.At(n).Type())
-			}
-			fn.Params = append(fn.Params, ctfe.Param{Decl: name, Type: pt})
-			n++
+		var pt *ctfe.Type
+		if params := sig.Params(); n < params.Len() {
+			pt = h.fromType(params.At(n).Type())
 		}
-		if len(names) == 0 {
-			n++
-		}
+		fn.Params = append(fn.Params, ctfe.Param{Decl: name, Type: pt})
+		n++
 	}
 	if sig.Variadic() && len(fn.Params) > 0 {
 		fn.Variadic = true

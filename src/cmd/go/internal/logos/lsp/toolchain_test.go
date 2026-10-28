@@ -49,7 +49,11 @@ func realWorkspace(t *testing.T) (root string, tc *toolchain) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { tc.Close() })
+	t.Cleanup(func() {
+		if err := tc.Close(); err != nil {
+			t.Errorf("cleaning up toolchain: %v", err)
+		}
+	})
 	return root, tc
 }
 
@@ -89,17 +93,17 @@ func TestToolchainLowersImportedLogosPackage(t *testing.T) {
 	}
 
 	orig := shift(findPos(t, aLgo, "ReadFile(path)?", 0), len("ReadFile("))
-	lowPos := pm.toLowered(orig, leading)
+	lowPos := pm.toLowered(orig)
 	if got := lineOf(out, lowPos.Line)[lowPos.Character:]; !strings.HasPrefix(got, "path)") {
 		t.Errorf("operand %v maps to lowered %v, which starts %q", orig, lowPos, got)
 	}
-	if back := pm.toOriginal(lowPos, leading); back != orig {
+	if back := pm.toOriginal(lowPos); back != orig {
 		t.Errorf("operand round trip %v -> %v -> %v", orig, lowPos, back)
 	}
 	q := findPos(t, aLgo, "?", 0)
 	end := findPos(t, aLgo, "return string(data)", 0)
-	lowEnd := pm.toLowered(end, leading)
-	if lines := lowEnd.Line - pm.toLowered(q, leading).Line; lines < 2 {
+	lowEnd := pm.toLowered(end)
+	if lines := lowEnd.Line - pm.toLowered(q).Line; lines < 2 {
 		t.Errorf("the ? statement expands to %d more lines in the lowered text, want at least 2", lines)
 	}
 
@@ -217,16 +221,65 @@ func TestToolchainDiagnosesGoPackages(t *testing.T) {
 	}
 }
 
-// TestToolchainHints runs the hints runner over a loGo/s package: the
-// compiler writes its hints report and the runner returns it as JSON.
+// TestToolchainHints runs the hints runner over a loGo/s package importing os
+// across default and explicit GOEXPERIMENT settings (logosfastcgo, nologosfastcgo,
+// none), verifying that the compiler and list exports align and emit valid hints.
 func TestToolchainHints(t *testing.T) {
 	root, tc := realWorkspace(t)
-	hints, err := tc.Hints(t.Context(), filepath.Join(root, "lmod", "a"), nil)
-	if err != nil {
-		t.Fatal(err)
+	pkgDir := filepath.Join(root, "lmod", "a")
+
+	cases := []struct {
+		name       string
+		experiment string
+		set        bool
+	}{
+		{name: "default", set: false},
+		{name: "logosfastcgo", experiment: "logosfastcgo", set: true},
+		{name: "nologosfastcgo", experiment: "nologosfastcgo", set: true},
+		{name: "none", experiment: "none", set: true},
 	}
-	if !json.Valid(hints) {
-		t.Errorf("hints are not JSON: %s", hints)
+	for _, tcCase := range cases {
+		t.Run(tcCase.name, func(t *testing.T) {
+			if tcCase.set {
+				t.Setenv("GOEXPERIMENT", tcCase.experiment)
+			}
+			hints, err := tc.Hints(t.Context(), pkgDir, nil)
+			if err != nil {
+				t.Fatalf("Hints failed: %v", err)
+			}
+			var report struct {
+				SchemaVersion string `json:"schemaVersion"`
+				Package       string `json:"package"`
+				Files         []struct {
+					File     string `json:"file"`
+					Narrowed []any  `json:"narrowed"`
+					Unions   []any  `json:"unions"`
+					Sites    []struct {
+						Kind    string `json:"kind"`
+						Lowered string `json:"lowered"`
+					} `json:"sites"`
+					Allocs []struct {
+						Tier    string `json:"tier"`
+						Message string `json:"message"`
+					} `json:"allocs"`
+				} `json:"files"`
+			}
+			if err := json.Unmarshal(hints, &report); err != nil {
+				t.Fatalf("hints is not a valid HintsReport: %v\n%s", err, hints)
+			}
+			if report.SchemaVersion != "1.0" {
+				t.Errorf("report schemaVersion = %q, want 1.0", report.SchemaVersion)
+			}
+			if report.Package != "example.com/lmod/a" {
+				t.Errorf("report package = %q, want example.com/lmod/a", report.Package)
+			}
+			if len(report.Files) != 1 || filepath.Base(report.Files[0].File) != "a.lgo" {
+				t.Fatalf("report files = %+v, want one a.lgo entry", report.Files)
+			}
+			if len(report.Files[0].Sites) != 1 || report.Files[0].Sites[0].Kind != "try" {
+				t.Errorf("report sites = %+v, want one try site", report.Files[0].Sites)
+			}
+		})
 	}
 }
 

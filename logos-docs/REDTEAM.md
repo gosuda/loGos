@@ -8,15 +8,15 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #2 | M5 | test/logos/run/zerocopy.lgo | tested |
 | #3 | M5 | test/logos/run/constmap_switch.lgo; src/cmd/compile/internal/logos/constmap_test.go (TestConstmapSwitchMax) | tested |
 | #4 | M18 |  | planned |
-| #5 | M8, M20 |  | planned |
+| #5 | M8, M20 | src/cmd/cgo/internal/testlogos/fastcall_test.go | tested |
 | #6 | M6 | test/logos/run/lambda.lgo; test/logos/run/chains.lgo (dblBlock, count with ?) | tested |
-| #7 | M3, M11 |  | planned |
+| #7 | M3, M11 | test/logos/run/json_unmarshal_test.lgo; src/internal/types/testdata/logos/nonnil_zero.lgo; src/internal/types/testdata/logos/map_index.lgo | tested |
 | #8 | M3 | test/logos/run/platform.lgo | tested |
-| #9 | M13 |  | planned |
+| #9 | M13 | (blocked: comptime clone pclntab naming pending) | blocked |
 | #10 | M9 | test/logos/lint/exhaustive_union_switch.lgo; src/cmd/go/testdata/script/logos_pedantic_lint.txt | tested |
 | #11 | M18 |  | planned |
 | #12 | M18 |  | planned |
-| #13 | M8, M9 | test/logos/lint/concurrent_multiword_race.lgo; test/logos/lint/concurrent_multiword_race_go.go | planned |
+| #13 | M8, M9 | test/logos/lint/concurrent_multiword_race.lgo; test/logos/lint/concurrent_multiword_race_go.go | tested |
 | #14 | M3 | src/internal/types/testdata/logos/narrowing.lgo | tested |
 | #15 | M13 |  | planned |
 | #16 | M5 | src/internal/types/testdata/logos/const_views.lgo (cvPlainReslice, cvPlainReuseLoop); test/logos/run/reslice_reuse.lgo | tested |
@@ -31,7 +31,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #25 | M12 | src/cmd/go/testdata/script/logos_cap_unsafe.txt | tested |
 | #26 | M8 | src/logos/sync/sync_test.go (TestHotUpdateConcurrent, TestHotLayout) | tested |
 | #27 | M16 | src/cmd/go/testdata/script/logos_wasm_loader.txt | tested |
-| #28 | M13 |  | planned |
+| #28 | M13 | test/logos/redteam/attack_028_self_aliased_rvo.lgo | tested |
 | #29 | M19 |  | planned |
 | #30 | M13 |  | planned |
 | #31 | M6 | src/internal/types/testdata/logos/chains.lgo; test/logos/run/sort_side_effect.lgo | tested |
@@ -70,7 +70,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #64 | M6 | test/logos/run/interp.lgo (nextID once, tag order) | tested |
 | #65 | M7 | test/logos/run/const_for.lgo; src/cmd/go/testdata/script/logos_comptime_cross.txt | tested |
 | #66 |M1| test/logos/redteam/attack_066_errdefer_unnamed_results | tested |
-| #67 | M6, M13 | M6 half: src/cmd/compile/internal/logos/m6gaps_test.go (TestChainSumPairwise); test/logos/run/chains.lgo (sum order). M13: arm64 leg open | planned |
+| #67 | M6, M13 | M6 half: src/cmd/compile/internal/logos/m6gaps_test.go (TestChainSumPairwise); test/logos/run/chains.lgo (sum order). M13: (blocked: arm64 harness limit) | blocked |
 | #68 | M8 | src/logos/rt/group_test.go (FirstErrorWins, CancelReachesSibling); test/logos/run/group_exit.lgo | tested |
 | #69 | M10 | src/cmd/go/testdata/script/logos_next.txt; src/cmd/compile/internal/logos/next_test.go | tested |
 | #70 | M5 | test/logos/codegen/rodata.lgo | tested |
@@ -107,10 +107,10 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #101 | M18 |  | planned |
 | #102 | M5 | src/internal/types/testdata/logos/ctfe.lgo | tested |
 | #103 | M5 | src/internal/types/testdata/logos/ctfe.lgo | tested |
-| #104 | M13 |  | planned |
-| #105 | M13 |  | planned |
+| #104 | M13 | test/logos/codegen/cold_frame_pointer.lgo | tested |
+| #105 | M13 | test/logos/redteam/attack_105_no_cold_section.lgo | tested |
 | #106 | M18 |  | planned |
-| #107 | M13 |  | planned |
+| #107 | M13 | src/cmd/go/testdata/script/logos_opt_levels.txt | tested |
 | #108 | M7 | src/cmd/go/testdata/script/logos_eject_const_switch.txt; src/cmd/compile/internal/logos (TestEjectMatchesLowering) | tested |
 | #109 | M10 | src/cmd/go/testdata/script/logos_next.txt (goldens, ! logos fmt) | tested |
 | #110 | M5 | test/logos/run/freeze.lgo | tested |
@@ -125,8 +125,8 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #119 | M6 | test/logos/run/spread.lgo; src/internal/types/testdata/logos/spread.lgo | tested |
 | #120 | M4 | test/logos/run/properties.lgo | tested |
 | #121 | M13 |  | planned |
-| #122 | M0 |  | planned |
-| #123 | M6, M11 |  | planned |
+| #122 | M0 | src/cmd/go/testdata/script/logos_alias.txt | tested |
+| #123 | M6, M11 | test/logos/run/json_unmarshal_test.lgo (TestDefaultsAppliedFirst) | tested |
 | #124 | M13 |  | planned |
 | #125 |M1| test/logos/redteam/attack_125_errdefer_join | tested |
 | #126 | M6 | src/cmd/compile/internal/logos/m6gaps_test.go (TestInterpBindBeforeSizing) | tested |
@@ -136,13 +136,13 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #130 | M7 | test/logos/compile/comptime_mapto.lgo; test/logos/run/comptime_mapto.lgo | tested |
 | #131 | M4 | src/internal/types/testdata/logos/property_iface.lgo | tested |
 | #132 | M4 | test/logos/run/properties.lgo | tested |
-| #133 | M0 |  | planned |
-| #134 | M13 |  | planned |
+| #133 | M0 | test/logos/lint/alias_extension.lgo; src/cmd/go/testdata/script/logos_lint_alias_extension.txt | tested |
+| #134 | M13 | test/logos/codegen/recursive_stack.lgo; test/logos/codegen/recursive_stack.go; test/logos/codegen/inline_levels.lgo; src/cmd/compile/internal/inline/stackbuf_logos_test.go (TestLogosVariableMakeThreshold) | tested |
 | #135 |M1| test/logos/redteam/attack_135_lifo_order | tested |
 | #136 | M8 | test/logos/run/group_chan.lgo | tested |
-| #137 | M15 |  | planned |
+| #137 | M15 | test/logos/run/wasm_loop_preempt.lgo | tested |
 | #138 | M18 |  | planned |
-| #139 | M11 |  | planned |
+| #139 | M11 | test/logos/run/json_unmarshal_test.lgo (TestHostileArrayCostsOnArrival, TestLargeArrayDecodesIncrementally) | tested |
 | #140 | M5 | src/cmd/compile/internal/logos/constmap_test.go (TestConstmapBudgetIsOneMillion, TestConstmapProbeIsSingleProbe); src/logos/rt/constmap_proof_test.go (TestConstTableGetSingleProbe) | tested |
 | #141 | M4 | test/logos/run/properties.lgo | tested |
 | #142 | M6 | test/logos/run/chains.lgo (at-return closes) | tested |
@@ -151,7 +151,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #145 | M4 | src/internal/types/testdata/logos/property_iface.lgo | tested |
 | #146 | M6 | src/cmd/compile/internal/logos/spread_test.go; test/logos/codegen/spread_nomemmove.lgo | tested |
 | #147 | M8 | src/logos/rt/group_test.go; test/logos/run/group_panic.lgo | tested |
-| #148 | M8, M9 | test/logos/lint/concurrent_multiword_race.lgo; test/logos/lint/concurrent_multiword_race_go.go | planned |
+| #148 | M8, M9 | test/logos/lint/concurrent_multiword_race.lgo; test/logos/lint/concurrent_multiword_race_go.go | tested |
 | #149 | M15 | test/logos/codegen/clear_kept.lgo | satisfied upstream |
 | #150 | M7 | src/cmd/go/testdata/script/logos_comptime_nodes.txt | tested |
 | #151 | M8 | test/logos/run/group_netpoll.lgo; src/runtime/logos_group_netpoll_test.go | tested |
@@ -160,7 +160,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #154 | M8 | src/logos/sync/sync_test.go (TestHotLayout) | tested |
 | #155 | M18 |  | planned |
 | #156 | M3 | src/internal/types/testdata/logos/error_first.lgo | tested |
-| #157 | M7, M9 | test/logos/lint/infinite_recursion.lgo; test/logos/lint/infinite_recursion_go.go | planned |
+| #157 | M7, M9 | test/logos/lint/infinite_recursion.lgo; test/logos/lint/infinite_recursion_go.go | tested |
 | #158 | M9 | test/logos/lint/large_backing_array_pin.lgo; test/logos/lint/large_backing_array_pin_go.go | tested |
 | #159 | M19 |  | planned |
 | #160 | M19, M20 |  | planned |

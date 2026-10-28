@@ -128,7 +128,7 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 	*argv = arg
 
 	// Find the containing object.
-	base, span, _ := findObject(usptr, 0, 0)
+	base, span := zgcAttachResolve(unsafe.Pointer(usptr))
 	if base == 0 {
 		if isGoPointerWithoutSpan(unsafe.Pointer(ptr)) {
 			// Cleanup is a noop.
@@ -137,9 +137,11 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 		panic("runtime.AddCleanup: ptr not in allocated block")
 	}
 
-	// Check that arg is not within ptr.
+	// Check that arg is not within ptr. The argument word is
+	// canonicalized first: a stale or colored word would otherwise
+	// compare against the copy's range and miss.
 	if kind == abi.Pointer || kind == abi.UnsafePointer {
-		argPtr := uintptr(*(*unsafe.Pointer)(unsafe.Pointer(&arg)))
+		argPtr := zgcCanonical(uintptr(*(*unsafe.Pointer)(unsafe.Pointer(&arg))))
 		if argPtr >= base && argPtr < base+span.elemsize {
 			// It's possible that both pointers are separate
 			// parts of a tiny allocation, which is OK.
@@ -155,7 +157,7 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 
 	// Check that the cleanup function doesn't close over the pointer.
 	cleanupFV := unsafe.Pointer(*(**funcval)(unsafe.Pointer(&cleanup)))
-	cBase, cSpan, _ := findObject(uintptr(cleanupFV), 0, 0)
+	cBase, cSpan := zgcAttachResolve(cleanupFV)
 	if cBase != 0 {
 		tp := cSpan.typePointersOfUnchecked(cBase)
 		for {
@@ -163,7 +165,7 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 			if tp, addr = tp.next(cBase + cSpan.elemsize); addr == 0 {
 				break
 			}
-			ptr := *(*uintptr)(unsafe.Pointer(addr))
+			ptr := zgcCanonical(*(*uintptr)(unsafe.Pointer(addr)))
 			if ptr >= base && ptr < base+span.elemsize {
 				panic("runtime.AddCleanup: cleanup function closes over ptr, cleanup will never run")
 			}
@@ -175,7 +177,20 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 		gcCleanups.createGs()
 	}
 
-	id := addCleanup(unsafe.Pointer(ptr), cleanupFn{
+	// Resolve the stable attach address before taking locks: when the
+	// object sits unpublished on a registered page, addCleanup copies it
+	// into to-space and attaches the special to the copy, so a handle
+	// naming the source would miss at Stop once the source page is
+	// released, retired, and reused and the forwarding entry is gone.
+	// Keeping the copy's address makes the handle independent of the
+	// forwarding table: the copy's span carries the special, so page
+	// selection excludes it (sticky logosNoReloc plus specials != nil)
+	// and it cannot move again while the handle is live. addCleanup
+	// re-resolves the same copy through its own hoisted ensure-copy (a
+	// published forward-hit: no copy, no allocation), so both agree on
+	// the span. Without a cycle this is the identity and nothing changes.
+	attach := zgcAttachEnsureCopy(unsafe.Pointer(ptr))
+	id := addCleanup(attach, cleanupFn{
 		// Instantiate a caller function to call the cleanup, that is cleanup(*argv).
 		//
 		// TODO(mknyszek): This allocates because the generic dictionary argument
@@ -187,11 +202,11 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 	})
 	if debug.checkfinalizers != 0 {
 		cleanupFn := *(**funcval)(unsafe.Pointer(&cleanup))
-		setCleanupContext(unsafe.Pointer(ptr), abi.TypeFor[T](), sys.GetCallerPC(), cleanupFn.fn, id)
+		setCleanupContext(attach, abi.TypeFor[T](), sys.GetCallerPC(), cleanupFn.fn, id)
 	}
 	return Cleanup{
 		id:  id,
-		ptr: usptr,
+		ptr: uintptr(attach),
 	}
 }
 
@@ -209,7 +224,10 @@ func callCleanup[T any](fn *funcval, arg unsafe.Pointer) {
 type Cleanup struct {
 	// id is the unique identifier for the cleanup within the arena.
 	id uint64
-	// ptr contains the pointer to the object.
+	// ptr contains the stable address the special was attached to: the
+	// to-space copy when attach relocated the object, the object itself
+	// otherwise. It is a uintptr, so the handle never keeps its target
+	// alive.
 	ptr uintptr
 }
 
@@ -223,8 +241,12 @@ func (c Cleanup) Stop() {
 		return
 	}
 
+	// Canonicalize without copying, mirroring removespecial: the handle
+	// already names the copy's span, so this is the identity for it, and
+	// it keeps the lookup on the copy's span for a stale or colored word.
 	// The following block removes the Special record of type cleanup for the object c.ptr.
-	span := spanOfHeap(c.ptr)
+	ptr := uintptr(logosZgcAttachSpecial(unsafe.Pointer(c.ptr)))
+	span := spanOfHeap(ptr)
 	if span == nil {
 		return
 	}
@@ -234,7 +256,7 @@ func (c Cleanup) Stop() {
 	mp := acquirem()
 	span.ensureSwept()
 
-	offset := c.ptr - span.base()
+	offset := ptr - span.base()
 
 	var found *special
 	lock(&span.speciallock)
@@ -277,7 +299,7 @@ func (c Cleanup) Stop() {
 	unlock(&mheap_.speciallock)
 
 	if debug.checkfinalizers != 0 {
-		clearCleanupContext(c.ptr, c.id)
+		clearCleanupContext(ptr, c.id)
 	}
 }
 

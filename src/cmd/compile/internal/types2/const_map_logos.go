@@ -20,10 +20,20 @@ import (
 // exist. Each entry lists the parameters the function mutates as a bit
 // mask (bit i set means parameter i is mutated, the ParamMutated encoding).
 // A function missing from the table fails closed, as a const view
-// argument always did.
+// argument always did. An admitted imported const func takes the same
+// read-only path as a same-package const func (see logosConstMapReadOnly).
 
 // logosStdMutatedParams maps "importpath.Func" to its ParamMutated mask.
 var logosStdMutatedParams = map[string]uint64{
+	"fmt.Print":          0,
+	"fmt.Printf":         0,
+	"fmt.Println":        0,
+	"fmt.Sprint":         0,
+	"fmt.Sprintf":        0,
+	"fmt.Sprintln":       0,
+	"fmt.Append":         0,
+	"fmt.Appendf":        0,
+	"fmt.Appendln":       0,
 	"maps.All":        0, // m: read
 	"maps.Clone":      0, // m: read
 	"maps.Collect":    0, // no map parameter
@@ -57,6 +67,26 @@ func logosImportedCallMask(check *Checker, call *syntax.CallExpr) (mask uint64, 
 	return mask, true, known
 }
 
+// logosImportedCallee resolves the callee of call when it names a function
+// of an imported package (pkg.F), reporting the import path and object name.
+// It mirrors logosImportedCallMask's qualifier resolution and additionally
+// fails closed when the qualifier's package is unavailable.
+func logosImportedCallee(check *Checker, call *syntax.CallExpr) (path, name string, ok bool) {
+	sel, ok := call.Fun.(*syntax.SelectorExpr)
+	if !ok {
+		return "", "", false
+	}
+	qual, ok := sel.X.(*syntax.Name)
+	if !ok {
+		return "", "", false
+	}
+	pkg, ok := check.lookup(qual.Value).(*PkgName)
+	if !ok || pkg.Imported() == nil {
+		return "", "", false
+	}
+	return pkg.Imported().Path(), sel.Sel.Value, true
+}
+
 // logosConstMapKeyOK reports whether a const map key of type t has a base
 // hash the lowering can compute (SPEC T-Sec9): strings, numbers, and bools,
 // and structs and arrays of them. Interfaces, pointers, channels, and complex
@@ -79,17 +109,26 @@ func logosConstMapKeyOK(t Type) bool {
 }
 
 // logosConstMapReadOnly reports whether argument i of call may take a const
-// map's materialized copy. An imported callee decides by its table mask. A
-// function of this package takes it only when the callee is a const func:
-// const funcs run at compile time, and the evaluator copies each argument at
-// binding (ctfe copyArg, evalcall.go): a write through a parameter stays in
-// the callee and never reaches the caller's recorded const value. The purity
-// check covers package variables only, so it is not the guard here. Every
-// other .lgo parameter fails closed, as T-201 requires for non-const
-// parameters of .lgo functions.
+// map's materialized copy. An imported callee decides by its table mask,
+// except an admitted imported const func, which decides like a same-package
+// const func: both evaluate in the caller's CTFE with deep-copied arguments
+// (copyArg copies maps, slices, arrays and structs recursively), so a write
+// through a parameter stays in the callee and never reaches the caller's
+// recorded const value. A function of this package takes it only when the
+// callee is a const func. The purity check covers package variables only, so
+// it is not the guard here. Every other .lgo parameter fails closed, as
+// T-201 requires for non-const parameters of .lgo functions.
 func (check *Checker) logosConstMapReadOnly(call *syntax.CallExpr, imported, known bool, mask uint64, i int) bool {
 	if imported {
-		return known && i < 64 && mask&(1<<uint(i)) == 0
+		if known && i < 64 && mask&(1<<uint(i)) == 0 {
+			return true
+		}
+		if path, name, ok := logosImportedCallee(check, call); ok {
+			if admitted, _ := check.logosAdmitImportedConstFunc(path, name); admitted {
+				return true
+			}
+		}
+		return false
 	}
 	name, ok := syntax.Unparen(call.Fun).(*syntax.Name)
 	if !ok {
@@ -130,6 +169,15 @@ func (check *Checker) logosConstMapArgs(call *syntax.CallExpr, sigParams *Tuple,
 		}
 		readOnly := check.logosConstMapReadOnly(call, imported, known, mask, i)
 		if !readOnly {
+			if imported {
+				if path, name, ok := logosImportedCallee(check, call); ok {
+					if _, detail := check.logosAdmitImportedConstFunc(path, name); detail != "" {
+						check.errorf(a, InvalidConstInit, "%s %s", logosConstEvalRule, detail)
+						a.invalidate()
+						continue
+					}
+				}
+			}
 			check.errorf(a, IncompatibleAssign, "%s cannot pass argument through const view %s in argument to %s", logosConstMutation, ExprString(a.expr), ExprString(call.Fun))
 			a.invalidate()
 			continue

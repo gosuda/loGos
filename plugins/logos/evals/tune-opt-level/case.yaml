@@ -1,0 +1,25 @@
+schema_version: "1.1"
+name: tune-opt-level
+description: Pick an -O tier for size and report measured binaries.
+tags: [logos, performance]
+context:
+  add_dirs: []
+execution:
+  prompt: |
+    In a new subdirectory ./tinybin of the working directory, create a loGo/s module that prints a short line and computes a fixed-array reduction with a := [4]float64{1, 2, 3, 4}; fmt.Println(a.sum()). Build it at the default tier and at Os, record both binary sizes with ls -l, and set [build] opt_level in logos.toml to the smaller result. Then run logos build ./... and logos test ./... . Both commands must exit 0.
+  max_turns: 15
+  timeout_seconds: 300
+  allowed_tools: [Bash, Skill]
+runs: 3
+graders:
+  - name: performance-skill-fired
+    type: tool_used
+    tool: Skill
+    arm: with-only
+    input_match: "logos:logos-performance"
+    min: 1
+  - name: tier-picked-by-measurement
+    type: llm
+    criteria: Both binary sizes are recorded from ls -l output; the module computes a fixed-array reduction; logos.toml sets the tier that measured smaller; logos build ./... and logos test ./... exit 0.
+    focus: last_message
+expected_outcome: Fixed-array reduction tested and smaller tier picked by measurement, green build and test.

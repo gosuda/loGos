@@ -118,7 +118,7 @@ The `logos lint` check MUST run inside escape analysis for escape rules, on Go p
 Lint overhead carries target: 2% of compile time, measured by BenchmarkLintOverhead [T-102].
 `logos lint` MUST lint Go packages with the language-neutral rules only [T-102][R-U1].
 A rule MUST count as language-neutral when a Go package can trigger it with Go syntax and types alone and the code it guards exists in Go packages. A loGo/s form inside its detection, such as a group child, a const view, or `?`, MUST stay inactive in Go [T-102][R-U1].
-The language-neutral rules MUST be `correctness::typed_nil_return` (in Go, the `(*T)(nil)` form only), `correctness::arena_pointer_escape`, `correctness::infinite_recursion`, `correctness::unclosed_io_closer`, `correctness::unbounded_channel_op`, `concurrency::concurrent_multiword_race`, `concurrency::reentrant_withlock_deadlock`, `slop::err_chain_reset`, `slop::discarded_error`, `slop::todo_placeholder`, `complexity::cognitive_overflow`, `perf::large_backing_array_pin`, and `perf::time_after_in_loop` [T-102][R-U1].
+The language-neutral rules MUST be `correctness::typed_nil_return` (in Go, the `(*T)(nil)` form only), `correctness::arena_pointer_escape`, `correctness::infinite_recursion`, `correctness::unclosed_io_closer`, `correctness::unbounded_channel_op`, `concurrency::concurrent_multiword_race`, `concurrency::reentrant_withlock_deadlock`, `slop::err_chain_reset`, `slop::discarded_error`, `slop::todo_placeholder`, `complexity::cognitive_overflow`, `perf::large_backing_array_pin`, `perf::time_after_in_loop`, `correctness::printf_misuse`, `suspicious::copy_lock`, `correctness::structtag_malformed`, and `suspicious::string_intconv` [T-102][R-U1].
 The rules `correctness::nil_deref_unproven`, `correctness::defer_erases_errdefer_state`, `concurrency::unsupervised_goroutine`, `suspicious::unapplied_struct_default`, `suspicious::side_effect_before_sort`, `portability::serialized_unsized_int`, `portability::alias_extension`, and `pedantic::exhaustive_union_switch` MUST NOT apply to Go packages, because each depends on loGo/s syntax, types, or generated code [T-102][R-U1].
 The rule `portability::serialized_unsized_int` guards the generated binary layout of Sec 12.1, which Go packages do not get [T-102][R-U1].
 A Go package MUST get the default group severities, the `logos.toml [lints]` table, and the `//logos:allow(<rule>)` directive of this section, with the cap that the next line states [T-102][R-U1].
@@ -428,6 +428,12 @@ The same conversion MUST copy for any other provenance. [T-201]
 `logos/rt.Freeze` MUST deep-copy its argument and return a `const` view. [T-201]
 
 A later write to the source (or to a child object it points to) MUST NOT change the frozen view. [T-201]
+
+`Freeze` MUST panic on a reachable non-nil `func`, `chan`, or `unsafe.Pointer`. It cannot isolate their referenced state. [T-201]
+
+A nil `func`, `chan`, or `unsafe.Pointer` MUST remain valid and copy as nil. [T-201]
+
+Reachability MUST include map keys and values, interface payloads, and slice capacity tails. [T-201]
 
 ### 2.2 RFC-202: Non-nil pointers, option types, and nil flow
 
@@ -1063,7 +1069,7 @@ Go runtime states objects do not move, so zgc and immix stay research tracks unt
 The variable-size `make` stack buffer MUST default to 32 bytes. [T-302]
 At O2 it MUST be 256 bytes. [T-302]
 At O3 it MUST be 4096 bytes. [T-302]
-A slice that flows into a cgo call argument or an `unsafe.Pointer` conversion MUST NOT use the stack buffer. [T-302]
+A slice `make` with variable effective capacity that flows into a cgo call argument or an `unsafe.Pointer` conversion MUST NOT use the stack buffer and MUST allocate its backing storage on the heap. Effective capacity is the explicit capacity when present, otherwise the length; it is fixed only when the compiler proves it constant with `ir.IsSmallIntConst` after literal rewriting. Fixed-effective-capacity makes MUST retain ordinary escape and size behavior, not a guarantee of stack allocation. [T-302]
 Under `GOEXPERIMENT=logosstack`, the runtime MUST choose the initial goroutine stack size from the per-PC exponential moving average of final stack sizes. [T-302]
 Without history for a PC, it MUST fall back to the upstream global average. [T-302]
 
@@ -1105,17 +1111,22 @@ One fast path MUST serve Go packages and loGo/s packages: the single `runtime.lo
 The fast path MUST skip P hand-off. [T-304]
 It MUST record the call start. [T-304]
 Sysmon MUST retake the P from a fast call under the same rule and the same threshold as from a syscall, as the upstream `retake` does, with no longer grace period. [T-304][R-U1]
-Until the M20 gate passes, the fast path MUST stay behind `GOEXPERIMENT=logosfastcgo`. [T-304]
+Managed `logos` package commands MUST enable `logosfastcgo` by default. These commands include `build`, `run`, `test`, `install`, `list`, and `env`. [T-304][R-U1]
+Plain `go` MUST require explicit `GOEXPERIMENT=logosfastcgo` to enable the fast path. [T-304][R-U1]
+The shared toolchain experiment baseline MUST remain off. [T-304]
+The default MUST NOT override explicit `logosfastcgo`, `nologosfastcgo`, or `none` tokens from the process environment or `go env -w`. [T-304]
+Explicit tokens MUST retain the standard experiment ordering rules. [T-304]
+Raw `logos tool` invocations MUST retain explicit experiment selection. They do not rebuild a matching runtime. [T-304]
 The M20 gate MUST cover race, SIGPROF, a blocking C call, every `-gc` mode whose M19 gate has passed, Go pointer validity, the `nocallback` panic, CPU profile attribution, and blocking parity. [T-304]
-After the M20 gate passes and the speed rule and the blocking rule below hold, the fast path MUST be on by default. [T-304][R-U1]
-`GOEXPERIMENT=nologosfastcgo` MUST turn the default off. [T-304][R-U1]
+Command default selection MUST NOT count as passing the M20 correctness or performance gates. [T-304]
+`GOEXPERIMENT=nologosfastcgo` and `GOEXPERIMENT=none` MUST disable the default under `logos`. [T-304][R-U1]
 The speed rule MUST be a ratio of at least 1.05 of the same `BenchmarkFastcall`, built once with `GOEXPERIMENT=logosfastcgo` and once with `GOEXPERIMENT=nologosfastcgo`, measured under rule G6 of `IMPLEMENTATION.md`. [T-304]
-Without that ratio the default MUST stay off. [T-304]
+Without that ratio, M20 performance acceptance MUST remain failed. [T-304]
 A fast-called C function MUST NOT block other goroutines measurably longer than a plain cgo call of the same function does, under the blocking rule below. [T-304][R-U1]
 The blocking rule MUST be measured with a C function that sleeps 100 microseconds under `GOMAXPROCS=1`, as the delay of a ready goroutine against a plain cgo call. [T-304]
 The blocking rule holds when the median delay with the fast path is at most 1.05 times the median delay of the plain cgo call, and the standard deviation of each series is at most 20 percent of its median. [T-304]
 A series that exceeds the noise limit MUST count as blocked, never as passed. [T-304]
-The default change MUST land as its own commit after the M20 milestone gate passes. [T-304]
+The command-default policy MUST land as its own commit. [T-304]
 The fast path MUST NOT change the cgo file layout, the generated file names, or the action cache key format. [T-304][R-U1]
 Profiling with `SIGPROF` during fast calls MUST NOT crash. [T-304]
 A C function marked `nocallback` that calls into Go MUST still panic on the fast path. It MUST NOT hang and MUST NOT corrupt state. [T-304][R-U1]
@@ -1490,6 +1501,7 @@ Arrays grow incrementally with no pre-allocation cap. [T-Sec12]
 Decoding through json.Decoder uses the same method. [T-Sec12]
 No validate tags are needed. [T-Sec12]
 Unmarshal of a closed union tries members in declaration order into fresh scratch values and counts successes. [T-Sec12][T-203.1]
+A member trial counts a success only when its decode succeeds and at least one key in the object is modeled by that member; a key modeled by any sibling member but not this one disqualifies this member's trial, while keys no member models are ignored. [T-Sec12][T-203.1]
 It assigns the target only on a single success. [T-Sec12][T-203.1]
 Ambiguity returns an error naming the union and the members. [T-Sec12][T-203.1]
 Failed trials leave the target untouched. [T-Sec12][T-203.1]
@@ -1557,6 +1569,7 @@ Pure imports keep MayYield=0. [T-Sec14]
 Unknown wasmimport targets default to MayYield=1. [T-Sec14]
 A wrong MayYield=0 MUST trap instead of hanging. [T-Sec14]
 MayYield=1 functions MUST keep resume-point dispatch. [T-Sec14]
+A caller of runtime.mcall MUST keep resume-point dispatch even when it is not in the runtime: the goroutine switch back re-enters that frame, which inlining (Gosched) can place in user code. [T-Sec14]
 With `--wasm-features=stack-switching` on `logos build` or `go build` they MUST use stack switching instead. [T-Sec14][R-U1]
 Pointers are 8 bytes and slice headers are 24 bytes. [T-Sec14]
 alignof of int64, uint64, and float64 equals 8, so 64-bit atomics stay naturally aligned with no forcing code. [T-Sec14]
@@ -1784,7 +1797,7 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #107 Native CPU settings break reproducibility: The deterministic target MUST select GOAMD64=v3 and GOARM64=v8.2 unless the environment overrides them. Host-specific selection MUST require `target_cpu = "native"`. See Sec 1.5. [T-105]
 - #108 Emit-go fallback for interface switch cases: Interface cases in run-time `const switch` MUST use assertion on the value. Native and ejected output MUST agree. See Sec 2.5. [T-205]
 - #109 Conversion changes unrelated source text: `logos next` MUST preserve comments and build lines outside its edits. The toolchain MUST NOT add a `logos fmt` rewriting command. See Sec 1.3. [T-103]
-- #110 Frozen view sharing mutable heap child: `logos/rt.Freeze` MUST deep-copy its argument and return a `const` view. A later write to the source or its child MUST NOT change the view. See Sec 2.1. [T-201]
+- #110 Frozen view sharing mutable heap child: `logos/rt.Freeze` MUST deep-copy its argument and return a `const` view. A later write to the source or its child MUST NOT change the view. `Freeze` MUST panic on a reachable non-nil `func`, `chan`, or `unsafe.Pointer`. Nil leaves MUST copy as nil. Reachability MUST include map keys and values, interface payloads, and slice capacity tails. See Sec 2.1. [T-201]
 - #111 Unsafe ARM64 load store pair fusion: Pairs MUST keep distinct destinations with encodable offsets only. Go 1.27 already enforces this and the test MUST pin it. See Sec 15.1. [T-303]
 - #112 Generated files clashing with source files: Ejected output MUST NOT emit `.gen.go` file names. It MUST NOT emit a `//go:build !logos` line. See Sec 0.3. [T-0.3]
 - #113 Inlined defer leaking resources in loops: A scope defer in a loop body MUST run every iteration. Cleanup on panic MUST use open-coded defers. See Sec 20.1. [T-104.7]
@@ -1818,7 +1831,7 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #141 Method call on property value losing mutation: A method call on a property value MUST use read-call-write-back around the call. The write MUST reach the struct. See Sec 6.3. [T-203.2]
 - #142 Chain map leaking file descriptors on failure: Partial chain failure MUST close already produced `io.Closer` elements in reverse order. The fused loop MUST run that rollback before returning. See Sec 1.4. [T-104.6]
 - #143 Buffered channel retaining dead pointer after receive: Go 1.27 already clears the received slot, and the test MUST pin that a received pointer becomes collectable. See IMPLEMENTATION.md M8-S5. [T-206]
-- #144 Stack slice passed to CGo invalidated: A slice that flows into a cgo argument or an `unsafe.Pointer` conversion MUST NOT use the stack buffer. Such slices MUST allocate on the heap. See Sec 3.2. [T-302]
+- #144 Stack slice passed to CGo invalidated: A slice `make` with variable effective capacity that flows into a cgo argument or an `unsafe.Pointer` conversion MUST NOT use the stack buffer and MUST allocate its backing storage on the heap. Fixed-effective-capacity makes MUST retain ordinary escape and size behavior, not a guarantee of stack allocation. Effective capacity and compiler-proven constants are defined in Sec 3.2. [T-302]
 - #145 Field versus embedded method selector ambiguity: Embedded fields MUST satisfy properties by Go selector depth rules. An equal-depth match MUST fail as an ambiguous selector. See Sec 6.3. [T-203.2]
 - #146 Self spread copying large struct each tick: Self-update `x = T{f: e, ..x}` MUST lower to one tuple assignment of the explicit fields. It MUST perform no full struct copy. See Sec 1.4. [T-104.5]
 - #147 Background goroutine panic crashing server process: A child panic MUST become `*logos/rt.PanicError` with the value and a stack. The group MUST cancel siblings and return it. See Sec 2.6. [T-206]

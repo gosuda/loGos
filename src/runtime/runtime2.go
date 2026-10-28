@@ -480,6 +480,17 @@ type g struct {
 	stackguard0 uintptr // offset known to cmd/internal/obj/*
 	stackguard1 uintptr // offset known to cmd/internal/obj/*
 
+	// logosArena is the newest chunk of the loGo/s arena chain leased to
+	// this goroutine (M18-S1); older chunks hang off sideStackChunk.next.
+	// Nil when the goroutine holds no arena chunk.
+	// offset known to cmd/compile (logosArena bump)
+	logosArena *sideStackChunk
+	// logosArenaRetOK is the one-shot consent token a caller sets right
+	// before a static call to a function that may allocate its returned
+	// objects in the caller's arena region. The callee takes it (reads and
+	// clears it) as its first action; see logosArenaRetSet.
+	logosArenaRetOK bool
+
 	_panic    *_panic // innermost panic
 	_defer    *_defer // innermost defer
 	m         *m      // current m
@@ -606,10 +617,6 @@ type g struct {
 	// logosErrLast is the data word of the error that filled the ring:
 	// identity only, not a reference, so the trace keeps no error alive.
 	logosErrLast uintptr
-	// logosArena is the newest chunk of the loGo/s arena chain leased to
-	// this goroutine (M18-S1); older chunks hang off sideStackChunk.next.
-	// Nil when the goroutine holds no arena chunk.
-	logosArena *sideStackChunk
 }
 
 // gTrackingPeriod is the number of transitions out of _Grunning between

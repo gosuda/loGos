@@ -1,0 +1,483 @@
+// run
+
+package jsonmarshal
+
+// M11-S1 attack (SPEC Sec 12.1, T-Sec12): the generated MarshalJSON is
+// byte-identical to the reflective encoding/json output, compact, exact in
+// length for the User shape, and one allocation for a struct of scalars.
+// `mirror` is a method-less copy of the type, so it takes the reflective
+// path; json.Marshal(v) reaches the generated method by interface dispatch.
+
+import (
+	"bytes"
+	"encoding/json"
+	"math"
+	"math/rand"
+	"strings"
+	"testing"
+
+	rtjson "logos/rt/json"
+)
+
+type Dur int64
+
+type Label string
+
+type Inner struct {
+	N int32  `json:"n"`
+	S string `json:"s,omitempty"`
+}
+
+type Every struct {
+	B           bool        `json:"b"`
+	I           int         `json:"i"`
+	I8          int8        `json:"i8"`
+	I16         int16       `json:"i16"`
+	I32         int32       `json:"i32"`
+	I64         int64       `json:"i64"`
+	U           uint        `json:"u"`
+	U8          uint8       `json:"u8"`
+	U16         uint16      `json:"u16"`
+	U32         uint32      `json:"u32"`
+	U64         uint64      `json:"u64"`
+	Uptr        uintptr     `json:"uptr"`
+	F32         float32     `json:"f32"`
+	F64         float64     `json:"f64"`
+	S           string      `json:"s"`
+	Named       Label       `json:"named"`
+	NoTag       int64
+	Renamed     string      `json:"renamed_key"`
+	HTMLKey     string      `json:"<&>"`
+	Skip        string      `json:"-"`
+	hidden      string
+	OmitStr     string      `json:"os,omitempty"`
+	OmitInt     int64       `json:"oi,omitempty"`
+	OmitFloat   float64     `json:"of,omitempty"`
+	OmitBool    bool        `json:"ob,omitempty"`
+	ZeroInt     int64       `json:"zi,omitzero"`
+	ZeroStr     string      `json:"zs,omitzero"`
+	ZeroFloat   float32     `json:"zf,omitzero"`
+	Both        string      `json:"both,omitempty,omitzero"`
+	QInt        int64       `json:"qi,string"`
+	QUint       uint64      `json:"qu,string"`
+	QFloat      float64     `json:"qf,string"`
+	QF32        float32     `json:"qf32,string"`
+	QBool       bool        `json:"qb,string"`
+	QStr        string      `json:"qs,string"`
+	QOmit       int32       `json:"qo,string,omitempty"`
+	PS          *string?    `json:"ps"`
+	PSOmit      *string?    `json:"pso,omitempty"`
+	PInt        *int64?     `json:"pi,string"`
+	PFloat      *float64?   `json:"pf,omitzero"`
+	PBool       *bool?      `json:"pb"`
+	OptInt      int64?      `json:"optint"`
+	OptStr      string?     `json:"optstr,omitempty"`
+	Req         *Inner      `json:"req"`
+	ReqInt      *int64      `json:"reqi"`
+	Strs        []string    `json:"strs"`
+	StrsOmit    []string    `json:"strs_omit,omitempty"`
+	StrsZero    []string    `json:"strs_zero,omitzero"`
+	Ints        []int64     `json:"ints"`
+	Floats      []float64   `json:"floats"`
+	Bools       []bool      `json:"bools"`
+	Bytes       []byte      `json:"bytes"`
+	Arr         [3]int16    `json:"arr"`
+	Map         map[string]int `json:"m"`
+	Nested      Inner       `json:"nested"`
+	Dur         Dur         `json:"dur"`
+}
+
+type mirror Every
+
+type innerMirror Inner
+
+type draw struct {
+	r    *rand.Rand
+	s    string
+	f64  float64
+	f32  float32
+	i64  int64
+	u64  uint64
+	bits uint32
+}
+
+var corpus = []string{
+	"", "plain", "<script>alert(1)&amp;</script>", "line\u2028sep\u2029end", "\xff\xfe", "a\xc3", "\xe2\x82",
+	"\x00\x01\x1f\x7f", "tab\tnl\nfeed\fret\rbs\b", "\"quoted\\\"", "é世界😀", "\xed\xa0\x80", "\xc0\xaf",
+}
+
+func (d *draw) str() string {
+	switch d.r.Intn(5) {
+	case 0:
+		return d.s
+	case 1:
+		return d.s[:len(d.s)/2]
+	case 2:
+		raw := make([]byte, d.r.Intn(40))
+		for i := range raw {
+			raw[i] = byte(d.r.Intn(256))
+		}
+		return string(raw)
+	}
+	return corpus[d.r.Intn(len(corpus))]
+}
+
+func (d *draw) float() float64 {
+	switch d.r.Intn(4) {
+	case 0:
+		return d.f64
+	case 1:
+		return float64(d.f32)
+	case 2:
+		return math.Float64frombits(d.r.Uint64() &^ (0x7ff << 52) | uint64(d.r.Intn(2000)+24)<<52)
+	}
+	tricky := []float64{0, math.Copysign(0, -1), 1e21, 1e20, 1e-6, 1e-7, 123456789, 5e-324, math.MaxFloat64, 0.1, 1.5e300}
+	return tricky[d.r.Intn(len(tricky))]
+}
+
+func (d *draw) float32() float32 {
+	if d.r.Intn(2) == 0 {
+		return d.f32
+	}
+	tricky := []float32{0, float32(math.Copysign(0, -1)), 1e21, 1e-7, 16777216, math.SmallestNonzeroFloat32, math.MaxFloat32, 0.1}
+	return tricky[d.r.Intn(len(tricky))]
+}
+
+func (d *draw) bit(i uint) bool {
+	return d.bits>>i&1 == 1
+}
+
+func (d *draw) ptrString() *string? {
+	if d.r.Intn(3) == 0 {
+		return nil
+	}
+	s := d.str()
+	return &s
+}
+
+func (d *draw) strs() []string {
+	if d.r.Intn(3) == 0 {
+		return nil
+	}
+	out := make([]string, d.r.Intn(4))
+	for i := range out {
+		out[i] = d.str()
+	}
+	return out
+}
+
+func (d *draw) ints() []int64 {
+	if d.r.Intn(3) == 0 {
+		return nil
+	}
+	out := make([]int64, d.r.Intn(5))
+	for i := range out {
+		out[i] = d.i64 >> d.r.Intn(64)
+	}
+	return out
+}
+
+func (d *draw) floats() []float64 {
+	if d.r.Intn(3) == 0 {
+		return nil
+	}
+	out := make([]float64, d.r.Intn(4))
+	for i := range out {
+		out[i] = d.float()
+	}
+	return out
+}
+
+func (d *draw) inner() Inner {
+	return Inner{N: int32(d.i64), S: d.str()}
+}
+
+func (d *draw) scalars(v *Every) {
+	v.B = d.bit(0)
+	v.I, v.I8, v.I16, v.I32, v.I64 = int(d.i64), int8(d.i64>>3), int16(d.i64>>5), int32(d.i64>>7), d.i64
+	v.U, v.U8, v.U16, v.U32, v.U64 = uint(d.u64), uint8(d.u64>>3), uint16(d.u64>>5), uint32(d.u64>>7), d.u64
+	v.Uptr = uintptr(d.u64 >> 11)
+	v.F32, v.F64 = d.float32(), d.float()
+	v.S, v.Named, v.NoTag, v.Renamed, v.HTMLKey = d.str(), Label(d.str()), d.i64>>1, d.str(), d.str()
+	v.Skip, v.hidden = d.str(), d.str()
+	v.Dur = Dur(d.i64 >> 2)
+}
+
+func (d *draw) omitted(v *Every) {
+	v.OmitStr, v.OmitInt, v.OmitFloat, v.OmitBool = pick(d, d.str(), ""), pick(d, d.i64, 0), pick(d, d.float(), 0), d.bit(1) && d.bit(2)
+	v.ZeroInt, v.ZeroStr, v.ZeroFloat = pick(d, d.i64>>4, 0), pick(d, d.str(), ""), pick(d, d.float32(), 0)
+	v.Both = pick(d, d.str(), "")
+	v.QOmit = int32(pick(d, d.i64>>6, 0))
+}
+
+func (d *draw) quoted(v *Every) {
+	v.QInt, v.QUint, v.QFloat, v.QF32 = d.i64, d.u64, d.float(), d.float32()
+	v.QBool, v.QStr = d.bit(3), d.str()
+}
+
+func pick[T comparable](d *draw, x T, zero T) T {
+	if d.r.Intn(3) == 0 {
+		return zero
+	}
+	return x
+}
+
+func (d *draw) pointers(v *Every) {
+	v.PS, v.PSOmit = d.ptrString(), d.ptrString()
+	if d.bit(4) {
+		x := d.i64
+		v.PInt = &x
+	}
+	if d.bit(5) {
+		x := d.float()
+		v.PFloat = &x
+	}
+	if d.bit(6) {
+		x := d.bit(7)
+		v.PBool = &x
+	}
+	in := d.inner()
+	n := d.i64
+	v.Req, v.ReqInt = &in, &n
+}
+
+func (d *draw) composites(v *Every) {
+	v.Strs, v.StrsOmit, v.StrsZero = d.strs(), d.strs(), d.strs()
+	v.Ints, v.Floats = d.ints(), d.floats()
+	if d.bit(8) {
+		v.Bools = []bool{d.bit(9), d.bit(10)}
+	}
+	if d.bit(11) {
+		v.Bytes = []byte(d.str())
+	}
+	v.Arr = [3]int16{int16(d.i64), int16(d.i64 >> 16), int16(d.i64 >> 32)}
+	if d.bit(12) {
+		v.Map = map[string]int{d.str(): int(d.i64), d.str(): 1}
+	}
+	v.Nested = d.inner()
+	if d.bit(13) {
+		v.OptInt = d.i64
+	}
+	if d.bit(14) {
+		v.OptStr = d.str()
+	}
+}
+
+var extremes = []int64{0, -1, 1, 9, 10, 123456789, 1234567890, math.MaxInt64, math.MinInt64, math.MaxInt32, math.MinInt32}
+
+func newDraw(seed int64, s string, f float64) *draw {
+	r := rand.New(rand.NewSource(seed))
+	d := &draw{r: r, s: s, f64: f, f32: float32(f), u64: r.Uint64(), bits: r.Uint32()}
+	d.i64 = extremes[r.Intn(len(extremes))]
+	if r.Intn(2) == 0 {
+		d.i64 = int64(d.u64)
+	}
+	return d
+}
+
+func build(d *draw) Every {
+	v := Every{Req: &Inner{}, ReqInt: new(int64)}
+	d.scalars(&v)
+	d.omitted(&v)
+	d.quoted(&v)
+	d.pointers(&v)
+	d.composites(&v)
+	return v
+}
+
+func must(b []byte, err error) []byte {
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func unsupported(t *testing.T, err error) *json.UnsupportedValueError {
+	t.Helper()
+	ue, ok := err.(*json.UnsupportedValueError)
+	if !ok {
+		t.Fatalf("error %v (%T) is not an UnsupportedValueError", err, err)
+	}
+	return ue
+}
+
+func compareFailing(t *testing.T, v Every, werr error) {
+	t.Helper()
+	want := unsupported(t, werr)
+	_, gerr := v.MarshalJSON()
+	if got := unsupported(t, gerr); got.Str != want.Str {
+		t.Fatalf("generated %q, reflective %q", got.Str, want.Str)
+	}
+	if _, err := json.Marshal(v); err == nil {
+		t.Fatalf("json.Marshal(v) succeeded where the reflective path fails with %v", werr)
+	}
+}
+
+func compareValid(t *testing.T, v Every, want []byte) {
+	t.Helper()
+	got := must(v.MarshalJSON())
+	if !bytes.Equal(got, want) {
+		t.Fatalf("MarshalJSON differs from encoding/json\n got %s\nwant %s", got, want)
+	}
+	if !json.Valid(got) {
+		t.Fatalf("generated output is not valid JSON: %s", got)
+	}
+	via := must(json.Marshal(v))
+	if !bytes.Equal(via, want) {
+		t.Fatalf("json.Marshal(v) differs from the reflective path\n got %s\nwant %s", via, want)
+	}
+}
+
+func compare(t *testing.T, v Every) {
+	t.Helper()
+	want, werr := json.Marshal(mirror(v))
+	if werr != nil {
+		compareFailing(t, v, werr)
+		return
+	}
+	compareValid(t, v, want)
+}
+
+func FuzzMarshalMatchesEncodingJSON(f *testing.F) {
+	f.Add(int64(1), "plain", 1.5)
+	f.Add(int64(2), "<script>&", 1e21)
+	f.Add(int64(3), "a\u2028b\u2029c", 1e20)
+	f.Add(int64(4), "\xff\xfe\xc3", 5e-324)
+	f.Add(int64(5), strings.Repeat("x", 4097), 123456789.0)
+	f.Add(int64(6), "e", 1e-6)
+	f.Add(int64(7), "x", math.NaN())
+	f.Add(int64(8), "x", math.Inf(1))
+	f.Add(int64(9), "x", math.Copysign(0, -1))
+	f.Add(int64(10), "\x00\x1f\x7f\"\\", 1e-7)
+	f.Fuzz(func(t *testing.T, seed int64, s string, x float64) {
+		compare(t, build(newDraw(seed, s, x)))
+	})
+}
+
+func TestMarshalMatchesEncodingJSONSweep(t *testing.T) {
+	for seed := range int64(400) {
+		compare(t, build(newDraw(seed, corpus[int(seed)%len(corpus)], 1e21)))
+	}
+}
+
+func nonFinite(d *draw, bad float64) []Every {
+	a, b, c := build(d), build(d), build(d)
+	a.F64 = bad
+	b.F32 = float32(bad)
+	c.PFloat = &bad
+	return []Every{a, b, c}
+}
+
+func TestNonFiniteFloatsAreUnsupported(t *testing.T) {
+	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		for _, v := range nonFinite(newDraw(1, "x", 0), bad) {
+			compare(t, v)
+		}
+	}
+	_, err := nonFinite(newDraw(2, "x", 0), math.NaN())[0].MarshalJSON()
+	unsupported(t, err)
+}
+
+func TestInnerMatchesReflectivePath(t *testing.T) {
+	for _, in := range []Inner{{}, {N: -1, S: "<&>"}, {N: math.MaxInt32, S: "\xff\u2028"}} {
+		want := must(json.Marshal(innerMirror(in)))
+		got := must(in.MarshalJSON())
+		if !bytes.Equal(got, want) {
+			t.Fatalf("Inner %+v: got %s, want %s", in, got, want)
+		}
+	}
+}
+
+type User struct {
+	ID   int64    `json:"id"`
+	Name string   `json:"name"`
+	Role *string? `json:"role,omitempty"`
+}
+
+func userLen(u User) int {
+	n := 17 + rtjson.IntLen(u.ID) + rtjson.EscapedLen(u.Name)
+	r := u.Role
+	if r != nil {
+		n += 10 + rtjson.EscapedLen(*r)
+	}
+	return n
+}
+
+var (
+	ids     = []int64{0, -1, 123456789, -123456789, 1234567890, -1234567890, math.MaxInt64, math.MinInt64}
+	lengths = []int{0, 1, 64, 4095, 4096, 4097}
+	units   = []string{"a", "<&\"\n"}
+)
+
+func usersFor(name, role string) []User {
+	var out []User
+	for _, id := range ids {
+		out = append(out, User{ID: id, Name: name}, User{ID: id, Name: name, Role: &role})
+	}
+	return out
+}
+
+func usersOfLen(n int) []User {
+	var out []User
+	for _, unit := range units {
+		out = append(out, usersFor(strings.Repeat(unit, n), strings.Repeat(unit, n/2))...)
+	}
+	return out
+}
+
+// TestUserExactLen asserts len(buf) == cap(buf) == 17 + IntLen(id) +
+// EscapedLen(name) + (role present ? 10 + EscapedLen(*role) : 0).
+func TestUserExactLen(t *testing.T) {
+	for _, n := range lengths {
+		for _, u := range usersOfLen(n) {
+			buf := must(u.MarshalJSON())
+			if want := userLen(u); len(buf) != want || cap(buf) != want {
+				t.Fatalf("id=%d name=%d: len=%d cap=%d, want both %d", u.ID, len(u.Name), len(buf), cap(buf), want)
+			}
+		}
+	}
+}
+
+func TestUserAbsentRoleWritesNoKey(t *testing.T) {
+	buf := must(User{ID: 7, Name: "n"}.MarshalJSON())
+	if string(buf) != `{"id":7,"name":"n"}` {
+		t.Fatalf("got %s", buf)
+	}
+	role := ""
+	buf = must(User{ID: 7, Name: "n", Role: &role}.MarshalJSON())
+	if string(buf) != `{"id":7,"name":"n","role":""}` {
+		t.Fatalf("got %s", buf)
+	}
+}
+
+type Scalars struct {
+	A int64   `json:"a"`
+	B string  `json:"b"`
+	C bool    `json:"c"`
+	D uint8   `json:"d"`
+	E float64 `json:"e"`
+}
+
+var sink []byte
+
+func TestScalarStructOneAllocation(t *testing.T) {
+	v := Scalars{A: -42, B: "hello <world>", C: true, D: 9, E: 2.5}
+	allocs := testing.AllocsPerRun(100, func() {
+		sink = must(v.MarshalJSON())
+	})
+	if allocs != 1 {
+		t.Fatalf("MarshalJSON of a struct of scalars allocates %v times, want 1", allocs)
+	}
+}
+
+func TestOutputIsCompact(t *testing.T) {
+	v := build(newDraw(11, "x", 1))
+	got := must(v.MarshalJSON())
+	var dst bytes.Buffer
+	if err := json.Compact(&dst, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dst.Bytes(), got) {
+		t.Fatalf("output is not already compact: %s", got)
+	}
+}

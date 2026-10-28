@@ -58,6 +58,33 @@ func LogosArenaRestore(m LogosArenaMark) {
 	logosArenaRestore(m)
 }
 
+// LogosArenaMarkSave saves the calling goroutine's watermark as the three
+// words the compiler's inline bump spills: chunk, noscan, scan.
+func LogosArenaMarkSave() (chunk, noscan, scan uintptr) {
+	return logosArenaMarkSave()
+}
+
+// LogosArenaMarkRestore pops the calling goroutine's arena back to the
+// watermark the three words describe.
+func LogosArenaMarkRestore(chunk, noscan, scan uintptr) {
+	logosArenaMarkRestore(chunk, noscan, scan)
+}
+
+// LogosArenaRetSet stores the consent token for the next candidate callee.
+func LogosArenaRetSet(ok bool) {
+	logosArenaRetSet(ok)
+}
+
+// LogosArenaRetTake returns and clears the consent token.
+func LogosArenaRetTake() bool {
+	return logosArenaRetTake()
+}
+
+// LogosArenaFieldOffset is unsafe.Offsetof(g{}.logosArena), exported so
+// package runtime_test can pin the offset the compiler's inline bump
+// hard-codes (TestLogosArenaFieldOffset).
+var LogosArenaFieldOffset = unsafe.Offsetof(g{}.logosArena)
+
 // LogosArenaStat reports the calling goroutine's chunk chain.
 func LogosArenaStat() LogosArenaInfo {
 	var info LogosArenaInfo

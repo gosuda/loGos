@@ -39,14 +39,19 @@ type LogosConstFor struct {
 // comptime-generic copies emitted so far, which later copies may call,
 // and the file's synthesized package aliases (the `_logos_tN` qualifiers
 // that spell a type of a package the file does not import), each bound to
-// the package object it names.
+// the package object it names, and the importer and canonical context
+// the main check recorded, so copied const evaluation opens the same
+// packages and shares instance identity instead of failing closed.
 type LogosCopyContext struct {
-	Scope   *Scope
-	Sig     *Signature
-	Version string
-	Disqual []map[string]bool
-	Funcs   []*Func
-	Aliases map[*Package]string
+	Scope    *Scope
+	Sig      *Signature
+	Version  string
+	Disqual  []map[string]bool
+	Funcs    []*Func
+	Aliases  map[*Package]string
+	MaxSteps int
+	Importer Importer
+	Context  *Context
 }
 
 // logosCopyChecker builds the throwaway checker one copy check runs on.
@@ -55,16 +60,32 @@ type LogosCopyContext struct {
 // never block a fact, and the recheck of the lowered tree reports them.
 // The parser already checked the copy's branches and labels.
 func (ctx LogosCopyContext) logosCopyChecker(pkg *Package, info *Info, errs *[]Error) *Checker {
+	imp := ctx.Importer
+	if imp == nil && info != nil {
+		imp = info.LogosImporter
+	}
+	ctxt := ctx.Context
+	if ctxt == nil && info != nil {
+		ctxt = info.LogosContext
+	}
+	if ctxt == nil {
+		ctxt = NewContext()
+	}
 	conf := &Config{
 		Logos:              true,
 		GoVersion:          ctx.Version,
-		Context:            NewContext(),
+		Context:            ctxt,
+		Importer:           imp,
 		IgnoreBranchErrors: true,
+		LogosCTFEMaxSteps:  ctx.MaxSteps,
 		Error: func(err error) {
 			if e, ok := err.(Error); ok && !e.Soft && errs != nil {
 				*errs = append(*errs, e)
 			}
 		},
+	}
+	if conf.LogosCTFEMaxSteps == 0 && info != nil {
+		conf.LogosCTFEMaxSteps = info.LogosCTFEMaxSteps
 	}
 	mc := NewChecker(conf, pkg, info)
 	mc.version = asGoVersion(ctx.Version)

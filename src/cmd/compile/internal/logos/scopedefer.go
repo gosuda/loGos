@@ -223,7 +223,13 @@ func (fc *funcLower) scopeBlockList(list []syntax.Stmt, owner syntax.Node, endOf
 		out = append(out, fc.scopeStmt(s, cur, stack)...)
 	}
 	if ctx != nil && !scopeEndsExiting(out) {
-		native, text, tw := fc.scopeStanza(ctx.items[0].pos, ownScopeItems(ctx))
+		// The fallthrough stanza is emitted after every statement of the
+		// block, so it must carry the last statement's end position, not
+		// the first defer's: scope marks are recorded in emission order
+		// and a defer position here would move them backwards past the
+		// block's later statements (the group tail join at the body
+		// rbrace is the same shape).
+		native, text, tw := fc.scopeStanza(syntax.EndPos(list[len(list)-1]), ownScopeItems(ctx))
 		out = append(out, native...)
 		fl := fc.fl
 		gapStart := stmtEnd(fl.src, fl.off(syntax.StartPos(list[len(list)-1])))
@@ -477,7 +483,7 @@ func (fc *funcLower) scopeReturn(s *syntax.ReturnStmt, active []*scopeDeferCtx) 
 	pos := s.Pos()
 	items := scopeActiveItems(active)
 	results := syntax.UnpackListExpr(s.Results)
-	if len(results) == 0 || len(results) != len(fc.specs) {
+	if len(results) == 0 || (len(results) != len(fc.specs) && !(len(results) == 1 && len(fc.specs) > 1)) {
 		native, text, tw := fc.scopeStanza(pos, items)
 		fc.fl.add(fc.fl.off(pos), fc.fl.off(pos), renderText(text, tw.subs))
 		return append(native, s)
@@ -493,7 +499,7 @@ func (fc *funcLower) scopeReturn(s *syntax.ReturnStmt, active []*scopeDeferCtx) 
 	tw.absorb(stw.subs)
 	marks := make([]syntax.Expr, len(results))
 	for i, v := range results {
-		marks[i] = tw.mark(v.Pos(), fc.fl.textOf(span{start: fc.fl.off(syntax.StartPos(v)), end: fc.fl.off(syntax.EndPos(v))}))
+		marks[i] = tw.mark(v.Pos(), fc.fl.textOf(span{start: fc.fl.off(syntax.StartPos(v)), end: fc.fl.exprEndOf(v)}))
 	}
 	native := append([]syntax.Stmt{assignOf(pos, names, results)}, stanzaN...)
 	native = append(native, returnOf(pos, nil))

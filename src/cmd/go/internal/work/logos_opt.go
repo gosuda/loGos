@@ -46,6 +46,7 @@ func logosApplyOpt() {
 	gc, ld := logosFlagsFor(level, logosSynthLevel(file, level))
 	forcedGcflags = append(forcedGcflags, gc...)
 	forcedLdflags = append(forcedLdflags, ld...)
+	logosApplyLoopStride()
 	logosApplyTargetCPU(file)
 }
 
@@ -149,6 +150,24 @@ func logosApplyTargetCPU(file *config.File) {
 	logosSetArchLevel("GOARM64", arm64)
 }
 
+var logosTargetArchEnv []string
+
+// LogosTargetArchEnv returns KEY=VALUE pairs for architecture levels pinned
+// by target_cpu that must reach test binary environments.
+func LogosTargetArchEnv() []string {
+	if !cfg.Logos {
+		return nil
+	}
+	prefix := "GO" + strings.ToUpper(cfg.Goarch) + "="
+	var env []string
+	for _, kv := range logosTargetArchEnv {
+		if strings.HasPrefix(kv, prefix) {
+			env = append(env, kv)
+		}
+	}
+	return env
+}
+
 // logosSetArchLevel sets one arch level when the startup environment
 // leaves it unset, across the go command config, the process environment
 // that tool subprocesses inherit, and the changed config environment that
@@ -167,4 +186,11 @@ func logosSetArchLevel(key, val string) {
 	}
 	os.Setenv(key, val)
 	cfgChangedEnv = append(cfgChangedEnv, key+"="+val)
+	for i, entry := range logosTargetArchEnv {
+		if strings.HasPrefix(entry, key+"=") {
+			logosTargetArchEnv[i] = key + "=" + val
+			return
+		}
+	}
+	logosTargetArchEnv = append(logosTargetArchEnv, key+"="+val)
 }

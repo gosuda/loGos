@@ -40,6 +40,11 @@ type Group struct {
 	joined bool
 	first  error
 	slot   uint32
+	// parentStop stops the parent-cancel wake; parentDone closes when
+	// that wake has run. Wait stops and joins it before releasing the
+	// slot so no callback fires after reuse.
+	parentStop func() bool
+	parentDone chan struct{}
 }
 
 // PanicError is the error of a group child that panicked: Value is the
@@ -65,7 +70,16 @@ func (e *PanicError) Error() string {
 // wake, until Wait has joined them all.
 func NewGroup(ctx context.Context, limit int) (*Group, context.Context) {
 	c, cancel := context.WithCancel(ctx)
-	g := &Group{ctx: c, cancel: cancel, slot: logosGroupAcquire()}
+	slot := logosGroupAcquire()
+	done := make(chan struct{})
+	// Wake netpoll waiters when the parent context is cancelled or its
+	// deadline expires. The runtime records the failure for the slot, so
+	// a waiter registering afterwards arms instead of parking.
+	stop := context.AfterFunc(ctx, func() {
+		logosCancelGroup(slot)
+		close(done)
+	})
+	g := &Group{ctx: c, cancel: cancel, slot: slot, parentStop: stop, parentDone: done}
 	g.cond.L = &g.mu
 	if limit > 0 {
 		g.sem = make(chan struct{}, limit)
@@ -151,7 +165,18 @@ func (g *Group) Wait() error {
 		g.cond.Wait()
 	}
 	g.joined = true
+	stop := g.parentStop
+	done := g.parentDone
 	g.mu.Unlock()
+	// Stop and join any running parent wake before releasing the slot:
+	// a callback firing after release would wake an unrelated group
+	// reusing the slot. No locks are held across the wake, so the order
+	// stays acyclic with the runtime waiter lock.
+	if stop != nil {
+		if !stop() {
+			<-done
+		}
+	}
 	logosGroupRelease(g.slot)
 	g.cancel()
 	g.mu.Lock()

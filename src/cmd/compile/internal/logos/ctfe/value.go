@@ -60,6 +60,15 @@ func IntValue(n *big.Int, t *Type) Value { return Value{typ: t, constant: true, 
 // FloatValue builds a float value.
 func FloatValue(f float64, t *Type) Value { return Value{typ: t, constant: true, f64: f} }
 
+// ExactFloatValue builds a float constant holding an exact rational.
+func ExactFloatValue(r *big.Rat, t *Type) Value {
+	var copyR *big.Rat
+	if r != nil {
+		copyR = new(big.Rat).Set(r)
+	}
+	return Value{typ: t, constant: true, fval: copyR}
+}
+
 // defaulted maps an untyped value to its default type, leaving typed
 // values alone.
 func defaulted(v Value) Value {
@@ -249,6 +258,19 @@ func (e *evaluator) evalConversion(fr *frame, c *syntax.CallExpr) (Value, error)
 	}
 	t := e.h.TypeOf(c)
 	if t == nil {
+		t = e.h.TypeOf(c.Fun)
+	}
+	if t == nil {
+		t = e.h.TypeOf(syntax.Unparen(c.Fun))
+	}
+	if t == nil {
+		var err error
+		t, err = e.resolveType(fr, c.Fun)
+		if err != nil {
+			return Value{}, err
+		}
+	}
+	if t == nil {
 		return Value{}, e.fail(posOf(c), "unsupported conversion in const evaluation")
 	}
 	if t.Impure != "" {
@@ -287,11 +309,11 @@ func (e *evaluator) convert(v Value, t *Type, pos syntax.Pos) (Value, error) {
 	case KString:
 		return e.convertToString(v, t, pos)
 	case KSlice:
-		if vk == KString && t.Elem != nil && (t.Elem.Kind == KUint8 || t.Elem.Kind == KInt32) {
+		if isStringLike(vk) && t.Elem != nil && (t.Elem.Kind == KUint8 || t.Elem.Kind == KInt32) {
 			return e.stringToSlice(v, t, pos)
 		}
 	}
-	if !isUntyped(vk) && vk == KString && t.Kind == KSlice {
+	if !isUntyped(vk) && isStringLike(vk) && t.Kind == KSlice {
 		return Value{}, e.fail(pos, "cannot convert string in const evaluation")
 	}
 	if isInteger(t.Kind) || isFloat(t.Kind) {
@@ -394,8 +416,10 @@ func (e *evaluator) convertToString(v Value, t *Type, pos syntax.Pos) (Value, er
 	}
 	n := v.ival.Int64()
 	if v.constant {
+		// Invalid constant runes yield U+FFFD, keeping constant
+		// status, exactly like ordinary execution.
 		if n < 0 || n > utf8.MaxRune || (n >= 0xD800 && n <= 0xDFFF) {
-			return Value{}, e.fail(pos, "constant %v is not a valid rune in const evaluation", v.ival)
+			return Value{typ: t, constant: true, sval: "\uFFFD"}, nil
 		}
 		return Value{typ: t, constant: true, sval: string(rune(n))}, nil
 	}
@@ -541,14 +565,16 @@ func (e *evaluator) evalElements(fr *frame, lit *syntax.CompositeLit, elemT *Typ
 			next = idx + 1
 			continue
 		}
+		for len(elems) <= next {
+			elems = append(elems, zeroValue(elemT))
+		}
 		v, err := e.evalElem(fr, el, elemT)
 		if err != nil {
 			return nil, err
 		}
-		elems = append(elems, v)
+		elems[next] = v
 		next++
 	}
-	_ = next
 	for i := range elems {
 		elems[i] = copyValue(withVar(elems[i]))
 	}
@@ -819,7 +845,7 @@ func (e *evaluator) indexValue(x, k Value, pos syntax.Pos) (Value, error) {
 			return Value{}, e.fail(pos, "index out of range in const evaluation")
 		}
 		return withVar(x.array[i]), nil
-	case x.typ != nil && x.typ.Kind == KString:
+	case x.typ != nil && isStringLike(x.typ.Kind):
 		if !isInteger(kindOf(k)) {
 			return Value{}, e.fail(pos, "non-integer index in const evaluation")
 		}
@@ -877,8 +903,12 @@ func (e *evaluator) indexPlace(fr *frame, ix *syntax.IndexExpr) (place, error) {
 					name := base.Value
 					return place{
 						get: func() Value {
-							v, err := e.indexValue(fr.scopes[idx][name], k, posOf(ix))
+							curMap := fr.scopes[idx][name]
+							v, err := e.indexValue(curMap, k, posOf(ix))
 							if err != nil {
+								if curMap.typ != nil && curMap.typ.Elem != nil {
+									return zeroValue(curMap.typ.Elem)
+								}
 								return zeroValue(&Type{Kind: KInt})
 							}
 							return v
@@ -992,14 +1022,18 @@ func (e *evaluator) evalSlice(fr *frame, sx *syntax.SliceExpr) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		if lo < 0 || hi < lo || hi > n || max < hi || max > c {
+		// Explicit upper bounds may extend through capacity; only
+		// the omitted default stays at length. Capacity endpoints
+		// are absolute backing-store offsets, so the source offset
+		// carries into the new endpoint.
+		if lo < 0 || hi < lo || hi > c || max < hi || max > c {
 			return Value{}, e.fail(posOf(sx), "slice bounds out of range in const evaluation")
 		}
 		nv := x
 		nh := *x.slice
 		nh.lo += int(lo)
 		nh.length = int(hi - lo)
-		nh.cap_ = int(max)
+		nh.cap_ = x.slice.lo + int(max)
 		nv.slice = &nh
 		return nv, nil
 	case x.array != nil:
@@ -1018,10 +1052,17 @@ func (e *evaluator) evalSlice(fr *frame, sx *syntax.SliceExpr) (Value, error) {
 		if lo < 0 || hi < lo || hi > n {
 			return Value{}, e.fail(posOf(sx), "slice bounds out of range in const evaluation")
 		}
-		// Slicing an array copies into a fresh backing.
-		elems := slices.Clone(x.array[lo:hi])
-		return sliceValue(x.typ.Elem, elems, int(hi-lo)), nil
-	case x.typ != nil && x.typ.Kind == KString:
+		// Slicing an array views the array storage: the slice
+		// aliases the array backing so writes through either side
+		// observe each other, exactly like Go. Capacity runs to the
+		// end of the array.
+		backing := x.array
+		return Value{
+			typ:      &Type{Kind: KSlice, Elem: x.typ.Elem},
+			slice:    &sliceVal{backing: &backing, lo: int(lo), length: int(hi - lo), cap_: int(n)},
+			constant: false,
+		}, nil
+	case x.typ != nil && isStringLike(x.typ.Kind):
 		n := int64(len(x.sval))
 		lo, err := bound(sx.Index[0], 0)
 		if err != nil {
@@ -1054,9 +1095,22 @@ func (e *evaluator) evalBuiltin(fr *frame, name string, c *syntax.CallExpr) (Val
 		if err != nil {
 			return Value{}, err
 		}
+		// Typed nil collections report zero length (and zero slice
+		// capacity); cap of a nil map stays an error, like Go.
+		if v.isNil && v.typ != nil && (v.typ.Kind == KSlice || v.typ.Kind == KMap) {
+			if v.typ.Kind == KSlice {
+				return intValue(big.NewInt(0), UntypedInt(), true), nil
+			}
+			if name == "len" {
+				return intValue(big.NewInt(0), UntypedInt(), true), nil
+			}
+		}
 		switch {
-		case v.typ != nil && v.typ.Kind == KString:
-			return intValue(big.NewInt(int64(len(v.sval))), UntypedInt(), true), nil
+		case v.typ != nil && isStringLike(v.typ.Kind):
+			if name == "len" {
+				return intValue(big.NewInt(int64(len(v.sval))), UntypedInt(), true), nil
+			}
+			return Value{}, e.fail(pos, "bad cap call on string in const evaluation")
 		case v.slice != nil:
 			if name == "len" {
 				return intValue(big.NewInt(int64(len(sliceElems(v)))), UntypedInt(), true), nil
@@ -1177,7 +1231,13 @@ func (e *evaluator) evalAppend(fr *frame, c *syntax.CallExpr) (Value, error) {
 	if err != nil {
 		return Value{}, err
 	}
-	if s.slice == nil {
+	if s.isNil && s.typ != nil && s.typ.Kind == KSlice {
+		if len(c.ArgList) == 1 {
+			return s, nil
+		}
+		s.isNil = false
+		s.slice = &sliceVal{backing: new([]Value), length: 0, cap_: 0}
+	} else if s.slice == nil {
 		return Value{}, e.fail(pos, "append to non-slice in const evaluation")
 	}
 	elems, err := e.evalArgs(fr, &syntax.CallExpr{ArgList: c.ArgList[1:], HasDots: c.HasDots})
@@ -1194,6 +1254,9 @@ func (e *evaluator) evalAppend(fr *frame, c *syntax.CallExpr) (Value, error) {
 	}
 	lo, length, cap_ := s.slice.lo, s.slice.length, s.slice.cap_
 	if length+len(elems) <= cap_-lo {
+		if int64(length+len(elems)) > e.cfg.MaxValueBytes {
+			return Value{}, &Error{Code: CodeTooLarge, Detail: fmt.Sprintf("append of %d elements over %d byte limit", length+len(elems), e.cfg.MaxValueBytes), Pos: pos}
+		}
 		copy((*s.slice.backing)[lo+length:], elems)
 		nh := *s.slice
 		nh.length += len(elems)
@@ -1207,6 +1270,15 @@ func (e *evaluator) evalAppend(fr *frame, c *syntax.CallExpr) (Value, error) {
 	}
 	if newcap == 0 {
 		return s, nil
+	}
+	// Bound growth before allocating: fail with CodeTooLarge rather
+	// than materializing an over-budget backing.
+	if int64(need) > e.cfg.MaxValueBytes || int64(newcap) > e.cfg.MaxValueBytes {
+		return Value{}, &Error{Code: CodeTooLarge, Detail: fmt.Sprintf("append of %d elements over %d byte limit", need, e.cfg.MaxValueBytes), Pos: pos}
+	}
+	if err := e.checkSize(); err != nil {
+		err.Pos = pos
+		return Value{}, err
 	}
 	backing := make([]Value, newcap)
 	copy(backing, sliceElems(s))
@@ -1242,10 +1314,14 @@ func (e *evaluator) evalCopy(fr *frame, c *syntax.CallExpr) (Value, error) {
 	} else {
 		return Value{}, e.fail(pos, "bad copy call in const evaluation")
 	}
+	// Snapshot source elements before storing: when dst starts inside
+	// src backing, a forward loop would otherwise overwrite elements
+	// before later iterations read them.
+	snap := slices.Clone(selems)
 	delems := sliceElems(dst)
-	n := min(len(delems), len(selems))
+	n := min(len(delems), len(snap))
 	for i := range n {
-		v := copyValue(selems[i])
+		v := copyValue(snap[i])
 		if dst.typ.Elem != nil {
 			var err error
 			if v, err = e.convert(v, dst.typ.Elem, pos); err != nil {
@@ -1304,7 +1380,7 @@ func (e *evaluator) evalMake(fr *frame, c *syntax.CallExpr) (Value, error) {
 		if ln < 0 || cp < ln {
 			return Value{}, e.fail(pos, "negative make length in const evaluation")
 		}
-		if ln > 0 && cp > e.cfg.MaxValueBytes {
+		if cp > e.cfg.MaxValueBytes {
 			return Value{}, &Error{Code: CodeTooLarge, Detail: fmt.Sprintf("make of %d elements", cp), Pos: pos}
 		}
 		elems := make([]Value, ln)
@@ -1319,6 +1395,15 @@ func (e *evaluator) evalMake(fr *frame, c *syntax.CallExpr) (Value, error) {
 	case KMap:
 		if len(c.ArgList) > 2 || c.HasDots {
 			return Value{}, e.fail(pos, "bad make call in const evaluation")
+		}
+		// Evaluate the optional hint for its errors and calls even
+		// though the interpreter reserves nothing for it. A hint
+		// like 1/0 must fail; a variable hint (even negative)
+		// succeeds and yields an empty map.
+		if len(c.ArgList) == 2 {
+			if _, err := intArg(1); err != nil {
+				return Value{}, err
+			}
 		}
 		return Value{typ: t, mval: &mapVal{}}, nil
 	}
@@ -1352,10 +1437,10 @@ func (e *evaluator) evalExtremum(op syntax.Operator, fr *frame, c *syntax.CallEx
 }
 
 // checkSize enforces the value cap over live frames plus extras.
-func (e *evaluator) checkSize(extras ...Value) error {
+func (e *evaluator) checkSize(extras ...Value) *Error {
 	seen := map[any]bool{}
 	var total int64
-	add := func(v Value) error {
+	add := func(v Value) *Error {
 		total += e.valueSize(v, seen)
 		if total > e.cfg.MaxValueBytes {
 			return &Error{Code: CodeTooLarge, Detail: fmt.Sprintf("%d bytes over %d byte limit", total, e.cfg.MaxValueBytes)}

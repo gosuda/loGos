@@ -14,12 +14,17 @@ Rule IDs the compiler reports:
 - M2 unions: `correctness::open_union_value`, `correctness::union_nonmember`, `correctness::nonexhaustive_switch`, `correctness::switch_arm_mismatch`, `correctness::switch_expr_needs_default`, `correctness::assertion_failed`.
 - M3 options: `correctness::not_an_option`, `correctness::nil_deref_unproven`, `correctness::nonnil_uninitialized`, `correctness::nil_to_nonnil`, `correctness::result_before_error_check`.
 - M4 properties: `correctness::property_requires_conformance`, `correctness::property_unsatisfied`, `correctness::property_needs_pointer`, `correctness::property_conflict`, `correctness::property_address`.
+- M9 lints: `slop::err_chain_reset`, `slop::discarded_error`, `slop::todo_placeholder`, `complexity::cognitive_overflow`, `perf::large_backing_array_pin`, `perf::time_after_in_loop`, `correctness::arena_pointer_escape`, `correctness::infinite_recursion`, `correctness::typed_nil_return`, `correctness::unclosed_io_closer`, `correctness::unbounded_channel_op`, `correctness::defer_erases_errdefer_state`, `correctness::allow_forbidden_rule`, `suspicious::side_effect_before_sort`, `portability::serialized_unsized_int`, `pedantic::exhaustive_union_switch`.
 - M12 capabilities: `capabilities::unauthorized_unsafe`, `capabilities::unauthorized_exec`, `capabilities::unauthorized_reflect`, `capabilities::unauthorized_net`, `capabilities::unauthorized_cgo`.
 
 ## Commands
 
 - `logos build ./...`: build. Done when it exits 0.
 - `logos test ./...`: test. Done when it exits 0.
+- `logos lint ./...`: lint code and reports findings.
+- `logos next`: preview Go to loGo/s migration diff; `--fix` applies it.
+- `logos context <pkg>#<symbol>`: print symbol signatures without bodies.
+- `logos lsp`: start the language server proxy for editor integration.
 - `logos eject -o DIR`: plain-Go copy in DIR; then `go build ./...` and `go test ./...` in DIR.
 
 ## Error propagation (M1)

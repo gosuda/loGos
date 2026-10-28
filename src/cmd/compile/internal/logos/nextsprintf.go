@@ -136,6 +136,9 @@ func (s *nextScan) sprintfOperand(arg syntax.Expr, verb byte) (string, bool) {
 	if t == nil {
 		return "", false
 	}
+	if implementsFormatter(t) {
+		return "", false
+	}
 	kind, ok := types2.LogosInterpKindOf(t)
 	if !ok {
 		return "", false
@@ -224,7 +227,7 @@ func verbKind(verb byte, kind types2.LogosInterpKind) bool {
 // verbKindS reports whether a kind renders identically under %s and
 // interpolation.
 func verbKindS(kind types2.LogosInterpKind) bool {
-	return kind == types2.LogosInterpString || kind == types2.LogosInterpBytes || kind == types2.LogosInterpError || kind == types2.LogosInterpStringer
+	return kind == types2.LogosInterpString || kind == types2.LogosInterpBytes
 }
 
 // verbKindD reports whether a kind renders identically under %d and
@@ -236,7 +239,34 @@ func verbKindD(kind types2.LogosInterpKind) bool {
 // verbKindV reports whether a kind renders identically under %v and
 // interpolation.
 func verbKindV(kind types2.LogosInterpKind) bool {
-	return kind == types2.LogosInterpString || kind == types2.LogosInterpInt || kind == types2.LogosInterpUint || kind == types2.LogosInterpBool || kind == types2.LogosInterpError || kind == types2.LogosInterpStringer
+	return kind == types2.LogosInterpString || kind == types2.LogosInterpInt || kind == types2.LogosInterpUint || kind == types2.LogosInterpBool
+}
+
+func implementsFormatter(t types2.Type) bool {
+	obj, _, _ := types2.LookupFieldOrMethod(t, true, nil, "Format")
+	fn, ok := obj.(*types2.Func)
+	if !ok {
+		return false
+	}
+	sig, ok := types2.Unalias(fn.Type()).(*types2.Signature)
+	if !ok || sig.Params().Len() != 2 || sig.Results().Len() != 0 || sig.Variadic() {
+		return false
+	}
+	second := types2.Unalias(sig.Params().At(1).Type()).Underlying()
+	b, ok := second.(*types2.Basic)
+	if !ok || b.Kind() != types2.Rune {
+		return false
+	}
+	first := types2.Unalias(sig.Params().At(0).Type())
+	named, ok := first.(*types2.Named)
+	if !ok {
+		return false
+	}
+	if named.Obj().Name() != "State" {
+		return false
+	}
+	pkg := named.Obj().Pkg()
+	return pkg != nil && pkg.Path() == "fmt"
 }
 
 // buildInterp assembles the interpolated string from chunks and

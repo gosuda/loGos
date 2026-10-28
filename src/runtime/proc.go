@@ -521,7 +521,7 @@ func acquireSudog() *sudog {
 		unlock(&sched.sudoglock)
 		// If the central cache is empty, allocate a new one.
 		if len(pp.sudogcache) == 0 {
-			pp.sudogcache = append(pp.sudogcache, new(sudog))
+			pp.sudogcache = append(pp.sudogcache, logosPinSudog(new(sudog)))
 		}
 	}
 	n := len(pp.sudogcache)
@@ -1479,6 +1479,7 @@ const (
 	stwForTestReadMemStatsSlow                      // "ReadMemStatsSlow (test)"
 	stwForTestPageCachePagesLeaked                  // "PageCachePagesLeaked (test)"
 	stwForTestResetDebugLog                         // "ResetDebugLog (test)"
+	stwForTestForeignRetain                         // "ForeignRetain (test)"
 )
 
 func (r stwReason) String() string {
@@ -1510,6 +1511,7 @@ var stwReasonStrings = [...]string{
 	stwForTestReadMemStatsSlow:     "ReadMemStatsSlow (test)",
 	stwForTestPageCachePagesLeaked: "PageCachePagesLeaked (test)",
 	stwForTestResetDebugLog:        "ResetDebugLog (test)",
+	stwForTestForeignRetain:        "ForeignRetain (test)",
 }
 
 // worldStop provides context from the stop-the-world required by the
@@ -4641,6 +4643,15 @@ func save(pc, sp, bp uintptr) {
 // from a function further up in the call stack than the parent, as g->syscallsp
 // must always point to a valid stack frame. entersyscall below is the normal
 // entry point for syscalls, which obtains the SP and PC from the caller.
+//
+// Foreign-argument canonicality at the syscall seam: trap arguments arrive
+// as uintptr values materialized by address-take in the syscall wrappers,
+// never by barriered pointer loads, so direct words are always uncolored
+// canonical and need no untag here. Heap reachable through those words
+// (nested iovec/argv buffers) is retained transitively by the gcStart
+// foreign closure, and nested words are reloaded through the barrier in
+// the typed wrappers before the trap (parent-wired call sites); this
+// nosplit path itself can neither walk types nor allocate.
 //
 //go:nosplit
 func reentersyscall(pc, sp, bp uintptr) {
