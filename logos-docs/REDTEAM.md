@@ -162,8 +162,8 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #156 | M3 | src/internal/types/testdata/logos/error_first.lgo | tested |
 | #157 | M7, M9 | test/logos/lint/infinite_recursion.lgo; test/logos/lint/infinite_recursion_go.go | tested |
 | #158 | M9 | test/logos/lint/large_backing_array_pin.lgo; test/logos/lint/large_backing_array_pin_go.go | tested |
-| #159 | M19 | src/cmd/go/testdata/script/logos_redteam_159.txt (planned: unmet, script exists, no executed test/logos attack run) | planned |
-| #160 | M19, M20 | src/cmd/go/testdata/script/logos_redteam_160.txt (planned: unmet, script exists, no executed test/logos attack run) | planned |
+| #159 | M19 | src/cmd/go/testdata/script/logos_redteam_159.txt (blocked: M19-S5 immix phase 1, and zgc phase 2 for the pointer-keyed map half; scripts exist, no executed run) | blocked |
+| #160 | M19, M20 | src/cmd/go/testdata/script/logos_redteam_160.txt (blocked: M19-S5 immix phase 1; the script links immix explicitly, no executed run) | blocked |
 | #161 | M19 | src/runtime/logos_pacer_test.go (TestLogosElasticKeepsAssistBackstop, assists still run at u >= 0.95) | tested |
 | #162 | M9 | src/cmd/go/testdata/script/logos_lint_go.txt | tested |
 | #163 | M9 | test/logos/lint/unbounded_channel_op.lgo; test/logos/lint/unbounded_channel_op_go.go | tested |
@@ -171,14 +171,14 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #165 | M20 | src/cmd/cgo/internal/testlogos/fastcall_test.go | tested |
 | #166 | M19 | src/runtime/logos_gcmode_test.go (TestLogosGCModeBatchTriggersAtNinetyPercent, TestLogosGCModeBatchHeapCorrect) | tested |
 | #167 | M8, M9 | test/logos/lint/reentrant_withlock_deadlock.lgo; test/logos/lint/reentrant_withlock_deadlock_go.go; src/logos/sync/sync_test.go (TestLockedWithLockMutates, TestLockedWithLockUnlocksAfterPanic) | tested |
-| #168 | M19 | src/cmd/go/testdata/script/logos_redteam_168.txt (planned: unmet, script exists, no executed test/logos attack run) | planned |
+| #168 | M19 | src/cmd/go/testdata/script/logos_redteam_168.txt (blocked: M19-S7 zgc phase 2; the script links zgc explicitly, no executed run) | blocked |
 | #169 | M15 | test/logos/run/make_overflow.lgo (length and capacity); test/logos/run/make_overflow_go.go; test/logos/run/make_const.lgo; src/logos/rt/mullen_test.go | tested |
 | #170 | M9 | test/logos/lint/time_after_in_loop.lgo; test/logos/lint/time_after_in_loop_go.go | tested |
-| #171 | M19 | src/cmd/go/testdata/script/logos_redteam_171.txt (planned: unmet, script exists, no executed test/logos attack run) | planned |
+| #171 | M19 | src/cmd/go/testdata/script/logos_redteam_171.txt (blocked: M19-S7 zgc phase 2; the script links zgc explicitly, no executed run) | blocked |
 | #172 | M9 | test/logos/lint/time_after_in_loop.lgo; test/logos/lint/time_after_in_loop_go.go | tested |
 | #173 | M20 | src/cmd/cgo/internal/testlogos/fastcall_test.go | tested |
 | #174 | M7 | src/internal/types/testdata/logos/const_if.lgo; test/logos/run/const_if.lgo; test/logos/codegen/const_if_dead.lgo | tested |
-| #175 | M19 | src/cmd/go/testdata/script/logos_redteam_175.txt (planned: unmet, script exists, no executed test/logos attack run) | planned |
+| #175 | M19 | src/cmd/go/testdata/script/logos_redteam_175.txt (blocked: M19-S5 immix phase 1; the script links immix explicitly, no executed run) | blocked |
 | #176 | M8 | src/logos/sync/sync_test.go (TestLockedWithLockUnlocksAfterPanic) | tested |
 | #177 | M6 | test/logos/run/interp.lgo (format verbs printed literally) | tested |
 | #178 | M8 | src/logos/rt/group_test.go; test/logos/run/group.lgo; src/internal/types/testdata/logos/group.lgo | tested |
