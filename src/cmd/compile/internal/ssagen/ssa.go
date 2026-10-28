@@ -4979,6 +4979,10 @@ func (s *state) callAddr(n *ir.CallExpr, k callKind) *ssa.Value {
 // Returns the address of the return value (or nil if none).
 func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExtra ir.Expr) *ssa.Value {
 	s.prevCall = nil
+	// Syscall foreign admission (logosgcmoving only): the Admit half goes
+	// before argument lowering so it precedes the call in memory order.
+	// Pure no-op for non-qualifying sites; see logos_syscall_order.go.
+	syscallAdmit := s.logosSyscallEmitAdmit(n, k)
 	var calleeLSym *obj.LSym // target function (if static)
 	var closure *ssa.Value   // ptr to closure to run (if dynamic)
 	var codeptr *ssa.Value   // ptr to target code (if dynamic)
@@ -5182,6 +5186,9 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExt
 	}
 	s.prevCall = call
 	s.vars[memVar] = s.newValue1I(ssa.OpSelectN, types.TypeMem, int64(len(ACResults)), call)
+	// Syscall foreign admission: the End half pairs with the Admit token
+	// above. No-op unless Admit fired; preserves prevCall for ORESULTs.
+	s.logosSyscallEmitEnd(syscallAdmit)
 	// Insert VarLive opcodes.
 	for _, v := range n.KeepAlive {
 		if !v.Addrtaken() {
