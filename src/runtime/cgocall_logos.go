@@ -66,12 +66,22 @@ func logosZgcCanonicalizeSlot(slot *uintptr) bool {
 // variable slot, rewriting every pointer slot to its uncolored canonical
 // address. It follows the same type-driven traversal as cgoCheckArg but
 // never judges and never panics, so unpinned nesting is canonicalized
-// rather than rejected. Generated code calls it pre-frame for each
-// pointer argument, next to its _cgoCheckPointer emission, passing the
-// address of its own argument variable: healing the walker's copies
-// inside cgoCheckPointer could not reach what C reads, but healing the
-// originals before the frame is built can. No-op unless the zgc cycle
-// runs; preemptible context only.
+// rather than rejected. It is meant to be called pre-frame for each pointer
+// argument, next to _cgoCheckPointer, with the address of the caller's own
+// argument variable: healing the walker's copies inside cgoCheckPointer
+// cannot reach what C reads, but healing the originals before the frame is
+// built can.
+//
+// The current cmd/cgo sources emit _cgoForeignBegin/_cgoForeignEnd; no call
+// to this function is present there. Wiring one in would put the bounded
+// walk below on every cgo call, so the omission is a decision, not an
+// oversight. Until that is decided, generated cgo frames rely on foreign
+// admission, which covers them: it runs under a stopped world, uses a
+// growable queue, and rolls back on failure. That says nothing about the
+// raw syscall path or about C-to-Go callback frames, which this comment
+// does not claim to cover.
+//
+// No-op unless the zgc cycle runs; preemptible context only.
 //
 //go:linkname cgoCanonicalizeSlot
 func cgoCanonicalizeSlot(ptr any, slot unsafe.Pointer) {
