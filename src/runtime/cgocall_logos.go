@@ -203,25 +203,69 @@ func cgoCanonicalizeArg(t *_type, p unsafe.Pointer, indir bool) {
 	}
 }
 
-// cgoCanonicalizeUnknown rewrites the pointer slots of the heap object at
-// p using heap type information, the same metadata
-// cgoCheckUnknownPointer judges with, minus verdicts. One level, like the
-// checker: pinned interiors stay a documented residual in both.
+// cgoCanonicalizeUnknown rewrites the pointer slots of every heap object
+// reachable from p using heap type information, the same metadata
+// cgoCheckUnknownPointer judges with, minus verdicts.
+//
+// Unlike the checker, which judges one level, this walk is transitive and
+// tolerates cycles, so a cycle back-link cannot stay coloured. It is
+// bounded: the work list and the visited set are fixed-size arrays on the
+// stack, so the walk allocates nothing, needs no GC safety and cannot loop,
+// but at most cgoCanonUnknownBudget objects are canonicalized per call.
+// Beyond that the remainder keeps its colour, a documented residual beside
+// pinned interiors rather than a promise of the whole graph. A graph larger
+// than the budget needs an unbounded work list, which must allocate; that is
+// open work, and a chain longer than the budget is not yet covered.
+const cgoCanonUnknownBudget = 32
+
 func cgoCanonicalizeUnknown(p unsafe.Pointer) {
 	p = cgoCanonicalPP(p)
 	if !inheap(uintptr(p)) {
 		return
 	}
-	base, span, _ := findObject(uintptr(p), 0, 0)
+	base, _, _ := findObject(uintptr(p), 0, 0)
 	if base == 0 {
 		return
 	}
-	tp := span.typePointersOfUnchecked(base)
-	for {
-		var addr uintptr
-		if tp, addr = tp.next(base + span.elemsize); addr == 0 {
-			break
+	var work [cgoCanonUnknownBudget]uintptr
+	var seen [cgoCanonUnknownBudget]uintptr
+	nwork, nseen := 1, 0
+	work[0] = base
+	for nwork > 0 {
+		nwork--
+		b := work[nwork]
+		dup := false
+		for i := range nseen {
+			if seen[i] == b {
+				dup = true
+				break
+			}
 		}
-		logosZgcCanonicalizeSlot((*uintptr)(unsafe.Pointer(addr)))
+		if dup || nseen == cgoCanonUnknownBudget {
+			continue
+		}
+		seen[nseen] = b
+		nseen++
+		span := spanOfHeap(b)
+		if span == nil {
+			continue
+		}
+		tp := span.typePointersOfUnchecked(b)
+		for {
+			var addr uintptr
+			if tp, addr = tp.next(b + span.elemsize); addr == 0 {
+				break
+			}
+			slot := (*uintptr)(unsafe.Pointer(addr))
+			logosZgcCanonicalizeSlot(slot)
+			q := *slot
+			if q == 0 || !inheap(q) || nwork == cgoCanonUnknownBudget {
+				continue
+			}
+			if qb, _, _ := findObject(q, 0, 0); qb != 0 {
+				work[nwork] = qb
+				nwork++
+			}
+		}
 	}
 }
