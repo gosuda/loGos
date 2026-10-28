@@ -821,7 +821,18 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				return true
 			}
 			// Return span back to the right mcentral list.
-			if nalloc == s.nelems || logosGenClosed(s) {
+			// For immix-managed classes, keep the reusable set to spans
+			// that actually freed an object this sweep (nfreed > 0). A
+			// merely partial immix span (nalloc < nelems, nfreed == 0)
+			// has only never-used tail free; admitting it to partialSwept
+			// lets cacheSpan pop it FIFO ahead of unswept dropped spans
+			// and serve virgin tail at a fresh block start instead of
+			// reusing a dropped slot. Hide immix tail for this cycle on
+			// fullSwept; next cycle it becomes fullUnswept and is still
+			// found via nextFreeIndex. Non-immix classes keep the
+			// classic partial/full split so the plain collector neither
+			// grows fresh spans nor sweeps twice.
+			if nalloc == s.nelems || logosGenClosed(s) || (nfreed == 0 && logosImmixSpanClass(spc)) {
 				mheap_.central[spc].mcentral.fullSwept(sweepgen).push(s)
 			} else {
 				mheap_.central[spc].mcentral.partialSwept(sweepgen).push(s)
