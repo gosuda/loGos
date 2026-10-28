@@ -211,6 +211,13 @@ func (s *Walk) appendValue(buf []byte, rv reflect.Value) ([]byte, error) {
 		return append(buf, "null"...), nil
 	}
 	t := rv.Type()
+	// Exact json.Number precedes both the method check and the string
+	// branch: under goexperiment.jsonv2 Number implements MarshalJSONTo,
+	// so the honour branch would catch it first. Routing it here keeps
+	// numeric emission and validation in both modes.
+	if t == numberType {
+		return appendNumber(buf, rv)
+	}
 	if s.honorsJSONMethod(rv) {
 		return appendHonored(buf, rv)
 	}
@@ -247,9 +254,6 @@ func (s *Walk) appendValue(buf []byte, rv reflect.Value) ([]byte, error) {
 		}
 		return AppendFloat(buf, f, bits), nil
 	case reflect.String:
-		if t == numberType {
-			return appendNumber(buf, rv)
-		}
 		buf = append(buf, '"')
 		buf = AppendEscaped(buf, rv.String())
 		return append(buf, '"'), nil
