@@ -8,6 +8,7 @@ package toolchain
 
 import (
 	"cmd/go/internal/base"
+	"cmd/go/internal/cfg"
 	"fmt"
 	"internal/godebug"
 	"os"
@@ -22,6 +23,7 @@ import (
 // gotoolchain found in $PATH.
 func execGoToolchain(gotoolchain, dir, exe string) {
 	os.Setenv(targetEnv, gotoolchain)
+	cfg.DropLogosExperiments()
 	if dir == "" {
 		os.Unsetenv("GOROOT")
 	} else {
