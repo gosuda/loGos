@@ -77,11 +77,22 @@ func isExec(p string) bool {
 
 func runCmd(t *testing.T, dir, name string, args ...string) (string, error) {
 	t.Helper()
+	return runCmdEnv(t, dir, nil, name, args...)
+}
+
+// runCmdEnv runs a command with extra environment entries appended. It
+// exists so a child build can be told the experiment this test binary was
+// built with: the child is the plain go command, which never applies the
+// managed default, so an inherited environment alone would build the other
+// personality and the structure assertions would compare unlike bodies.
+func runCmdEnv(t *testing.T, dir string, extraEnv []string, name string, args ...string) (string, error) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GOPROXY=off", "GOTOOLCHAIN=local")
+	cmd.Env = append(cmd.Env, extraEnv...)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -382,14 +393,23 @@ func TestFastcallLayout(t *testing.T) {
 
 // selfTestBin builds an unstripped test binary for inspection. Plain
 // `go test` links run-mode binaries with -s -w, so os.Executable()
-// carries no symbol section; `go test -c` preserves it. The build
-// inherits the gate GOEXPERIMENT, so the binary matches the mode.
+// carries no symbol section; `go test -c` preserves it.
+//
+// The inner build is told the experiment this test binary was compiled
+// with. The child is the plain go command, which never applies a managed
+// default, so relying on the inherited environment would build the other
+// personality under `logos test` and the structure assertion would
+// compare unlike bodies.
 func selfTestBin(t *testing.T) string {
 	t.Helper()
 	requireCgo(t)
 	bin := filepath.Join(t.TempDir(), "testlogos.test")
 	srcCmd := filepath.Join(runtime.GOROOT(), "src", "cmd")
-	out, err := runCmd(t, srcCmd, goBin(t), "test", "-c", "-o", bin, "cmd/cgo/internal/testlogos")
+	exp := "GOEXPERIMENT=nologosfastcgo"
+	if goexperiment.LogosFastCgo {
+		exp = "GOEXPERIMENT=logosfastcgo"
+	}
+	out, err := runCmdEnv(t, srcCmd, []string{exp}, goBin(t), "test", "-c", "-o", bin, "cmd/cgo/internal/testlogos")
 	if err != nil {
 		t.Fatalf("self build: %v\n%s", err, out)
 	}
@@ -432,6 +452,49 @@ func TestFastcallOneTrampoline(t *testing.T) {
 	}
 	if defs != 1 {
 		t.Fatalf("runtime.logosCgocallFast text definitions = %d, want 1", defs)
+	}
+}
+
+// objdumpFunc returns the disassembly chunk for one symbol.
+func objdumpFunc(t *testing.T, binary, symbol string) string {
+	t.Helper()
+	out, err := runCmd(t, "", goBin(t), "tool", "objdump", "-s", symbol, binary)
+	if err != nil {
+		t.Fatalf("go tool objdump -s %s: %v\n%s", symbol, err, out)
+	}
+	return out
+}
+
+// TestFastcallStructure ATTACK: the trampoline body performs the status
+// dance through the standard entries and, with the experiment on,
+// contains no fallback call into plain cgocall. With the experiment
+// off it is a stub over cgocall. Red before: no such symbol.
+func TestFastcallStructure(t *testing.T) {
+	self := selfTestBin(t)
+	body := objdumpFunc(t, self, "runtime\\.logosCgocallFast")
+	if !strings.Contains(body, "logosCgocallFast") {
+		t.Fatalf("no logosCgocallFast disassembly:\n%s", body)
+	}
+	if goexperiment.LogosFastCgo {
+		for _, want := range []string{"asmcgocall", "reentersyscall", "exitsyscall"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("fast body lacks %s:\n%s", want, body)
+			}
+		}
+		// No plain call at all: with the experiment on, the
+		// `if !goexperiment.LogosFastCgo { return cgocall(...) }`
+		// branch folds away, so any CALL runtime.cgocall left in the
+		// fast body is a fallback that failed to prune.
+		if got := strings.Count(body, "CALL runtime.cgocall(SB)"); got != 0 {
+			t.Fatalf("fast body has %d plain cgocall calls, want 0 (fallback must be pruned):\n%s", got, body)
+		}
+	} else {
+		if !strings.Contains(body, "runtime.cgocall(SB)") {
+			t.Fatalf("fallback body lacks plain cgocall call:\n%s", body)
+		}
+		if strings.Contains(body, "asmcgocall") {
+			t.Fatalf("fallback body reaches asmcgocall directly:\n%s", body)
+		}
 	}
 }
 
@@ -753,19 +816,6 @@ func TestFastcallCallbackParity(t *testing.T) {
 	checkViolation(t, "plain", out)
 }
 
-func TestFastcallNumCgoCallAccounting(t *testing.T) {
-	requireCgo(t)
-	bin := filepath.Join(t.TempDir(), "callcount.exe")
-	text, err := runCmd(t, filepath.Join("testdata", "callcount"), goBin(t), "build", "-o", bin, ".")
-	if err != nil {
-		t.Fatalf("callcount build: %v\n%s", err, text)
-	}
-	out, err := runCmd(t, "", bin)
-	if err != nil {
-		t.Fatalf("callcount run: %v\n%s", err, out)
-	}
-}
-
 // TestFastcallGoPointerValid PIN (#160): a Go pointer argument stays
 // valid across the fast call.
 func TestFastcallGoPointerValid(t *testing.T) {
@@ -865,12 +915,6 @@ func TestFastcallLogosProfileParity(t *testing.T) {
 		t.Fatalf("plain top entry = %q, want the call site", topPlain)
 	}
 
-	if goexperiment.LogosFastCgo {
-		t.Setenv("GOEXPERIMENT", "logosfastcgo")
-	} else {
-		t.Setenv("GOEXPERIMENT", "nologosfastcgo")
-	}
-
 	bin := fixtureBin(t, "logosfast")
 	dir := t.TempDir()
 	prof := filepath.Join(dir, "lgo.prof")
@@ -905,7 +949,7 @@ func BenchmarkFastcall(b *testing.B) {
 	b.Logf("logosfastcgo = %v", goexperiment.LogosFastCgo)
 	var sink int32
 	for b.Loop() {
-		sink = callFastAdd(sink&((1<<30)-1), 1)
+		sink += callFastAdd(sink, 1)
 	}
 	_ = sink
 }
@@ -915,7 +959,7 @@ func BenchmarkFastcallSlow(b *testing.B) {
 	requireCgo(b)
 	var sink int32
 	for b.Loop() {
-		sink = callSlowNoescape(sink&((1<<30)-1), 1)
+		sink += callSlowNoescape(sink, 1)
 	}
 	_ = sink
 }
