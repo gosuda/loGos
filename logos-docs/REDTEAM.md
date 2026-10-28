@@ -61,12 +61,12 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #55 |M1| test/logos/redteam/attack_055_errtrace_reset_cap | tested |
 | #56 | M6 | test/logos/run/scope_defer.lgo (funcVarDefer, recvDefer) | tested |
 | #57 |M2, M7| test/logos/redteam/attack_057_case_first_match | tested |
-| #58 | M13 | src/cmd/go/testdata/script/logos_redteam_58.txt (planned: script exists, no executed test/logos attack run) | planned |
-| #59 | M18 | src/cmd/go/testdata/script/logos_redteam_59.txt (planned: script exists, no executed test/logos attack run) | planned |
+| #58 | M13 | src/cmd/go/testdata/script/logos_redteam_58.txt (executed 2026-10-28: `go test cmd/go -run 'Script/^logos_redteam_58$'` passes) | tested |
+| #59 | M18 | src/cmd/go/testdata/script/logos_redteam_59.txt (executed 2026-10-28: `go test cmd/go -run 'Script/^logos_redteam_59$'` passes, race leg included) | tested |
 | #60 | M3 | src/internal/types/testdata/logos/nonnil_zero.lgo | tested |
 | #61 | M3 | test/logos/run/option_nested.lgo | tested |
 | #62 | M5 | src/internal/types/testdata/logos/const_views.lgo (Rename, Peek) | tested |
-| #63 | M18 | src/cmd/go/testdata/script/logos_redteam_63.txt (planned: script exists, no executed test/logos attack run) | planned |
+| #63 | M18 | src/cmd/go/testdata/script/logos_redteam_63.txt (executed 2026-10-28: `go test cmd/go -run 'Script/^logos_redteam_63$'` passes, race leg included) | tested |
 | #64 | M6 | test/logos/run/interp.lgo (nextID once, tag order) | tested |
 | #65 | M7 | test/logos/run/const_for.lgo; src/cmd/go/testdata/script/logos_comptime_cross.txt | tested |
 | #66 |M1| test/logos/redteam/attack_066_errdefer_unnamed_results | tested |
@@ -74,7 +74,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #68 | M8 | src/logos/rt/group_test.go (FirstErrorWins, CancelReachesSibling); test/logos/run/group_exit.lgo | tested |
 | #69 | M10 | src/cmd/go/testdata/script/logos_next.txt; src/cmd/compile/internal/logos/next_test.go | tested |
 | #70 | M5 | test/logos/codegen/rodata.lgo | tested |
-| #71 | M18 | src/cmd/go/testdata/script/logos_redteam_71.txt (planned: script exists, no executed test/logos attack run) | planned |
+| #71 | M18 | src/cmd/go/testdata/script/logos_redteam_71.txt (executed 2026-10-28: `go test cmd/go -run 'Script/^logos_redteam_71$'` passes, race leg included) | tested |
 | #72 | M7 | test/logos/run/viewas.lgo (GC keep-alive, need-have panic); src/logos/rt/viewas_test.go | tested |
 | #73 | M5 | test/logos/run/const_map.lgo; src/cmd/compile/internal/logos/constmap_test.go | tested |
 | #74 | M13 | test/logos/redteam/attack_074_funcforpc_spec_name.lgo | tested |
@@ -147,7 +147,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #141 | M4 | test/logos/run/properties.lgo | tested |
 | #142 | M6 | test/logos/run/chains.lgo (at-return closes) | tested |
 | #143 | M8 | src/logos/sync/chanslot_logos_test.go | satisfied upstream |
-| #144 | M17, M20 | src/cmd/go/testdata/script/logos_redteam_144.txt (planned: script exists, no executed test/logos attack run) | planned |
+| #144 | M17, M20 | src/cmd/go/testdata/script/logos_redteam_144.txt (executed 2026-10-28: `go test cmd/go -run 'Script/^logos_redteam_144$'` passes) | tested |
 | #145 | M4 | src/internal/types/testdata/logos/property_iface.lgo | tested |
 | #146 | M6 | src/cmd/compile/internal/logos/spread_test.go; test/logos/codegen/spread_nomemmove.lgo | tested |
 | #147 | M8 | src/logos/rt/group_test.go; test/logos/run/group_panic.lgo | tested |
@@ -184,7 +184,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #178 | M8 | src/logos/rt/group_test.go; test/logos/run/group.lgo; src/internal/types/testdata/logos/group.lgo | tested |
 | #179 | M6 | test/logos/run/chains.lgo (64-item stability, NaN order) | tested |
 | #180 | M5 | src/cmd/compile/internal/logos/ctfe/ctfe_test.go (TestWidthsComposite); test/logos/run/const_init_read.lgo | tested |
-| #181 | M18 | src/cmd/go/testdata/script/logos_redteam_181.txt (planned: script exists, no executed test/logos attack run) | planned |
+| #181 | M18 | src/cmd/go/testdata/script/logos_redteam_181.txt (executed 2026-10-28: `go test cmd/go -run 'Script/^logos_redteam_181$'` passes, race leg included) | tested |
 | #182 | M9 | test/logos/lint/serialized_unsized_int.lgo | tested |
 | #183 | M0 | src/cmd/go/testdata/script/logos_interop.txt (case 1) | tested |
 | #184 | M0 | src/cmd/go/testdata/script/logos_interop.txt (case 2) | tested |
