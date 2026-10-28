@@ -393,7 +393,13 @@ func (ev *logosEvac) claimSlot(ds *mspan, di uintptr) (fresh bool) {
 	if goexperiment.GreenTeaGC && gcUsesSpanInlineMarkBits(ds.elemsize) {
 		ds.scannedBitsForIndex(di).setMarkedNonAtomic()
 	}
-	if di >= uintptr(ds.freeindex) && !ds.allocBitsForIndex(di).isMarked() {
+	// A clear alloc bit means the slot is uncounted, wherever it sits.
+	// The comment above requires exactly that case to raise allocCount so
+	// the caller can lower the source's by one. Restricting this to slots
+	// at or above freeindex left a destination mark with no allocation in
+	// every swept hole below the watermark, which is the state the sweep's
+	// zombie check reports as a pointer to a free object.
+	if !ds.allocBitsForIndex(di).isMarked() {
 		ds.allocBitsForIndex(di).setMarkedNonAtomic()
 		ds.allocCount++
 		fresh = true
