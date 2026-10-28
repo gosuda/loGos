@@ -1154,7 +1154,7 @@ A C function that carries only one of the two directives, or none, MUST keep the
 `//logos:cgo_fastcall` MUST be the `.lgo` spelling of the same pair and MUST mark a cgo call `noescape` and `nocallback`. [T-304]
 One fast path MUST serve Go packages and loGo/s packages: the single `runtime.logosCgocallFast` trampoline and the one cgo pipeline of this section. [T-304][R-U1]
 The fast path MUST use the syscall-style `reentersyscall`/`asmcgocall`/`exitsyscall` sequence, so it may release the P like a syscall; fast-call diagnostics stay on the original M. [T-304]
-It MUST record the call start in `m.fastCallEnterNano` on the original M. [T-304]
+It MUST NOT read a clock: `m.fastCallEnterNano` stays zero on the original M, because a per-call monotonic read dominated the measured fast path and no consumer read the value. A build MAY populate that slot behind a diagnostic switch, and no code may treat it as a call start. [T-304]
 Sysmon MUST retake the P from a fast call under the same rule and the same threshold as from a syscall, as the upstream `retake` does, with no longer grace period. [T-304][R-U1]
 Managed `logos` package commands MUST enable `logosfastcgo` by default. These commands include `build`, `run`, `test`, `install`, `list`, and `env`. [T-304][R-U1]
 Plain `go` MUST require explicit `GOEXPERIMENT=logosfastcgo` to enable the fast path. [T-304][R-U1]
@@ -1184,7 +1184,7 @@ Pin cost MUST be reported through `BenchmarkFastcall`. [T-PERF]
 Pin cost MUST NOT gate a test pass; only the speed rule and the blocking rule above use their ratios. [T-PERF]
 
 Implementation note (informative): Fast calls preserve `runtime.NumCgoCall` accounting and reset the cgo traceback buffer.
-The original M owns the diagnostic slots and monotonic start time, even when sysmon retakes its P.
+The original M owns the diagnostic slots, which stay zero under the no-clock rule above, even when sysmon retakes its P.
 Normal return and rejected callbacks clear this record before leaving syscall state.
 The slots contain address copies, not GC roots or pins.
 The ordinary cgo pointer-lifetime rules still apply.
@@ -1744,7 +1744,7 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #2 String constBytes mutated via surviving alias: String to const byte views MUST allocate nothing. Views of other provenance to string MUST copy. See Sec 2.1. [T-201]
 - #3 Rodata map breaks from runtime hash seed: Const maps MUST lower to a switch up to 8 keys. Larger maps MUST use a static perfect hash in read-only data. See Sec 9.1. [T-Sec9]
 - #4 Side-stack arena growth across parked goroutines: On park, a goroutine MUST release every empty arena chunk, including empty chunks behind a live chunk. It MUST retain every live chunk and preserve all live-object addresses. With no live chunks, it MUST retain no arena capacity; its ordinary stack and runtime metadata still exist. See Sec 8.3. [T-301.1]
-- #5 Cgo fastcall blocks OS thread forever: The fast path MUST record the call start. Sysmon MUST retake the P from a fast call under the same rule and threshold as from a syscall. See Sec 3.4. [T-304]
+- #5 Cgo fastcall blocks OS thread forever: The fast path MUST NOT read a clock to fill `m.fastCallEnterNano`, which stays zero; Sysmon MUST retake the P from a fast call under the same rule and threshold as from a syscall. A fast call MUST NOT block other goroutines. See Sec 3.4. [T-304]
 - #6 Block lambda return ambiguity inside map: Lambdas MUST allow expression and block forms with known target types. A ? in an expression lambda MUST propagate from the enclosing function. See Sec 1.4. [T-104.6]
 - #7 Non-nil pointer bypass via arrays maps JSON: Zero values of non-nil pointers MUST fail with correctness::nonnil_uninitialized. Absent map and JSON values MUST check through V? and MissingFieldError. An absent key MUST read as none while a present nil payload MUST read as some. See Sec 2.2. [T-202][T-Sec12]
 - #8 Go functions returning nil into lgo: Pointers from Go declarations, in the standard library and in every other Go package, MUST act as platform pointers. Stores into non-nil locations MUST panic with logos: nil from Go value at the source line. See Sec 2.2. [T-202][R-U2]
