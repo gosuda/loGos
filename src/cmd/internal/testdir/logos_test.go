@@ -336,6 +336,13 @@ func (t test) runLogos(c logosCase) error {
 		cmd.Env = append(cmd.Env, "PWD="+tempDir)
 		cmd.Env = append(cmd.Env, "STDLIB_IMPORTCFG="+stdlibImportcfgFile())
 		cmd.Env = append(cmd.Env, c.runenv...)
+		// -race requires cgo. A .lgo case cannot ask for cgo itself:
+		// the directive parser turns only -goexperiment and -godebug
+		// into runenv, so the run path supplies it, as the asmcheck
+		// path already does.
+		if flags, _ := splitOptFlags(c.flags); len(flags) > 0 && flags[0] == "-race" {
+			cmd.Env = append(cmd.Env, "CGO_ENABLED=1")
+		}
 		var err error
 		if c.tim != 0 {
 			err = cmd.Start()
