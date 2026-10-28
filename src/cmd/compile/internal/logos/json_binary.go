@@ -147,15 +147,28 @@ func (g *binaryGenerator) codec(t types2.Type) (int, bool) {
 			if g.isZeroWire(x.Elem()) {
 				// Zero-wire elements encode zero bytes, so remaining input
 				// gives no lawful bound (SPEC Sec 12.3). Cap the count itself
-				// at the 1 MiB prealloc bound (unit 1) and reject beyond it
-				// with a count-out-of-range error, encoder symmetric, in
+				// at the 1 MiB prealloc bound (unit 1) and additionally cap
+				// the single-allocation byte total (count times element size)
+				// at 64 MiB, so a tiny header cannot drive an arbitrarily large
+				// make through fat ignored-field storage while a 1M ZeroPad
+				// (8 MiB) stays lawful; each field is checked on its own, so
+				// sums across fields are never rejected. Reject beyond either
+				// cap with a count-out-of-range error, encoder symmetric, in
 				// constant time without per-element iteration. Accepted wire
 				// bytes are unchanged.
+				elemType, ok := g.typeName(x.Elem())
+				if !ok {
+					return 0, false
+				}
 				e("dst = _logos_bbinary.AppendUvarint(dst, uint64(len(v)))")
 				e("if uint64(len(v)) > (1 << 20) { return dst, _logos_bfmt.Errorf(\"binary count %%d out of range\", len(v)) }")
+				e("_logos_zsize := uint64(_logos_bunsafe.Sizeof(*new(%s))); if _logos_zsize == 0 { _logos_zsize = 1 }", elemType)
+				e("if uint64(len(v)) > (1 << 26)/_logos_zsize { return dst, _logos_bfmt.Errorf(\"binary count %%d out of range\", len(v)) }")
 				d("n, used := _logos_bbinary.Uvarint(src[*off:]); if used <= 0 { %s }; *off += used", fail)
 				d("if n > uint64(int(^uint(0) >> 1)) { return _logos_bfmt.Errorf(\"binary field %%s at offset %%d: count %%d out of range\", field, *off-used, n) }")
 				d("if n > (1 << 20) { return _logos_bfmt.Errorf(\"binary field %%s at offset %%d: count %%d out of range\", field, *off-used, n) }")
+				d("_logos_zsize := uint64(_logos_bunsafe.Sizeof(*new(%s))); if _logos_zsize == 0 { _logos_zsize = 1 }", elemType)
+				d("if n > (1 << 26)/_logos_zsize { return _logos_bfmt.Errorf(\"binary field %%s at offset %%d: count %%d out of range\", field, *off-used, n) }")
 				d("*v = make(%s, int(n))", name)
 				break
 			}
@@ -164,7 +177,7 @@ func (g *binaryGenerator) codec(t types2.Type) (int, bool) {
 				return 0, false
 			}
 			e("dst = _logos_bbinary.AppendUvarint(dst, uint64(len(v))); for _, elem := range v {")
-			d("n, used := _logos_bbinary.Uvarint(src[*off:]); if used <= 0 { %s }; *off += used; var elem %s; size := uint64(_logos_bunsafe.Sizeof(elem)); if size == 0 { size = 1 }; cap64 := min(n, uint64(len(src)-*off)/2, (1<<20)/size); *v = make(%s, 0, int(cap64)); for i := uint64(0); i < n; i++ {", fail, elemType, name)
+			d("n, used := _logos_bbinary.Uvarint(src[*off:]); if used <= 0 { %s }; *off += used; if n > uint64(len(src)-*off) { %s }; var elem %s; size := uint64(_logos_bunsafe.Sizeof(elem)); if size == 0 { size = 1 }; cap64 := min(n, uint64(len(src)-*off)/2, (1<<20)/size); *v = make(%s, 0, int(cap64)); for i := uint64(0); i < n; i++ {", fail, fail, elemType, name)
 			if !child(x.Elem(), "elem", "&elem", "field") {
 				return 0, false
 			}
