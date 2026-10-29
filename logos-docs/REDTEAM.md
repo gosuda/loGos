@@ -174,7 +174,7 @@ Resolutions: logos-docs/SPEC.md Section 17. Status values: planned, tested, sati
 | #168 | M19 | src/cmd/go/testdata/script/logos_redteam_168.txt (blocked: M19-S7 zgc phase 2; the script links zgc explicitly, no executed run) | blocked |
 | #169 | M15 | test/logos/run/make_overflow.lgo (length and capacity); test/logos/run/make_overflow_go.go; test/logos/run/make_const.lgo; src/logos/rt/mullen_test.go | tested |
 | #170 | M9 | test/logos/lint/time_after_in_loop.lgo; test/logos/lint/time_after_in_loop_go.go | tested |
-| #171 | M19 | src/cmd/go/testdata/script/logos_redteam_171.txt (blocked: M19-S7 zgc phase 2; the script links zgc explicitly, no executed run) | blocked |
+| #171 | M19 | src/cmd/go/testdata/script/logos_redteam_171.txt (executed: the bulk leg failed at the script's `-race` command with `PC=0x424ebb addr=0x10`, a nil race thread state on the system stack, and passes after 507cee6e46; the script's own header keeps the row planned while the phase gates and the resident-set record stay open) | blocked |
 | #172 | M9 | test/logos/lint/time_after_in_loop.lgo; test/logos/lint/time_after_in_loop_go.go | tested |
 | #173 | M20 | src/cmd/cgo/internal/testlogos/fastcall_test.go | tested |
 | #174 | M7 | src/internal/types/testdata/logos/const_if.lgo; test/logos/run/const_if.lgo; test/logos/codegen/const_if_dead.lgo | tested |
