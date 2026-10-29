@@ -351,7 +351,12 @@ func zgcQuarantineSpan(s *mspan, pg *zgcPage) {
 					traceRelease(trace)
 				}
 			}
-			if raceenabled && !s.isUserArenaChunk {
+			// Reporting a free is a race-runtime call. The selection
+			// pause runs this loop on the system stack, which has no
+			// goroutine race context, and the race runtime dereferences
+			// that context unguarded, so report only from a goroutine
+			// stack.
+			if raceenabled && !s.isUserArenaChunk && getg() != getg().m.g0 {
 				racefree(unsafe.Pointer(x), s.elemsize)
 			}
 			dead++
