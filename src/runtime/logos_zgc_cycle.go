@@ -260,6 +260,7 @@ func zgcMarkTerminationHook() {
 	// the worker stack; g0 needs no growth.
 	systemstack(func() {
 		zgcRemapPassComplete()
+	wakeWorkers := false
 		zgcRetirePendingPages()
 		zgcPublishReadyToSpace()
 		zgcPagesLock()
@@ -303,7 +304,7 @@ func zgcMarkTerminationHook() {
 		zgcFixRoots(zgcFixSlot)
 		zgcFlip(zgcColorRemapped)
 		zgcRelocating.Store(int32(len(kept)))
-		zgcWakeWorkers()
+		wakeWorkers = true
 	})
 }
 
@@ -327,6 +328,12 @@ func zgcFinishRelocation() {
 	for {
 		progress := false
 		pages := zgcPagesSnapshot()
+	// The wake's channel send is race-instrumented, so it runs on this
+	// goroutine's stack, which has a race context; the system stack does
+	// not.
+	if wakeWorkers {
+		zgcWakeWorkers()
+	}
 		for _, pg := range pages {
 			if pg.published.Load() == pg.live {
 				continue

@@ -60,6 +60,12 @@ type zgcSourceRange struct {
 type zgcPage struct {
 	_ sys.NotInHeap
 
+	// stateIdx is the one-based index of this page's span state in
+	// zgcPageStates, or zero when it has none. It is an index and not a
+	// pointer because this metadata is NotInHeap, so the collector
+	// cannot trace it; the slice keeps the state alive.
+	stateIdx uintptr
+
 	start, size, live uintptr
 	fwd               unsafe.Pointer
 	fwdMask           uintptr
