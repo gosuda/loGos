@@ -4,7 +4,7 @@
 // a constant only in a `const if` condition. Anywhere else it is a
 // run-time use. A condition that mixes it with a run-time value is not
 // constant. A const for over a non-struct type fails in a live branch and
-// is silent in a dead one.
+// is silent in a dead one. comptime.Error requires a constant message.
 
 package p
 
@@ -46,4 +46,13 @@ func deadNonStruct() string {
 		}
 	}
 	return "ok"
+}
+
+func nonConstantError(msg string) {
+	comptime.Error(msg) // ERROR "comptime::error_not_constant"
+}
+
+func nonConstantErrorVar() {
+	msg := "dynamic message"
+	comptime.Error(msg) // ERROR "comptime::error_not_constant"
 }

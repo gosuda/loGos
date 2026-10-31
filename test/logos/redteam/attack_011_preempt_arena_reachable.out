@@ -1,0 +1,4 @@
+scan-reachable: ok
+preempt-reachable: ok
+alloc-noscan: 0
+alloc-scan: 0

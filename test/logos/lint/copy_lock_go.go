@@ -1,7 +1,8 @@
-// errorcheck -0
+// errorcheck
 
 // suspicious::copy_lock on a Go package (LINT-RULES.md Sec 1.2): detects
-// copying values containing embedded or direct locks.
+// copying values containing embedded or direct locks. Copying an active
+// lock duplicates synchronization state.
 
 package p
 
@@ -12,7 +13,7 @@ type State struct {
 	count int
 }
 
-func (s State) BadRecv() int { // ERROR "\[suspicious::copy_lock\]"
+func (s State) BadRecv() int { // ERROR "\[suspicious::copy_lock\]" "\[nogo::copylocks\]"
 	return s.count
 }
 
@@ -20,7 +21,7 @@ func (s *State) GoodRecv() int {
 	return s.count
 }
 
-func passByVal(s State) int { // ERROR "\[suspicious::copy_lock\]"
+func passByVal(s State) int { // ERROR "\[suspicious::copy_lock\]" "\[nogo::copylocks\]"
 	return s.count
 }
 
@@ -31,15 +32,15 @@ func passByPtr(s *State) int {
 func copyAssign() {
 	var s1 State
 	var s2 State
-	s2 = s1 // ERROR "\[suspicious::copy_lock\]"
-	var s3 = s1 // ERROR "\[suspicious::copy_lock\]"
+	s2 = s1 // ERROR "\[suspicious::copy_lock\]" "\[nogo::copylocks\]"
+	var s3 = s1 // ERROR "\[suspicious::copy_lock\]" "\[nogo::copylocks\]"
 	_ = &s2
 	_ = &s3
 }
 
 func copyReturn() State {
 	var s State
-	return s // ERROR "\[suspicious::copy_lock\]"
+	return s // ERROR "\[suspicious::copy_lock\]" "\[nogo::copylocks\]"
 }
 
 func cleanForms() {
@@ -49,6 +50,7 @@ func cleanForms() {
 }
 
 //logos:allow(suspicious::copy_lock)
+//logos:allow(nogo::copylocks)
 func allowedInGo(s State) int {
 	return s.count
 }

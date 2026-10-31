@@ -13,7 +13,7 @@ import (
 
 func badArgCount() {
 	fmt.Printf("user %s count %d\n", "alice") // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
-	fmt.Sprintf("user %s count %d\n")         // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
+	fmt.Sprintf("user %s count %d\n")         // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]" "\[nogo::unusedresult\]"
 	fmt.Fprintf(os.Stdout, "%s %s\n", "one")  // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
 	fmt.Printf("count %d\n", 1, 2)            // ERROR "\[correctness::printf_misuse\]" "\[nogo::printf\]"
 }
@@ -30,7 +30,7 @@ func badIndex() {
 
 func cleanForms(dynamic string) {
 	fmt.Printf("user %s count %d\n", "alice", 42)
-	fmt.Sprintf("val: %v, str: %s, int: %d\n", true, "ok", 10)
+	fmt.Sprintf("val: %v, str: %s, int: %d\n", true, "ok", 10) // ERROR "\[nogo::unusedresult\]"
 	fmt.Fprintf(os.Stdout, "name: %s\n", "bob")
 	fmt.Printf("%v %+v %#v %T\n", "s", 1, true, struct{}{})
 	fmt.Printf(dynamic, 1, 2, 3)

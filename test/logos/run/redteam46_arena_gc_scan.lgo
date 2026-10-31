@@ -1,0 +1,57 @@
+// run -goexperiment logosarena
+
+package main
+
+// REDTEAM #46 (SPEC Sec 8.3, T-301.1; IMPLEMENTATION.md M18-S3, AR3): the
+// side-stack arena must hold a bottom-up noscan region and a top-down scan
+// region, and the collector must scan scan-region objects with the owning
+// goroutine stack, so pointer-containing arena objects keep their heap
+// referents alive across runtime.GC. This fixture builds dynamic scan
+// slices (make with a runtime-sized length routes pointer-bearing makes
+// through runtime.logosArenaMakeSlice into the scan region), roots every
+// slot with a live heap object, collects twice, and re-sums through the
+// arena pointers. A collector that skips the scan region reclaims the
+// referents and the re-sum fails. Value-only: an all-heap fallback also
+// passes; only unscanned scan memory fails. The direct unit proof is
+// TestLogosArenaGCScansScanRegion in src/runtime/logos_arena_test.go.
+
+import (
+	"fmt"
+	"runtime"
+)
+
+type r46Node struct {
+	v int
+}
+
+//go:noinline
+func r46Sum(s []*r46Node) int {
+	total := 0
+	for _, p := range s {
+		total += p.v
+	}
+	return total
+}
+
+//go:noinline
+func r46Build(n int) []*r46Node {
+	s := make([]*r46Node, 0, n)
+	for i := 0; i < n; i++ {
+		s = append(s, &r46Node{v: i})
+	}
+	return s
+}
+
+func main() {
+	n := 64
+	s := r46Build(n)
+	before := r46Sum(s)
+	runtime.GC()
+	runtime.GC()
+	after := r46Sum(s)
+	runtime.KeepAlive(s)
+	fmt.Println("scan-gc:", before, after)
+	if before != 2016 || after != 2016 {
+		panic("redteam46: scan-region referents lost across GC")
+	}
+}

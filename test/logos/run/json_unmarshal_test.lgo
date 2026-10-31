@@ -622,3 +622,44 @@ func TestPrefilledTargetMatchesEncodingJSON(t *testing.T) {
 		}
 	}
 }
+
+// PRRT_kwDOVOeymc6wGfHR (r4373037368) on decode: a named int carrying
+// only IsZero() bool keeps the string option, and the quoted token is
+// read by the typed quoted reader with the exact value instead of the
+// reflective fallback.
+type ZInt int64
+
+func (z ZInt) IsZero() bool { return z == 42 }
+
+type IsZeroQuoted struct {
+	V ZInt `json:"v,string"`
+	W ZInt `json:"w,string,omitzero"`
+}
+
+type isZeroQuotedMirror IsZeroQuoted
+
+func TestQuotedNamedIntWithIsZero(t *testing.T) {
+	a := decodeOK[IsZeroQuoted](`{"v":"7","w":"7"}`)
+	if a.V != 7 || a.W != 7 {
+		t.Fatalf(`{"v":"7","w":"7"}: got %+v, want V=7 W=7`, a)
+	}
+	b := decodeOK[IsZeroQuoted](`{"v":"7"}`)
+	if b.V != 7 || b.W != 0 {
+		t.Fatalf(`{"v":"7"}: got %+v, want V=7 W=0`, b)
+	}
+	for _, doc := range []string{
+		`{"v":"7","w":"7"}`, `{"v":"7"}`, `{}`, `{"v":"0","w":"0"}`, `{"v":"7","w":"42"}`,
+		`{"v":"-9223372036854775808"}`, `{"V":7,"W":7}`, `{"v":7}`, `{"v":null,"w":null}`, `{"v":"abc"}`,
+	} {
+		var x IsZeroQuoted
+		var y isZeroQuotedMirror
+		errX := json.Unmarshal([]byte(doc), &x)
+		errY := json.Unmarshal([]byte(doc), &y)
+		if (errX == nil) != (errY == nil) {
+			t.Fatalf("%s: generated error %v, reflective error %v", doc, errX, errY)
+		}
+		if errX == nil && !reflect.DeepEqual(x, IsZeroQuoted(y)) {
+			t.Fatalf("%s: generated %+v, reflective %+v", doc, x, IsZeroQuoted(y))
+		}
+	}
+}

@@ -296,6 +296,7 @@ Rules:
 | `pedantic::exhaustive_union_switch` | Remove redundant default clause from exhaustive switch on closed union. |
 
 The `--json-diagnostics` flag prints one JSON object per line with fields `schema_version` ("1.0"), `severity`, `rule_id`, `file`, and `span`.
+This covers both `.lgo` and Go lint targets, and findings report original source positions, never ejected or generated Go.
 
 ## Eject
 

@@ -1,0 +1,194 @@
+// run -goexperiment logosarena
+
+package main
+
+// M18 pointer-slice attack (SPEC Sec 8.3): a runtime-sized nonescaping
+// []*Node local large enough to exceed the stack buffer must allocate its
+// backing in the arena scan region, keeping heap referents alive across
+// runtime.GC(). Escape LogosArenaLocalShape allows any elem with Size>0
+// and Align<=8 (pointers included), and runtime
+// TestLogosArenaPointerSliceScanRetention proves scan-region pointer
+// slices retain referents via direct LogosArenaAllocScan. Walk
+// walkLogosArenaMake still refuses HasPointers, so this fixture is
+// intentionally RED until that refusal lifts: alloc-ptr/alloc-mixed read
+// 1 on heap today, 0 when placed. Mixed structs with pointer fields ride
+// the same shape gate, so []Mixed is covered too. GC stability uses only
+// runtime.GC + KeepAlive (viewas.lgo pattern): no finalizer/cleanup, no
+// sleep. Alloc-measurement Nodes are preallocated outside every measured
+// closure, so AllocsPerRun counts only the slice backing; each GC helper
+// builds its own heap referents so the tested slice is their sole root.
+// Globals/channels are the
+// heap-escape controls and stay 1. No nil is ever stored into []*Node:
+// len-0/cap-n makes avoid nonnil zero values, then every slot is
+// appended with a live pointer before any read.
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"testing"
+)
+
+var ptrN = 1024
+
+var sinkInt int
+
+var globalPtrSink []*Node
+
+var ptrChan = make(chan []*Node, 1)
+
+type Node struct {
+	v int
+}
+
+type Mixed struct {
+	p *Node
+	v int
+}
+
+//go:noinline
+func ptrSliceSum(s []*Node) int {
+	sum := 0
+	for _, p := range s {
+		sum += p.v
+	}
+	return sum
+}
+
+//go:noinline
+func ptrLocalSum(pool []*Node, n int) int {
+	s := make([]*Node, 0, n)
+	for _, p := range pool[:n] {
+		s = append(s, p)
+	}
+	sum := 0
+	for _, p := range s {
+		sum += p.v
+	}
+	return sum
+}
+
+//go:noinline
+func mixedLocalSum(pool []*Node, n int) int {
+	s := make([]Mixed, 0, n)
+	for i := 0; i < n; i++ {
+		s = append(s, Mixed{p: pool[i], v: i})
+	}
+	sum := 0
+	for _, m := range s {
+		sum += m.v + m.p.v
+	}
+	return sum
+}
+
+//go:noinline
+func ptrGCSum(n int) (int, bool) {
+	s := make([]*Node, 0, n)
+	for i := 0; i < n; i++ {
+		s = append(s, &Node{v: i})
+	}
+	before := 0
+	for _, p := range s {
+		before += p.v
+	}
+	first := s[0]
+	last := s[n-1]
+	runtime.GC()
+	runtime.GC()
+	after := 0
+	for _, p := range s {
+		after += p.v
+	}
+	ident := s[0] == first && s[n-1] == last && before == after
+	runtime.KeepAlive(s)
+	return after, ident
+}
+
+//go:noinline
+func mixedGCSum(n int) (int, bool) {
+	s := make([]Mixed, 0, n)
+	for i := 0; i < n; i++ {
+		s = append(s, Mixed{p: &Node{v: i}, v: i})
+	}
+	before := 0
+	for _, m := range s {
+		before += m.v + m.p.v
+	}
+	first := s[0].p
+	last := s[n-1].p
+	runtime.GC()
+	runtime.GC()
+	after := 0
+	for _, m := range s {
+		after += m.v + m.p.v
+	}
+	ident := s[0].p == first && s[n-1].p == last && before == after
+	runtime.KeepAlive(s)
+	return after, ident
+}
+
+//go:noinline
+func ptrLeakSum(pool []*Node, n int) int {
+	s := make([]*Node, 0, n)
+	for _, p := range pool[:n] {
+		s = append(s, p)
+	}
+	globalPtrSink = s
+	sum := 0
+	for _, p := range s {
+		sum += p.v
+	}
+	return sum
+}
+
+//go:noinline
+func ptrChanSum(ctx context.Context, pool []*Node, n int) int {
+	s := make([]*Node, 0, n)
+	for _, p := range pool[:n] {
+		s = append(s, p)
+	}
+	select {
+	case ptrChan <- s:
+	case <-ctx.Done():
+		panic("arena_pointer_slice: ptrChan send canceled")
+	default:
+		panic("arena_pointer_slice: ptrChan send blocked (cap 1, expected empty)")
+	}
+	var t []*Node
+	select {
+	case t = <-ptrChan:
+	case <-ctx.Done():
+		panic("arena_pointer_slice: ptrChan recv canceled")
+	default:
+		panic("arena_pointer_slice: ptrChan recv blocked (cap 1, expected full)")
+	}
+	sum := 0
+	for _, p := range t {
+		sum += p.v
+	}
+	return sum
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = ctx.Done()
+	pool := make([]*Node, 0, ptrN)
+	for i := 0; i < ptrN; i++ {
+		pool = append(pool, &Node{v: i})
+	}
+	fmt.Println("ptr-sum:", ptrLocalSum(pool, ptrN))
+	fmt.Println("mixed-sum:", mixedLocalSum(pool, ptrN))
+	gSum, gIdent := ptrGCSum(ptrN)
+	fmt.Println("ptr-gc-sum:", gSum, gIdent)
+	mgSum, mgIdent := mixedGCSum(ptrN)
+	fmt.Println("mixed-gc-sum:", mgSum, mgIdent)
+	fmt.Println("leak-sum:", ptrLeakSum(pool, ptrN))
+	fmt.Println("leak-global-sum:", ptrSliceSum(globalPtrSink))
+	fmt.Println("chan-sum:", ptrChanSum(ctx, pool, ptrN))
+	fmt.Println("alloc-ptr:", testing.AllocsPerRun(100, func() { sinkInt = ptrLocalSum(pool, ptrN) }))
+	fmt.Println("alloc-mixed:", testing.AllocsPerRun(100, func() { sinkInt = mixedLocalSum(pool, ptrN) }))
+	fmt.Println("alloc-leak:", testing.AllocsPerRun(100, func() { sinkInt = ptrLeakSum(pool, ptrN) }))
+	fmt.Println("alloc-chan:", testing.AllocsPerRun(100, func() { sinkInt = ptrChanSum(ctx, pool, ptrN) }))
+	_ = sinkInt
+}

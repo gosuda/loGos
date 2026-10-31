@@ -1,0 +1,95 @@
+// run -goexperiment logosarena -race
+
+package main
+
+// REDTEAM #101 (SPEC Sec 8.3, T-301.1; IMPLEMENTATION.md M18-S3): race
+// builds must reset shadow memory on watermark moves, so reused chunks
+// report no false race. Every round allocates iteration-local noscan and
+// scan buffers whose watermark is restored at the loop back-edge, handing
+// the same memory to the next round; each round fills and checksums its
+// buffers against an allocation-free oracle, so stale or aliased reuse
+// fails loudly. The -race flag on the directive builds the staged module
+// instrumented, so a missing shadow reset fails the run with a detector
+// report instead of passing silently. The instrumented build needs cgo:
+// run the gate with CGO_ENABLED=1. Companion gate: GOEXPERIMENT=logosarena
+// go test -short -race runtime -run LogosArena (M18-S1). Distinct from
+// test/logos/run/redteam35_arena_race_reuse.lgo for row #35, which reuses
+// one shape with an additive oracle and a 4-step interleave; this fixture
+// mixes noscan and scan shapes per round with a multiplicative oracle,
+// nested allocation order, and a first-round carry across the whole run.
+
+import "fmt"
+
+type r101Node struct{ v int }
+
+//go:noinline
+func r101Sum(b []byte) int {
+	s := 0
+	for _, v := range b {
+		s += int(v)
+	}
+	return s
+}
+
+//go:noinline
+func r101Oracle(n, r int) int {
+	s := 0
+	for i := 0; i < n; i++ {
+		s += int(byte((i*7 + r) & 0xFF))
+	}
+	return s
+}
+
+//go:noinline
+func r101PtrSum(s []*r101Node) int {
+	total := 0
+	for _, p := range s {
+		total += p.v
+	}
+	return total
+}
+
+//go:noinline
+func r101PtrOracle(n, r int) int {
+	total := 0
+	for i := 0; i < n; i++ {
+		total += r*100 + i
+	}
+	return total
+}
+
+//go:noinline
+func r101Work() {
+	// first holds a snapshot copy of round 0. Retaining the slice itself
+	// would mark the make site escaping and push every round to the heap,
+	// leaving the arena shadow-reset path unexercised; copying keeps each
+	// round's buffer iteration-local and arena-eligible.
+	var first [512]byte
+	for r := 0; r < 60; r++ {
+		b := make([]byte, 512)
+		for i := range b {
+			b[i] = byte((i*7 + r) & 0xFF)
+		}
+		if got := r101Sum(b); got != r101Oracle(512, r) {
+			panic("redteam101: noscan round reuse corrupted data")
+		}
+		s := make([]*r101Node, 0, 32)
+		for i := 0; i < 32; i++ {
+			s = append(s, &r101Node{v: r*100 + i})
+		}
+		if got := r101PtrSum(s); got != r101PtrOracle(32, r) {
+			panic("redteam101: scan round reuse corrupted data")
+		}
+		if r == 0 {
+			copy(first[:], b)
+		}
+	}
+	if got := r101Sum(first[:]); got != r101Oracle(512, 0) {
+		panic("redteam101: first-round snapshot mismatch")
+	}
+}
+
+func main() {
+	r101Work()
+	fmt.Println("r101 ok")
+}

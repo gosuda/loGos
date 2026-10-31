@@ -1,0 +1,21 @@
+// run
+
+package main
+
+const true = 41
+const false = 42
+const nil = 43
+
+const func packageTrue() int { return true }
+const func packageFalse() int { return false }
+const func packageNil() int { return nil }
+
+const gotTrue = packageTrue()
+const gotFalse = packageFalse()
+const gotNil = packageNil()
+
+func main() {
+	if gotTrue != 41 || gotFalse != 42 || gotNil != 43 {
+		panic("compile-time package bindings did not shadow predeclared names")
+	}
+}

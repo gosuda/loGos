@@ -1,0 +1,197 @@
+// run -goexperiment logosarena
+
+package main
+
+// M18 loop-edge attack (SPEC Sec 3.1, Sec 8.3): iteration-local dynamic
+// makes must restore the watermark on every loop back-edge, while live
+// allocations survive and escaping makes stay on the heap. This fixture
+// covers ordinary and range loops with continue/break, labeled outer
+// continue/break, nested loops with inner-only break, switch-local break
+// (which must not restore the loop), and sibling loops at the same depth
+// with split eligibility (loop A iteration-local, loop B escaping via a
+// returned slice). Value checks only: runtime.LogosArenaStat lives in
+// export_logos_arena_test.go (a _test.go seam, unavailable to normal
+// builds), so no allocation counter is asserted here; boundedness stays
+// covered by runtime TestLogosArenaLoopWatermarkBounded. All loops and
+// sizes are small and fixed, so runtime is bounded with no timing.
+
+import "fmt"
+
+func fillSeq(b []byte, base int) {
+	for j := range b {
+		b[j] = byte(base + j)
+	}
+}
+
+func sumBytes(b []byte) int {
+	s := 0
+	for _, v := range b {
+		s += int(v)
+	}
+	return s
+}
+
+func ordinaryContinue(n, sz int) int {
+	total := 0
+	for i := 0; i < n; i++ {
+		b := make([]byte, sz)
+		fillSeq(b, i)
+		if i%2 == 0 {
+			continue
+		}
+		total += sumBytes(b)
+	}
+	return total
+}
+
+func ordinaryBreak(n, sz int) int {
+	total := 0
+	for i := 0; i < n; i++ {
+		b := make([]byte, sz)
+		fillSeq(b, 10*i)
+		if i == 3 {
+			break
+		}
+		total += sumBytes(b)
+	}
+	return total
+}
+
+func rangeContinue(items []int, sz int) int {
+	total := 0
+	for _, x := range items {
+		b := make([]byte, sz)
+		fillSeq(b, x)
+		if x%2 == 0 {
+			continue
+		}
+		total += sumBytes(b)
+	}
+	return total
+}
+
+func rangeBreak(items []int, sz int) int {
+	total := 0
+	for _, x := range items {
+		b := make([]byte, sz)
+		fillSeq(b, 10*x)
+		if x == 4 {
+			break
+		}
+		total += sumBytes(b)
+	}
+	return total
+}
+
+func nestedInnerBreak(n, m, sz int) int {
+	total := 0
+	for i := 0; i < n; i++ {
+		outer := make([]byte, sz)
+		fillSeq(outer, i*10)
+		for k := 0; k < m; k++ {
+			b := make([]byte, sz)
+			fillSeq(b, i*10+k*100)
+			if k == 2 {
+				break
+			}
+			total += sumBytes(b)
+		}
+		total += sumBytes(outer)
+	}
+	return total
+}
+
+func labeledOuterBreak(n, m, sz int) (int, int) {
+	total := 0
+	count := 0
+Outer:
+	for i := 0; i < n; i++ {
+		for k := 0; k < m; k++ {
+			b := make([]byte, sz)
+			fillSeq(b, i*10+k)
+			if i == 1 && k == 2 {
+				break Outer
+			}
+			total += sumBytes(b)
+			count++
+		}
+	}
+	return total, count
+}
+
+func labeledOuterContinue(n, m, sz int) (int, int) {
+	total := 0
+	count := 0
+Outer:
+	for i := 0; i < n; i++ {
+		for k := 0; k < m; k++ {
+			b := make([]byte, sz)
+			fillSeq(b, i*10+k)
+			if k == 1 {
+				continue Outer
+			}
+			total += sumBytes(b)
+			count++
+		}
+	}
+	return total, count
+}
+
+func switchBreak(n, sz int) int {
+	total := 0
+	for i := 0; i < n; i++ {
+		b := make([]byte, sz)
+		fillSeq(b, i)
+		switched := 0
+		switch i % 3 {
+		case 0:
+			switched = 1
+			break
+		case 1:
+			switched = 2
+			break
+		default:
+			switched = 3
+		}
+		total += sumBytes(b) + len(b)*switched
+	}
+	return total
+}
+
+func siblingBoth(n, sz int) (int, [][]byte, int) {
+	keep := make([]byte, sz)
+	fillSeq(keep, 50)
+	aTotal := 0
+	for i := 0; i < n; i++ {
+		b := make([]byte, sz)
+		fillSeq(b, i)
+		aTotal += sumBytes(b)
+	}
+	var out [][]byte
+	for i := 0; i < n; i++ {
+		b := make([]byte, sz)
+		fillSeq(b, 100+i*10)
+		out = append(out, b)
+	}
+	keepSum := sumBytes(keep)
+	return aTotal, out, keepSum
+}
+
+func main() {
+	fmt.Println("ordinary-continue:", ordinaryContinue(6, 4))
+	fmt.Println("ordinary-break:", ordinaryBreak(6, 4))
+	fmt.Println("range-continue:", rangeContinue([]int{1, 2, 3, 4, 5}, 4))
+	fmt.Println("range-break:", rangeBreak([]int{1, 2, 3, 4, 5}, 4))
+	fmt.Println("nested-inner-break:", nestedInnerBreak(3, 5, 4))
+	obTotal, obCount := labeledOuterBreak(4, 4, 4)
+	fmt.Println("labeled-outer-break:", obTotal, obCount)
+	ocTotal, ocCount := labeledOuterContinue(4, 4, 4)
+	fmt.Println("labeled-outer-continue:", ocTotal, ocCount)
+	fmt.Println("switch-break:", switchBreak(6, 4))
+	aTotal, out, keepSum := siblingBoth(4, 4)
+	bTotal := 0
+	for _, s := range out {
+		bTotal += sumBytes(s)
+	}
+	fmt.Println("sibling:", aTotal, bTotal, keepSum)
+}

@@ -20,7 +20,11 @@ package main
 // under `json:"-"` so each element has nonzero Sizeof with zero wire
 // bytes; that seam is admissible because LogosJSONFieldOf skips "-" and
 // LogosBinaryTypeOK skips ignored fields. ZeroEmpty has Sizeof 0 and takes
-// the same cap, so the size-0 path is covered too.
+// the same cap, so the size-0 path is covered too. ZeroFat is the finding's
+// own shape, 4 KiB of ignored storage per element, where a second
+// per-count byte budget of (1<<26)/zsize binds before the count cap:
+// 16384 fat elements are exactly 64 MiB and lawful, 16385 are rejected by
+// encoder and decoder alike.
 
 import (
 	"bytes"
@@ -59,6 +63,17 @@ type ZeroSizedHolder struct {
 	Items []ZeroEmpty `json:"items"`
 }
 
+// ZeroFat carries 4 KiB of storage under `json:"-"`, so each element is
+// zero-wire while fat. For such slices the per-count byte budget of
+// (1<<26)/zsize binds before the 1,048,576 count cap.
+type ZeroFat struct {
+	Scratch [4096]byte `json:"-"`
+}
+
+type ZeroFatHolder struct {
+	Items []ZeroFat `json:"items"`
+}
+
 // encoder is the pair of generated encode methods every holder below has,
 // and decoder the generated decode method.
 type encoder interface {
@@ -79,6 +94,12 @@ func zeroCap() int {
 
 func padSize() int {
 	return int(unsafe.Sizeof(ZeroPad{}))
+}
+
+// fatCap is the per-count byte budget for fat zero-wire elements:
+// (1<<26)/4096 = 16384. It binds before the count cap.
+func fatCap() int {
+	return (1 << 26) / int(unsafe.Sizeof(ZeroFat{}))
 }
 
 // wireOfUint64 renders the expected encoding of a struct whose fields are
@@ -438,6 +459,66 @@ func zeroSizedAtCap() error {
 	return decodeRejected(wireOf(over), caseTag{label: "zero-size over", field: ".Items", count: uint64(over)}, &gotOver)
 }
 
+// fatBoundary pins the byte-budget edge on the finding's fat ignored
+// element: 16384 elements of 4096 bytes are exactly the 64 MiB per-count
+// budget and lawful on all three methods, 16385 are rejected by both
+// encoders and by the decoder with the same count-out-of-range error
+// before any allocation. One make of limit+1 elements hosts both sides,
+// so the fixture's only fat allocations are that single shared slice and
+// the accepted decode's own 64 MiB of zero values.
+func fatBoundary() error {
+	if size := int(unsafe.Sizeof(ZeroFat{})); size != 4096 {
+		return fmt.Errorf("ZeroFat size %d, want 4096 for the fat boundary", size)
+	}
+	limit := fatCap()
+	if limit != 16384 {
+		return fmt.Errorf("fat byte budget %d, want 16384", limit)
+	}
+	if limit >= zeroCap() {
+		return fmt.Errorf("fat byte budget %d does not bind before the count cap", limit)
+	}
+	storage := make([]ZeroFat, limit+1)
+	over := ZeroFatHolder{Items: storage}
+	if err := encodersRejected(over, caseTag{label: "fat over", count: uint64(limit + 1)}); err != nil {
+		return err
+	}
+	var gotOver ZeroFatHolder
+	if err := decodeRejected(wireOf(limit+1), caseTag{label: "fat over", field: ".Items", count: uint64(limit + 1)}, &gotOver); err != nil {
+		return err
+	}
+	at := ZeroFatHolder{Items: storage[:limit]}
+	want := wireOf(limit)
+	if !bytes.Equal(want, []byte{0x01, 0x80, 0x80, 0x01}) {
+		return fmt.Errorf("fat cap wire %x, want the version byte plus the uvarint of 16384", want)
+	}
+	enc, err := at.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("fat at budget: MarshalBinary rejected the lawful count: %w", err)
+	}
+	if !bytes.Equal(enc, want) {
+		return fmt.Errorf("fat at budget: wire %x, want %x", enc, want)
+	}
+	pre := []byte{0x5a}
+	app, err := at.AppendBinary(pre)
+	if err != nil {
+		return fmt.Errorf("fat at budget: AppendBinary rejected the lawful count: %w", err)
+	}
+	if !bytes.Equal(app, append(append([]byte(nil), pre...), want...)) {
+		return fmt.Errorf("fat at budget: AppendBinary wire mismatch")
+	}
+	var got ZeroFatHolder
+	if err := got.UnmarshalBinary(enc); err != nil {
+		return fmt.Errorf("fat at budget: UnmarshalBinary rejected the lawful count: %w", err)
+	}
+	if len(got.Items) != limit {
+		return fmt.Errorf("fat at budget: decoded %d items, want %d", len(got.Items), limit)
+	}
+	if got.Items[0] != (ZeroFat{}) || got.Items[limit-1] != (ZeroFat{}) {
+		return fmt.Errorf("fat at budget: decoded elements are not zero values")
+	}
+	return nil
+}
+
 func run() error {
 	if zeroCap() != 1048576 {
 		return fmt.Errorf("zero-wire cap is not 1,048,576")
@@ -469,6 +550,9 @@ func run() error {
 	}
 	if err := zeroSizedAtCap(); err != nil {
 		failures = append(failures, "zero-size: "+err.Error())
+	}
+	if err := fatBoundary(); err != nil {
+		failures = append(failures, "fat-boundary: "+err.Error())
 	}
 	if len(failures) != 0 {
 		return fmt.Errorf("%s", strings.Join(failures, "; "))

@@ -944,13 +944,13 @@ func boolSame(a, b, c, d bool) bool {
 }
 
 func boolRuns(a, b, c, d bool) {
-	if a && b && c && d && a && b {
+	if a && b && c && d && a && b { // ERROR "\[nogo::bools\]"
 	}
-	if a || b || c || d || a || b {
+	if a || b || c || d || a || b { // ERROR "\[nogo::bools\]"
 	}
-	if a && b && c && d && a && b {
+	if a && b && c && d && a && b { // ERROR "\[nogo::bools\]"
 	}
-	if a || b || c || d || a || b {
+	if a || b || c || d || a || b { // ERROR "\[nogo::bools\]"
 	}
 }
 

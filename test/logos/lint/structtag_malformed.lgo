@@ -7,9 +7,9 @@
 package p
 
 type BadTags struct {
-	Name   string `json:name,omitempty`      // ERROR "\[correctness::structtag_malformed\]"
+	Name   string `json:name,omitempty`      // ERROR "\[correctness::structtag_malformed\]" "\[nogo::structtag\]"
 	Age    int32  `json:"age" json:"years"`  // ERROR "\[correctness::structtag_malformed\]"
-	secret string `json:"secret"`            // ERROR "\[correctness::structtag_malformed\]"
+	secret string `json:"secret"`            // ERROR "\[correctness::structtag_malformed\]" "\[nogo::structtag\]"
 }
 
 type CleanTags struct {
