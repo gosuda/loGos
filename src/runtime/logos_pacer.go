@@ -14,12 +14,11 @@ import "internal/runtime/atomic"
 type logosFractionalGoal = atomic.Float64
 
 // Elastic background marking (M19-S2, SPEC Sec 19, T-301.2). Under the
-// greentea collector and under an empty production-controller mode the
-// background mark utilization follows the PLAN curve
+// greentea collector the background mark utilization follows the PLAN curve
 // of live heap over heap goal instead of the fixed gcBackgroundUtilization.
 // Mark assist, its debt accounting and the CPU limiter are the upstream ones:
-// they stay the backstop when background marking falls behind. An empty
-// test-controller mode keeps the upstream pacing.
+// they stay the backstop when background marking falls behind. Every other
+// mode, including an empty production-controller mode, keeps upstream pacing.
 
 const (
 	// logosElasticFloor is the background utilization below logosElasticRise.
@@ -143,15 +142,16 @@ func (c *gcControllerState) logosElasticTotal(live, goal uint64) float64 {
 }
 
 // logosElasticStart replaces the worker split of a starting cycle when the
-// collector mode is greentea or, for the runtime's own controller, empty.
-// dedicated is the upstream split. It returns the
+// collector mode is greentea. dedicated is the upstream split. It returns the
 // number of dedicated workers to start, and sets the fractional goal for the
-// rest. Any other mode, an empty test-controller mode, and stop-the-world
-// collection keep the upstream split. The caller holds worldsema with the world stopped.
+// rest. Plain go keeps the upstream split: an empty production-controller
+// mode, an empty test-controller mode, any other mode, and stop-the-world
+// collection all take the same upstream path. The caller holds worldsema
+// with the world stopped.
 func (c *gcControllerState) logosElasticStart(procs int, dedicated int64) int64 {
 	e := &c.logosElastic
 	mode := c.logosElasticMode()
-	e.active = (mode == "greentea" || (!c.test && mode == "")) && debug.gcstoptheworld == 0
+	e.active = mode == "greentea" && debug.gcstoptheworld == 0
 	if !e.active {
 		return dedicated
 	}

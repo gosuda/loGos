@@ -1944,7 +1944,7 @@ The build MUST select the collector with `-gc=MODE` on `logos build` or `go buil
 MODE MUST be one of `greentea`, `zgc`, `immix`, `wasm`, `batch`, or `epsilon`. [T-301.2]
 Any other mode MUST fail with `logos build: unknown -gc mode "x" (want greentea, zgc, immix, wasm, batch, epsilon)`. [T-301.2]
 Under `logos`, the default MUST be `greentea`, or `wasm` when `GOARCH` equals `wasm`. [T-301.2]
-Elastic pacing MUST be the default for `greentea` and for an empty production-controller mode; empty test-controller modes MUST keep upstream pacing. [T-301.2]
+Elastic pacing MUST be the default for `greentea`; every other mode, including an empty production-controller mode, MUST keep upstream pacing. [T-301.2]
 Until phase 1 passes `go test -short std` with the experiment on, `-gc=immix` MUST fail with `logos build: -gc=immix requires GOEXPERIMENT=logosgcmoving phase 1, which is not complete`. [T-301.2]
 Until phase 2 passes, `-gc=zgc` MUST fail with `logos build: -gc=zgc requires GOEXPERIMENT=logosgcmoving phase 2, which is not complete`. [T-301.2]
 Batch MUST run no collection until heap use reaches 90% of `GOMEMLIMIT`. [T-301.2]

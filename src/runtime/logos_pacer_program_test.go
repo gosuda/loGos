@@ -117,10 +117,13 @@ func TestLogosElasticAssistsRunInBuiltProgram(t *testing.T) {
 	}
 }
 
-// TestLogosPlainBuildPacesElastically: a go build with no -gc paces
-// elastically through the empty production-controller mode.
-func TestLogosPlainBuildPacesElastically(t *testing.T) {
-	logosCheckElasticTrace(t, logosPacerTrace(t))
+// TestLogosPlainBuildKeepsUpstreamPacing: a go build with no -gc keeps the
+// upstream pacing; elastic requires the greentea collector mode.
+func TestLogosPlainBuildKeepsUpstreamPacing(t *testing.T) {
+	out := logosPacerRun(t, "LogosPacerForced")
+	if logosElasticLine.MatchString(out) {
+		t.Fatalf("plain go build paced elastically:\n%s", out)
+	}
 }
 
 // TestLogosOtherGCFlagKeepsUpstreamPacingInBuiltProgram: a mode other than
@@ -255,18 +258,18 @@ func TestLogosPacerWasmDefaultLogosKeepsUpstream(t *testing.T) {
 	}
 }
 
-// TestLogosPacerWasmPlainGoPacesElastically: plain go wasm has an empty
-// production-controller mode so it paces elastically; only the logos wasm
-// default (mode wasm) keeps the upstream pacing.
-func TestLogosPacerWasmPlainGoPacesElastically(t *testing.T) {
+// TestLogosPacerWasmPlainGoKeepsUpstream: plain go wasm has an empty
+// production-controller mode, which keeps the upstream pacing like every
+// other empty mode; only an explicit greentea selection paces elastically.
+func TestLogosPacerWasmPlainGoKeepsUpstream(t *testing.T) {
 	env := logosProgramWasmEnv()
 	wasm := logosProgramBuildWasm(t, "go", env)
 	out := logosProgramRunWasm(t, wasm, []string{"GODEBUG=gcpacertrace=1", "GOGC=100", "GOMEMLIMIT=off"})
 	if !strings.Contains(out, "done") {
 		t.Fatalf("wasm program did not finish:\n%s", out)
 	}
-	if !logosElasticLine.MatchString(out) {
-		t.Fatalf("plain go wasm did not pace elastically:\n%s", out)
+	if logosElasticLine.MatchString(out) {
+		t.Fatalf("plain go wasm paced elastically:\n%s", out)
 	}
 }
 

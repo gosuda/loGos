@@ -13,8 +13,8 @@ text under `go`), or `logos.toml [build] gc` under `logos`; cmd/go passes
 `logos build: unknown -gc mode "x"
 (want greentea, zgc, immix, wasm, batch, epsilon)` with the `go build:`
 prefix under plain `go`. Default under `logos` is `greentea`, or `wasm` when
-GOARCH is wasm. An empty production controller mode uses elastic pacing;
-empty test controller modes keep upstream pacing.
+GOARCH is wasm. An empty production controller mode and empty test controller modes
+keep upstream pacing; elastic needs an explicit greentea selection.
 
 - S1 batch and epsilon: `gcPercent = -1` at `gcinit`; batch triggers at 90
   percent of `GOMEMLIMIT` (or physical memory when unset) then runs a stop

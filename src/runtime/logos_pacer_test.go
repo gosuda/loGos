@@ -17,8 +17,7 @@ import (
 	"testing"
 )
 
-// M19-S2 attacks (SPEC Sec 19, T-301.2, #161). Under greentea and under an
-// empty production-controller mode the
+// M19-S2 attacks (SPEC Sec 19, T-301.2, #161). Under the greentea mode the
 // background utilization goal follows the PLAN curve of live heap over
 // heap goal, mark assist stays as backstop, endCycle credits the cycle
 // with the goal it ran with, and an empty test-controller mode keeps the
@@ -324,9 +323,9 @@ func logosUpstreamSplit(procs int) (int64, float64) {
 	return dedicated, 0
 }
 
-// TestLogosEmptyModeKeepsUpstreamPacing: an empty test-controller mode keeps
-// the upstream pacing. An empty production-controller mode paces elastically;
-// the built-program test covers that production path.
+// TestLogosEmptyModeKeepsUpstreamPacing: an empty mode keeps the upstream
+// pacing in the test controller; the built-program test covers the
+// production path.
 func TestLogosEmptyModeKeepsUpstreamPacing(t *testing.T) {
 	if runtime.LogosGCModeIsSTW() {
 		t.Skipf("stop-the-world GC mode (batch or epsilon): elastic pacing is off and every collection stops the world, so there is no concurrent pacing to assert")
@@ -569,8 +568,8 @@ func logosAllocBurst(workers, perWorker int) {
 // BenchmarkLogosAssistShare reports the share of CPU time spent in mark
 // assist, from /cpu/classes/gc/mark/assist:cpu-seconds over
 // /cpu/classes/total:cpu-seconds, for the upstream (wasm) pacing and for greentea.
-// The upstream arm uses wasm because an empty production-controller mode now
-// paces elastically. The target for greentea is a lower share; it is recorded, not asserted.
+// The upstream arm uses wasm because wasm is an upstream-pacing mode.
+// The target for greentea is a lower share; it is recorded, not asserted.
 func BenchmarkLogosAssistShare(b *testing.B) {
 	for _, mode := range []struct{ name, gc string }{{"upstream", "wasm"}, {"greentea", "greentea"}} {
 		b.Run(mode.name, func(b *testing.B) {
