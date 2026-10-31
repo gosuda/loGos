@@ -663,11 +663,9 @@ func isIdent(s string) bool {
 // Decode accepts, so a producer can skip names it cannot spell.
 func ValidObject(s string) bool { return validObject(s) }
 
-// validObject reports whether s is Name, Type.Field, Type.Method, or
-// (*Type).Method.
 func validObject(s string) bool {
-	recv := s
-	if before, after, ok := strings.CutLast(s, "."); ok {
+	recv, _, _ := strings.Cut(s, "@")
+	if before, after, ok := strings.CutLast(recv, "."); ok {
 		if !isIdent(after) {
 			return false
 		}
