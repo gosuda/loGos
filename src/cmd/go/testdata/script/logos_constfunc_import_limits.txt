@@ -1,7 +1,7 @@
 # M5-S2: imported const func step limits and purity rules (T-201, T-102).
 # Caller max_ctfe_steps bounds imported recursive const funcs; purity rejects
-# forbidden I/O and mutable package/imported globals; ordinary imported non-const
-# functions remain strictly rejected at compile time.
+# forbidden I/O, mutable globals, recover, uintptr, map iteration, goroutines,
+# and defer; ordinary imported non-const functions remain strictly rejected at compile time.
 
 env GOPROXY=off
 env GOTOOLCHAIN=local
@@ -64,6 +64,36 @@ cd ..
 cd copy_limit
 ! logos build ./...
 stderr '\[comptime::ctfe_step_limit\]'
+cd ..
+
+# 11. Purity rejects call to recover in const func.
+cd impure_recover
+! logos build ./...
+stderr '\[correctness::const_func_impure\] call to recover in const func'
+cd ..
+
+# 12. Purity rejects conversion to uintptr in const func.
+cd impure_uintptr
+! logos build ./...
+stderr '\[correctness::const_func_impure\] conversion to uintptr in const func'
+cd ..
+
+# 13. Purity rejects ranging over a dynamic map in const func.
+cd impure_map_range
+! logos build ./...
+stderr '\[correctness::const_func_impure\] range over map in const func'
+cd ..
+
+# 14. Purity rejects spawning a goroutine in const func.
+cd impure_goroutine
+! logos build ./...
+stderr '\[correctness::const_func_impure\] goroutine in const func'
+cd ..
+
+# 15. Purity rejects defer in const func.
+cd impure_defer
+! logos build ./...
+stderr '\[correctness::const_func_impure\] defer in const func'
 cd ..
 
 -- reclib/go.mod --
@@ -339,4 +369,100 @@ type Row struct {
 // evaluate Rec(1000) under the selected max_ctfe_steps = 100.
 func main() {
 	println(reclib.GenericSteps[Row]())
+}
+
+-- impure_recover/go.mod --
+module example.com/impurerecover
+
+go 1.27
+
+-- impure_recover/main.lgo --
+package main
+
+const func BadRecover() int {
+	_ = recover()
+	return 1
+}
+
+const V = BadRecover()
+
+func main() {
+	println(V)
+}
+
+-- impure_uintptr/go.mod --
+module example.com/impureuintptr
+
+go 1.27
+
+-- impure_uintptr/main.lgo --
+package main
+
+const func BadUintptr(x int) int {
+	_ = uintptr(x)
+	return x
+}
+
+const V = BadUintptr(1)
+
+func main() {
+	println(V)
+}
+
+-- impure_map_range/go.mod --
+module example.com/impuremaprange
+
+go 1.27
+
+-- impure_map_range/main.lgo --
+package main
+
+const func BadMapRange(m map[string]int) int {
+	total := 0
+	for k := range m {
+		total += len(k)
+	}
+	return total
+}
+
+func main() {
+	println("map-range")
+}
+
+-- impure_goroutine/go.mod --
+module example.com/impuregoroutine
+
+go 1.27
+
+-- impure_goroutine/main.lgo --
+package main
+
+func helper() {}
+
+const func BadGo() int {
+	go helper()
+	return 1
+}
+
+func main() {
+	println("go")
+}
+
+-- impure_defer/go.mod --
+module example.com/impuredefer
+
+go 1.27
+
+-- impure_defer/main.lgo --
+package main
+
+func helper() {}
+
+const func BadDefer() int {
+	defer helper()
+	return 1
+}
+
+func main() {
+	println("defer")
 }

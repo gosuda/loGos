@@ -169,6 +169,20 @@ stderr 'os\.startProcess\(\) +at .*os/exec_posix\.go:\d+'
 ! stderr 'unauthorized_(cgo|net)'
 cd ../..
 
+# Case R: dependency helper whose reflect.ValueOf(...).Method(0) is
+# inlined into its caller still reaches the reflective sink and is
+# denied under transitive_reflect=deny.
+cd r/main
+! logos build -a -gcflags=example.com/rdep=-m -o $WORK/bin/cr$GOEXE ./cmd
+stderr 'inlining call to helper'
+stderr 'inlining call to reflect\.ValueOf'
+stderr 'inlining call to reflect\.Value\.Method'
+stderr 'ERROR \[capabilities::unauthorized_reflect\]: Transitive dependency ''example\.com/rdep'' reaches ''reflect\.ValueOf'''
+stderr 'example\.com/rdep\.Init\(\) +at [^ ]+\.go:\d+'
+stderr 'reflect\.ValueOf\(\)'
+! stderr 'unauthorized_(cgo|exec|net)'
+cd ../..
+
 -- a/main/go.mod --
 module example.com/amain
 
@@ -802,4 +816,58 @@ func Init() {
 	cmd := exec.Command("echo", "hi")
 	m := reflect.ValueOf(cmd).MethodByName("Start")
 	m.Call(nil)
+}
+
+-- r/main/go.mod --
+module example.com/rmain
+
+go 1.27
+
+require example.com/rdep v0.0.0
+
+replace example.com/rdep => ../dep
+
+-- r/main/logos.toml --
+[build]
+opt_level = "O3"
+
+[capabilities]
+transitive_reflect = "deny"
+
+-- r/main/cmd/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/rdep"
+)
+
+func main() {
+	dep.Init()
+	fmt.Println("done")
+}
+
+-- r/dep/go.mod --
+module example.com/rdep
+
+go 1.27
+
+-- r/dep/dep.go --
+package dep
+
+import "reflect"
+
+type Plugin struct{}
+
+func (p *Plugin) Run() string { return "run" }
+
+func helper() {
+	m := reflect.ValueOf(&Plugin{}).Method(0)
+	_ = m
+}
+
+//go:noinline
+func Init() {
+	helper()
 }

@@ -132,8 +132,9 @@ cd ..
 # heap up to the level's stack buffer and takes the heap one byte past
 # it. The expected size is written here beside each command and is never
 # read back from the build under test, so an optimization that stops
-# working fails the probe. src/runtime/logos_mode_gate.bash carries the
-# same level and size pairs for the runtime tests.
+# working fails the probe. This fixture is the single owner of the
+# level-size pairs; standard-library packages never receive the
+# variable-make flag, so their own tests keep the upstream bodies.
 cd stackbuf
 env WANT_STACKBUF=32
 go test -count=1 .
@@ -219,6 +220,47 @@ func TestCompiledStackBuffer(t *testing.T) {
 		if got := allocs(c.n); (got == 0) != c.stack {
 			t.Errorf("make of %d bytes took %v allocations, want the stack buffer of %d bytes to decide: stack=%v", c.n, got, want, c.stack)
 		}
+	}
+}
+
+// appendProbe appends n bytes to a frame-local slice and reports the final
+// capacity and whether every byte survived.
+//
+//go:noinline
+func appendProbe(n int) (int, bool) {
+	s := make([]byte, 0)
+	for i := 0; i < n; i++ {
+		s = append(s, byte(i))
+	}
+	for i := range s {
+		if s[i] != byte(i) {
+			return cap(s), false
+		}
+	}
+	return cap(s), true
+}
+
+// TestBufferBacksAppends proves the buffer is used, not only sized: appends
+// inside it take no heap allocation, one byte past it does, capacity covers
+// the whole buffer, and the bytes survive the move to the heap.
+func TestBufferBacksAppends(t *testing.T) {
+	want, err := strconv.Atoi(os.Getenv("WANT_STACKBUF"))
+	if err != nil || want < 2 {
+		t.Fatalf("WANT_STACKBUF=%q: want a byte count of at least 2", os.Getenv("WANT_STACKBUF"))
+	}
+	if a := testing.AllocsPerRun(10, func() { appendProbe(want) }); a != 0 {
+		t.Errorf("appending %d bytes inside the buffer took %v allocations, want none", want, a)
+	}
+	if c, ok := appendProbe(want); !ok {
+		t.Errorf("data lost after appending %d bytes inside the buffer", want)
+	} else if c < want {
+		t.Errorf("capacity after %d appends is %d, want at least the buffer size", want, c)
+	}
+	if a := testing.AllocsPerRun(10, func() { appendProbe(want + 1) }); a < 1 {
+		t.Errorf("appending %d bytes, one past the buffer, took no heap allocation", want+1)
+	}
+	if _, ok := appendProbe(want + 1); !ok {
+		t.Errorf("data lost across the move past %d bytes", want)
 	}
 }
 

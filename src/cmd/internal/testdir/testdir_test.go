@@ -612,7 +612,16 @@ func (t test) run() error {
 	}
 	// test/logos cases run through the logos harness (see logos_test.go).
 	if routeLogosHarness(t.dir, t.goFile, action, flags) {
-		return t.runLogos(logosCase{action, args, flags, runenv, srcBytes, wantAuto, wantError, tim})
+		c := logosCase{action, args, flags, runenv, srcBytes, wantAuto, wantError, tim}
+		// Isolate plain-Go twins in a throwaway module (same convention as
+		// .lgo) so `go` never walks up to an unrelated parent go.mod such as
+		// /tmp/go.mod. Without a local go.mod the tool warns on stderr and
+		// the merged output mismatches the .out fixture. Lint twins already
+		// run in a throwaway module via runLogosLint, and .lgo via runLogos.
+		if t.dir == "logos" && strings.HasSuffix(t.goFile, ".go") && !strings.HasPrefix(t.goFile, "lint/") {
+			return t.runLogosGoIsolated(c)
+		}
+		return t.runLogos(c)
 	}
 	if action == "errorcheck" {
 		found := false

@@ -364,7 +364,7 @@ func zigCompiler(cmd, startup, kind string) string {
 	if startup != "" {
 		return cmd
 	}
-	if _, err := pathcache.LookPath(cmd); err == nil {
+	if compilerOnPath(cmd) {
 		return cmd
 	}
 	if _, err := pathcache.LookPath("zig"); err != nil {
@@ -374,6 +374,34 @@ func zigCompiler(cmd, startup, kind string) string {
 		return "zig " + kind + " -target " + target
 	}
 	return cmd
+}
+
+// compilerOnPath reports whether cmd is the compiler a cgo build would
+// actually run under the current PATH. The injected default may be an
+// absolute path baked in at toolchain build time; an absolute path is
+// present only when its own directory is on PATH, so hiding the default
+// compiler from PATH still enables the zig fallback.
+func compilerOnPath(cmd string) bool {
+	found, err := pathcache.LookPath(cmd)
+	if err != nil {
+		return false
+	}
+	if !filepath.IsAbs(cmd) {
+		return true
+	}
+	// An absolute default resolves without PATH, so ask whether the same
+	// file is what PATH names for this compiler. Compare file identity, not
+	// directory strings: /bin and /usr/bin are often one directory.
+	viaPath, err := pathcache.LookPath(filepath.Base(cmd))
+	if err != nil {
+		return false
+	}
+	want, err1 := os.Stat(found)
+	got, err2 := os.Stat(viaPath)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return os.SameFile(want, got)
 }
 
 // ZigCC resolves the C compiler for a cgo build given the current CC

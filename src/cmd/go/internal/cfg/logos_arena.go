@@ -5,7 +5,6 @@
 package cfg
 
 import (
-	"os"
 	"strings"
 
 	"cmd/go/internal/logos/config"
@@ -47,17 +46,7 @@ func RefreshLogosArena(mainRoots []string) {
 	if logosAnyRootArena(roots) {
 		raw = withLogosArena(raw)
 	}
-	if raw == RawGOEXPERIMENT {
-		return
-	}
-	RawGOEXPERIMENT = raw
-	recomputeExperiment()
-	os.Setenv("GOEXPERIMENT", RawGOEXPERIMENT)
-	for i := range CmdEnv {
-		if CmdEnv[i].Name == "GOEXPERIMENT" {
-			CmdEnv[i].Value = RawGOEXPERIMENT
-		}
-	}
+	logosApplyRawExperiment(raw)
 }
 
 func logosAnyRootArena(roots []string) bool {
