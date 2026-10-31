@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/escape"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/noder"
 	"cmd/compile/internal/objw"
@@ -685,6 +686,26 @@ func walkCall1(n *ir.CallExpr, init *ir.Nodes) {
 			}
 			hookArgs = append(hookArgs, fakePC(n))
 			init.Append(mkcall(hook.runtimeFunc, nil, init, hookArgs...))
+		}
+	}
+	// Caller-token set: after every argument (including temporaries and
+	// libfuzzer hooks) and immediately before the static call. Only
+	// consenting static calls touch the token; None emits nothing and
+	// leaves the cleared global false for the callee take. Set=>true,
+	// Chain=>caller tok.
+	if buildcfg.Experiment.LogosArena && n.Op() == ir.OCALLFUNC && ir.CurFunc != nil {
+		if callee := ir.StaticCalleeName(n.Fun); callee != nil && callee.Func != nil {
+			if escape.LogosArenaCandidate(callee.Func) {
+				switch escape.LogosArenaCallConsent(n) {
+				case escape.LogosArenaConsentSet:
+					okTrue := typecheck.Expr(ir.NewBinaryExpr(base.Pos, ir.OEQ, ir.NewInt(base.Pos, 0), ir.NewInt(base.Pos, 0)))
+					appendWalkStmt(init, mkcall("logosArenaRetSet", nil, init, okTrue))
+				case escape.LogosArenaConsentChain:
+					if tok, ok := logosArenaRetTok[ir.CurFunc]; ok && tok != nil {
+						appendWalkStmt(init, mkcall("logosArenaRetSet", nil, init, tok))
+					}
+				}
+			}
 		}
 	}
 }

@@ -16,7 +16,7 @@ import (
 	"weak"
 )
 
-// M19-S4 attacks for GOEXPERIMENT=logosgen: a card table, minor cycles
+// M19-S4 attacks for the stable generational default (amd64 && goexperiment.GreenTeaGC): a card table, minor cycles
 // that skip mature spans, and a full cycle after four minor cycles.
 
 // genHolder is a pointer-bearing object larger than the small-object
@@ -24,6 +24,7 @@ import (
 type genHolder struct{ slots [5000]unsafe.Pointer }
 
 var genRoot *genHolder
+var genAgeTarget *genHolder
 
 // genQuiet disables heap-triggered cycles so each test controls every
 // cycle and the span ages are exact.
@@ -61,7 +62,7 @@ func genClearSlot(h *genHolder) {
 
 func TestLogosGenActive(t *testing.T) {
 	if !runtime.LogosGenActive() {
-		t.Fatal("logosgen is built in but the collector is not generational")
+		t.Fatal("generational collector is not active on the amd64 GreenTeaGC default")
 	}
 }
 
@@ -171,6 +172,40 @@ func TestLogosGenMaturityScansOnlyDirtyCards(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestLogosGenAgeOneEdgeKeepsCardDirty(t *testing.T) {
+	genQuiet(t)
+	runtime.GC()
+	genRoot = new(genHolder)
+	defer func() { genRoot = nil }()
+	h := genRoot
+	genAgeTarget = new(genHolder)
+	defer func() { genAgeTarget = nil }()
+	target := genAgeTarget
+	runtime.LogosGenMinorCycle()
+	if got := runtime.LogosGenSpanAge(unsafe.Pointer(target)); got != 1 {
+		t.Fatalf("target span age = %d, want 1 (exactly one survived minor cycle)", got)
+	}
+	*(*uintptr)(unsafe.Pointer(&h.slots[0])) = uintptr(unsafe.Pointer(target))
+	if !runtime.LogosGenPromoteObjectForTest(unsafe.Pointer(h)) {
+		t.Fatal("promote with an age-1 pointee did not dirty the holder card (fails under the old age==0 predicate)")
+	}
+	genClearSlot(h)
+	runtime.KeepAlive(target)
+	runtime.KeepAlive(h)
+}
+
+func TestLogosGenScratchDrainMarksCardAndClears(t *testing.T) {
+	genQuiet(t)
+	runtime.GC()
+	genRoot = new(genHolder)
+	defer func() { genRoot = nil }()
+	obj := genRoot
+	if !runtime.LogosGenDrainScratchForTest(unsafe.Pointer(obj)) {
+		t.Fatal("M scratch drain did not mark the card and clear every scratch word")
+	}
+	runtime.KeepAlive(obj)
 }
 
 func TestLogosGenMatureGarbageWaitsForFullCycle(t *testing.T) {

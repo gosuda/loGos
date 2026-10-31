@@ -14,20 +14,11 @@ const reservedPrefix = "_logos_"
 
 // insideGenerated reports whether the lowered offset o lies strictly inside
 // text the lowering wrote. The first and last offsets of generated text are
-// seams with the user's own text, and do not count.
+// seams with the user's own text, and do not count: the answer comes from
+// the origin segments, so it is exact, not a span-geometry guess.
 func (m *posMap) insideGenerated(o int) bool {
-	shift := 0
-	for _, s := range m.spans {
-		start := s.Start + shift
-		if o <= start {
-			return false
-		}
-		if o < start+s.Len {
-			return true
-		}
-		shift += s.Len - (s.End - s.Start)
-	}
-	return false
+	_, generated := m.origOffset(o, leading)
+	return generated
 }
 
 // prepareResult removes from a decoded gopls result, still in the

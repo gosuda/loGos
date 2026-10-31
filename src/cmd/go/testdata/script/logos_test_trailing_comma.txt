@@ -1,0 +1,132 @@
+# Trailing comma in test signatures: single-line and multiline Test,
+# Benchmark, Fuzz, and TestMain shapes with one trailing comma run; an
+# extra parameter and a wrong parameter type still fail.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+# Single-line trailing comma shapes run.
+logos test ./single
+stdout '^ok'
+
+# Multiline trailing comma shapes run.
+logos test ./multi
+stdout '^ok'
+
+# Benchmark shapes with trailing commas are discovered and run.
+logos test -bench=. -run=^$ ./single ./multi
+stdout '^ok'
+
+# Extra parameter still rejected.
+! logos test ./badextra
+stderr 'wrong signature'
+
+# Wrong parameter type still rejected.
+! logos test ./badtype
+stderr 'wrong signature'
+
+-- go.mod --
+module example.com/trailingcomma
+
+go 1.27
+
+-- single/p.lgo --
+package single
+
+func Add(a, b int) int { return a + b }
+
+-- single/p_test.lgo --
+package single
+
+import "testing"
+import "os"
+
+func TestSingleComma(t *testing.T,) {
+	if Add(1, 2) != 3 {
+		t.Fatal("bad add")
+	}
+}
+
+func BenchmarkSingleComma(b *testing.B,) {
+	for i := 0; i < b.N; i++ {
+		Add(1, 2)
+	}
+}
+
+func FuzzSingleComma(f *testing.F,) {
+	f.Add(1, 2)
+	f.Fuzz(func(t *testing.T, a, b int) {
+		Add(a, b)
+	})
+}
+
+func TestMain(m *testing.M,) {
+	os.Exit(m.Run())
+}
+
+-- multi/p.lgo --
+package multi
+
+func Add(a, b int) int { return a + b }
+
+-- multi/p_test.lgo --
+package multi
+
+import "testing"
+import "os"
+
+func TestMultiComma(
+	t *testing.T,
+) {
+	if Add(1, 2) != 3 {
+		t.Fatal("bad add")
+	}
+}
+
+func BenchmarkMultiComma(
+	b *testing.B,
+) {
+	for i := 0; i < b.N; i++ {
+		Add(1, 2)
+	}
+}
+
+func FuzzMultiComma(
+	f *testing.F,
+) {
+	f.Add(1, 2)
+	f.Fuzz(func(t *testing.T, a, b int) {
+		Add(a, b)
+	})
+}
+
+func TestMain(
+	m *testing.M,
+) {
+	os.Exit(m.Run())
+}
+
+-- badextra/p.lgo --
+package badextra
+
+func Add(a, b int) int { return a + b }
+
+-- badextra/p_test.lgo --
+package badextra
+
+import "testing"
+
+func TestBadExtra(t *testing.T, x int) {
+}
+
+-- badtype/p.lgo --
+package badtype
+
+func Add(a, b int) int { return a + b }
+
+-- badtype/p_test.lgo --
+package badtype
+
+import "testing"
+
+func TestBadType(t *int,) {
+}

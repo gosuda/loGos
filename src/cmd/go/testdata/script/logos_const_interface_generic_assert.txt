@@ -1,0 +1,544 @@
+# T-201 Qual generic: ordinary `As[T any](x any) T { return x.(T) }`
+# declarations stay legal and serve `As[int]`/`As[Good]`; only
+# instantiations to a qualified interface (`As[Qualified](mutAny)`)
+# manufacture an unchecked contract because runtime Go erases the
+# readonly bit. The same instantiation hole exists through a generic
+# receiver (`ProjBox[T].Project`), a transitive wrapper, a closure
+# wrapping the instantiation, a type-switch case naming T, nested
+# anonymous interface targets holding T, and a >64 parameter-index
+# instantiation. All rejections reuse the existing
+# [correctness::const_view_mutation] code; no new diagnostic is pinned.
+# Benign instantiations stay allowed: Identity[Qualified] over proven
+# Good, As[int]/As[Good], storage-only StoreBox (separate from asserting
+# ProjBox so the positive control is not contradictory), and `any` to
+# concrete Good then assignment to Qualified. Imported facts keep their
+# effect in both directions: lgo-exported generics instantiated to an
+# imported Qualified from Go, and Go-exported generics instantiated to an
+# imported Qualified from lgo, are both rejected; an ordinary Go importer
+# cannot forge through the erased signature. Each module stays
+# homogeneous (all-.lgo or all-.go); imports between Go and lgo modules
+# are expressly supported. Behavior is proven by installed `logos build`/
+# `logos run` output, never source grep.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+mkdir $WORK/bin
+
+# Case 1: allowed generic half runs. Ordinary declarations serve
+# As[int]/As[Good]/WrapAs[int]; Identity[Qualified] over proven Good,
+# storage-only StoreBox, and any-to-Good-then-Qualified all run to
+# lgo-ok / go-ok. No Qualified instantiation from any/ordinary runs.
+cd w
+logos build ./...
+logos build -o $WORK/bin/genassert$GOEXE ./l/cmd
+exec $WORK/bin/genassert$GOEXE
+stdout '^lgo-ok$'
+logos build -o $WORK/bin/gogenassert$GOEXE ./g/cmd
+exec $WORK/bin/gogenassert$GOEXE
+stdout '^go-ok$'
+cd ..
+
+# golib alone builds: the ordinary Go generic declaration is legal; the
+# forgery appears only at Qualified instantiation in importers below.
+cd golib
+logos build ./...
+cd ..
+
+# Case 2: lgo forging instantiations rejected, including the lgo
+# importer of the Go-exported generic. Only const_view_mutation is
+# pinned; each package pins one instantiation shape over the imported
+# Qualified so the imported readonly fact must still trigger.
+cd neg
+! logos build ./as
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./receiver
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./wrap
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./closure
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./gswitch
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./composite
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./nested
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./big
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./inst
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./goimport
+stderr '\[correctness::const_view_mutation\]'
+cd ..
+
+# Case 3: Go importers cannot forge. The Go package instantiates the
+# Go-exported generic and the lgo-exported generic to the imported lgo
+# Qualified; logos still rejects through the erased signature.
+cd gneg
+! logos build ./...
+stderr '\[correctness::const_view_mutation\]'
+cd ..
+
+-- w/go.work --
+go 1.27
+
+use (
+	./l
+	./g
+)
+
+-- w/l/go.mod --
+module example.com/l
+
+go 1.27
+
+-- w/l/c/c.lgo --
+package c
+
+type Qualified interface {
+	const Name() string
+}
+
+type Good struct {
+	name string
+}
+
+func (g Good) Name() string {
+	return g.name
+}
+
+func Make(name string) Good {
+	return Good{name: name}
+}
+
+func Identity[T any](x T) T {
+	return x
+}
+
+func GenericAs[T any](x any) T {
+	return x.(T)
+}
+
+func WrapAs[T any](x any) T {
+	return GenericAs[T](x)
+}
+
+type StoreBox[T any] struct {
+	V T
+}
+
+func (b StoreBox[T]) Get() T {
+	return b.V
+}
+
+type Box[T any] struct {
+	V T
+}
+
+func (b Box[T]) As(x any) T {
+	return x.(T)
+}
+
+type HasGet[T any] interface {
+	const Name() string
+	Get() T
+}
+
+func CompositeAs[T Qualified](x any) HasGet[T] {
+	return x.(HasGet[T])
+}
+
+type Inner[T any] interface {
+	const Name() string
+	Get() T
+}
+
+type Outer[T any] interface {
+	const Name() string
+	Get() Inner[T]
+}
+
+func NestedAs[T Qualified](x any) Outer[T] {
+	return x.(Outer[T])
+}
+
+func SwitchAs[T Qualified](x any) string {
+	switch x.(type) {
+	case T:
+		return "hit"
+	default:
+		return "miss"
+	}
+}
+
+-- w/l/q/q.lgo --
+package q
+
+import "example.com/l/c"
+
+func ViaIdentity(g c.Good) string {
+	return c.Identity[c.Qualified](g).Name()
+}
+
+func ViaAsInt() int {
+	return c.GenericAs[int](any(41))
+}
+
+func ViaAsGood(g c.Good) string {
+	var v any = g
+	return c.GenericAs[c.Good](v).Name()
+}
+
+func ViaWrapInt() int {
+	return c.WrapAs[int](any(7)) + 1
+}
+
+func ViaStoreBox(g c.Good) string {
+	b := c.StoreBox[c.Qualified]{V: g}
+	return b.Get().Name()
+}
+
+func ViaConcrete(v any) string {
+	g := v.(c.Good)
+	var q c.Qualified = g
+	return q.Name()
+}
+
+func Run() string {
+	g := c.Make("ada")
+	if ViaIdentity(g) != "ada" {
+		return "bad-identity"
+	}
+	if ViaAsInt() != 41 {
+		return "bad-asint"
+	}
+	if ViaAsGood(g) != "ada" {
+		return "bad-asgood"
+	}
+	if ViaWrapInt() != 8 {
+		return "bad-wrap"
+	}
+	if ViaStoreBox(g) != "ada" {
+		return "bad-storebox"
+	}
+	var v any = c.Make("via")
+	if ViaConcrete(v) != "via" {
+		return "bad-concrete"
+	}
+	if c.Identity[int](7) != 7 {
+		return "bad-int"
+	}
+	if (c.StoreBox[int]{V: 41}).Get()+1 != 42 {
+		return "bad-intbox"
+	}
+	return "lgo-ok"
+}
+
+-- w/l/cmd/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/l/q"
+)
+
+func main() {
+	fmt.Println(q.Run())
+}
+
+-- w/g/go.mod --
+module example.com/g
+
+go 1.27
+
+-- w/g/qq/qq.go --
+package qq
+
+import "example.com/l/c"
+
+func Run() string {
+	g := c.Make("ada")
+	if c.Identity[c.Qualified](g).Name() != "ada" {
+		return "bad-identity"
+	}
+	if c.GenericAs[int](any(41)) != 41 {
+		return "bad-asint"
+	}
+	var v any = g
+	if c.GenericAs[c.Good](v).Name() != "ada" {
+		return "bad-asgood"
+	}
+	if c.WrapAs[int](any(7))+1 != 8 {
+		return "bad-wrap"
+	}
+	b := c.StoreBox[c.Qualified]{V: g}
+	if b.Get().Name() != "ada" {
+		return "bad-storebox"
+	}
+	var vv any = c.Make("via")
+	gg := vv.(c.Good)
+	var q c.Qualified = gg
+	if q.Name() != "via" {
+		return "bad-concrete"
+	}
+	return "go-ok"
+}
+
+-- w/g/cmd/main.go --
+package main
+
+import (
+	"fmt"
+
+	"example.com/g/qq"
+)
+
+func main() { fmt.Println(qq.Run()) }
+
+-- golib/go.mod --
+module example.com/golib
+
+go 1.27
+
+-- golib/lib.go --
+// Go-exported ordinary generic declaration: legal as declared. The
+// forgery appears only when an lgo importer instantiates it to the
+// imported Qualified (neg/goimport) or a Go importer does (gneg).
+package lib
+
+func GenericAs[T any](x any) T {
+	return x.(T)
+}
+
+-- neg/go.mod --
+module example.com/neg
+
+go 1.27
+
+require example.com/golib v0.0.0
+
+replace example.com/golib => ../golib
+
+-- neg/c/c.lgo --
+package c
+
+type Qualified interface {
+	const Name() string
+}
+
+type Good struct {
+	name string
+}
+
+func (g Good) Name() string {
+	return g.name
+}
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Name() string {
+	m.S[0] = 1
+	return "mut"
+}
+
+// Ordinary lgo-exported generic declarations: legal as declared.
+// Importers below instantiate them to the imported Qualified.
+func GenericAs[T any](x any) T {
+	return x.(T)
+}
+
+func WrapAs[T any](x any) T {
+	return GenericAs[T](x)
+}
+
+type StoreBox[T any] struct {
+	V T
+}
+
+func (b StoreBox[T]) Get() T {
+	return b.V
+}
+
+type Box[T any] struct {
+	V T
+}
+
+func (b Box[T]) As(x any) T {
+	return x.(T)
+}
+
+type HasGet[T any] interface {
+	const Name() string
+	Get() T
+}
+
+func CompositeAs[T Qualified](x any) HasGet[T] {
+	return x.(HasGet[T])
+}
+
+type Inner[T any] interface {
+	const Name() string
+	Get() T
+}
+
+type Outer[T any] interface {
+	const Name() string
+	Get() Inner[T]
+}
+
+func NestedAs[T Qualified](x any) Outer[T] {
+	return x.(Outer[T])
+}
+
+func SwitchAs[T Qualified](x any) string {
+	switch x.(type) {
+	case T:
+		return "hit"
+	default:
+		return "miss"
+	}
+}
+
+func BigAs[T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23, T24, T25, T26, T27, T28, T29, T30, T31, T32, T33, T34, T35, T36, T37, T38, T39, T40, T41, T42, T43, T44, T45, T46, T47, T48, T49, T50, T51, T52, T53, T54, T55, T56, T57, T58, T59, T60, T61, T62, T63, T64, T65 any](x any) T65 {
+	return x.(T65)
+}
+
+-- neg/as/as.lgo --
+package as
+
+import "example.com/neg/c"
+
+func Attack(v any) c.Qualified {
+	return c.GenericAs[c.Qualified](v)
+}
+
+-- neg/receiver/receiver.lgo --
+package receiver
+
+import "example.com/neg/c"
+
+func Attack(v any) c.Qualified {
+	var b c.Box[c.Qualified]
+	return b.As(v)
+}
+
+-- neg/wrap/wrap.lgo --
+package wrap
+
+import "example.com/neg/c"
+
+func Attack(v any) c.Qualified {
+	return c.WrapAs[c.Qualified](v)
+}
+
+-- neg/closure/closure.lgo --
+package closure
+
+import "example.com/neg/c"
+
+func Attack(v any) c.Qualified {
+	f := func() c.Qualified {
+		return c.GenericAs[c.Qualified](v)
+	}
+	return f()
+}
+
+-- neg/gswitch/gswitch.lgo --
+package gswitch
+
+import "example.com/neg/c"
+
+func Attack(v any) string {
+	return c.SwitchAs[c.Qualified](v)
+}
+
+-- neg/composite/composite.lgo --
+package composite
+
+import "example.com/neg/c"
+
+func Attack(v any) c.HasGet[c.Qualified] {
+	return c.CompositeAs[c.Qualified](v)
+}
+
+-- neg/nested/nested.lgo --
+package nested
+
+import "example.com/neg/c"
+
+func Attack(v any) c.Outer[c.Qualified] {
+	return c.NestedAs[c.Qualified](v)
+}
+
+-- neg/big/big.lgo --
+package big
+
+import "example.com/neg/c"
+
+func Attack(v any) c.Qualified {
+	return c.BigAs[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, c.Qualified](v)
+}
+
+-- neg/inst/inst.lgo --
+package inst
+
+import "example.com/neg/c"
+
+func AttackMut(m c.Mut) c.Qualified {
+	var v any = m
+	return c.GenericAs[c.Qualified](v)
+}
+
+-- neg/goimport/goimport.lgo --
+package goimport
+
+import (
+	golib "example.com/golib"
+	"example.com/neg/c"
+)
+
+func Attack(v any) c.Qualified {
+	return golib.GenericAs[c.Qualified](v)
+}
+
+-- gneg/go.mod --
+module example.com/gneg
+
+go 1.27
+
+require (
+	example.com/golib v0.0.0
+	example.com/l v0.0.0
+)
+
+replace (
+	example.com/golib => ../golib
+	example.com/l => ../w/l
+)
+
+-- gneg/lib/lib.go --
+// Go-local ordinary generic declaration: legal as declared.
+package lib
+
+func GenericAs[T any](x any) T {
+	return x.(T)
+}
+
+-- gneg/main.go --
+package main
+
+import (
+	"example.com/gneg/lib"
+	golib "example.com/golib"
+	"example.com/l/c"
+)
+
+func main() {
+	var v any = "mut"
+	println(lib.GenericAs[c.Qualified](v).Name())
+	println(golib.GenericAs[c.Qualified](v).Name())
+	println(c.GenericAs[c.Qualified](v).Name())
+}

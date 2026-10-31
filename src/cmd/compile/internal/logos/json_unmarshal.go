@@ -126,11 +126,48 @@ func (js *jsonStruct) valueLines(f *jsonField) []string {
 	case shapeUnion:
 		return js.unionLines(f, field)
 	case shapeFallback:
+		if f.quoted {
+			if isExactNumber(f.typ) || hasUnmarshalMethods(f.typ) {
+				return []string{fmt.Sprintf("_logos_s.FallbackQ(&%s)", field)}
+			}
+			if kind, ok := fallbackScalarKind(f.typ); ok {
+				return js.fallbackQuotedValueLines(f, field, kind)
+			}
+		}
 		return []string{fmt.Sprintf("_logos_s.Fallback(&%s)", field)}
 	default:
 		base.Fatalf("logos: unhandled shape kind %v for %s", f.shape.kind, f.goName)
 		return nil
 	}
+}
+
+// fallbackQuotedValueLines spells the decoding of a fallback scalar carrying
+// the `string` option when the type has no unmarshal-side JSON methods: the
+// quoted scalar reader (IntQ, UintQ, FloatQ, BoolQ, StringQ) for its
+// underlying kind. Method types keep the reflective Fallback, which the
+// encoder already handles with method-wins precedence.
+func (js *jsonStruct) fallbackQuotedValueLines(f *jsonField, field string, kind scalarKind) []string {
+	u := types2.Unalias(f.typ)
+	if cv, ok := u.(*types2.ConstView); ok {
+		u = types2.Unalias(cv.Elem)
+	}
+	_, isPtr := u.(*types2.Pointer)
+	tmp := &jsonField{
+		goName:    f.goName,
+		key:       f.key,
+		omitEmpty: f.omitEmpty,
+		omitZero:  f.omitZero,
+		quoted:    true,
+		pos:       f.pos,
+		required:  f.required,
+		typ:       f.typ,
+	}
+	if isPtr {
+		tmp.shape = jsonShape{kind: shapePointer, scalar: kind, nonNil: f.shape.nonNil}
+		return tmp.pointerLines(field)
+	}
+	tmp.shape = jsonShape{kind: shapeScalar, scalar: kind}
+	return []string{fmt.Sprintf("%s(&_logos_s, &%s)", tmp.codec().decodeFn(), field)}
 }
 
 // unionLines spells the decoding of a closed union: trials in declaration order

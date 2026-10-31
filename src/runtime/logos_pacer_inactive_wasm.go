@@ -48,3 +48,10 @@ func (c *gcControllerState) logosElasticRevise(live, goal uint64) {
 func (c *gcControllerState) logosElasticEndUtilization(utilization float64, now int64, procs int) float64 {
 	return utilization
 }
+
+// logosIdleMarkWorkerMax keeps the upstream idle-worker bound in the
+// inactive build: maxmcount is 10,000 by default and wasm runs on a
+// single P, so the upstream procs-dedicated value already fits.
+func logosIdleMarkWorkerMax(procs int, dedicated int64) int32 {
+	return int32(int64(procs) - dedicated)
+}

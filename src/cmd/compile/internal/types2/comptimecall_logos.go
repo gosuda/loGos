@@ -32,7 +32,9 @@ type logosPredState struct {
 // a comptime generic). Every other call keeps the normal check, so the
 // arguments and results are still typed; Error messages go out through a
 // deferred check that reads the checked constant, keeping error matching
-// per-line.
+// per-line. ViewAs keeps the normal check under its own M7-S5
+// validation, and unknown names keep the upstream undefined-selector
+// diagnostic.
 func (check *Checker) logosComptimeCall(x *operand, call *syntax.CallExpr) bool {
 	sel, fname, ok := check.logosComptimeQualifier(call)
 	if !ok {
@@ -48,10 +50,17 @@ func (check *Checker) logosComptimeCall(x *operand, call *syntax.CallExpr) bool 
 		}
 	}
 	switch {
+	// Invariant (predicate fold): an IsStruct call in a `const if`
+	// condition position is answered here, never falls through.
 	case fname == "IsStruct" && check.logosPred.depth > 0 && check.logosIsStruct(x, call):
 		return true
+	// Invariant (compile-time only): value-returning comptime calls
+	// outside their compile-time positions fail closed here; the
+	// normal check still types arguments and results.
 	case fname == "Fields", fname == "IsStruct", fname == "TypeOf":
 		check.errorf(syntax.StartPos(call), InvalidPkgUse, "[comptime::runtime_use] comptime.%s is compile-time only", fname)
+	// Invariant (deferred error): Error messages go out through a
+	// deferred check reading the checked constant, keeping per-line matching.
 	case fname == "Error":
 		check.logosComptimeError(call)
 	}
@@ -99,7 +108,10 @@ func (check *Checker) logosIsStruct(x *operand, call *syntax.CallExpr) bool {
 // e is one of the deferred predicate calls. The connectives `!`, `&&`,
 // `||`, `==`, `!=` and parentheses are looked through; a constant leaf
 // is a typed constant recorded in Info.Types or an untyped constant
-// still waiting in the untyped table.
+// still waiting in the untyped table. Short-circuit constants do not
+// fold here: `true || p` stays deferred and the copies fold it per
+// instantiation, so no constant branch is ever proven from a deferred
+// predicate.
 func (check *Checker) logosPredOnly(e syntax.Expr, calls map[*syntax.CallExpr]bool) bool {
 	switch e := e.(type) {
 	case *syntax.ParenExpr:
@@ -117,9 +129,26 @@ func (check *Checker) logosPredOnly(e syntax.Expr, calls map[*syntax.CallExpr]bo
 	return check.logosConstLeaf(e)
 }
 
+// logosChecked returns the type and constant value recorded for e: the
+// Info.Types entry when that map exists, else the syntax-node store the
+// compiler fills (Info.TypeOf reads the same two places). ok is false
+// when nothing is recorded.
+func (check *Checker) logosChecked(e syntax.Expr) (Type, constant.Value, bool) {
+	if m := check.Info.Types; m != nil {
+		tv, ok := m[e]
+		return tv.Type, tv.Value, ok
+	}
+	if check.Info.StoreTypesInSyntax {
+		if tv := e.GetTypeInfo(); tv.Type != nil {
+			return tv.Type, tv.Value, true
+		}
+	}
+	return nil, nil, false
+}
+
 // logosConstLeaf reports whether e was checked to a constant.
 func (check *Checker) logosConstLeaf(e syntax.Expr) bool {
-	if tv, ok := check.Info.Types[e]; ok && tv.Value != nil {
+	if _, val, ok := check.logosChecked(e); ok && val != nil {
 		return true
 	}
 	info, ok := check.untyped[e]
@@ -153,25 +182,62 @@ func (check *Checker) logosGenericFieldType(e syntax.Expr) bool {
 // call in a dead const-if branch (M7-S1) is silent; any other live call
 // with a constant message fails with that message, and a
 // non-constant message fails as not constant.
+// logosComptimeInGeneric reports whether the call sits inside a generic
+// function declaration: only declarations with a function type-parameter
+// list get per-instantiation copies, so only those defer and the copies
+// answer. A method of a generic type with no function type parameters
+// is never copied, so a call there answers eagerly at the first check
+// and the diagnostic cannot vanish. It reads the declaration stack, not
+// a global, so lowered rechecks (fresh checkers sharing Info) decide
+// from their own concrete copies.
+func (check *Checker) logosComptimeInGeneric() bool {
+	// Invariant (innermost decl): the current signature's own function
+	// type parameters defer the call to per-instantiation copies.
+	if check.sig != nil && check.sig.TypeParams().Len() > 0 {
+		return true
+	}
+	for _, sig := range check.logosFuncSigs {
+		// Invariant (enclosing decl): an outer generic function
+		// declaration defers the call too; its copy answers per
+		// instantiation.
+		if sig != nil && sig.TypeParams().Len() > 0 {
+			return true
+		}
+	}
+	// Invariant (concrete): no enclosing function type parameters means
+	// the first check answers directly.
+	return false
+}
+
 func (check *Checker) logosComptimeError(call *syntax.CallExpr) {
-	generic := check.sig != nil && check.sig.TypeParams().Len() > 0
+	// Invariant (deferral): generic instantiations answer per copy.
+	generic := check.logosComptimeInGeneric()
+	// Invariant (dead silence): M7-S1 dead-branch membership is the
+	// first-check Info proof, shared with lowered rechecks.
 	dead := check.Info.LogosConstIfDead[check.logosCurStmt]
 	var arg syntax.Expr
 	if len(call.ArgList) == 1 {
 		arg = call.ArgList[0]
 	}
 	check.later(func() {
+		// Invariant (no double report): malformed, generic-deferred,
+		// or dead-branch calls stay silent here.
 		if arg == nil || generic || dead {
 			return
 		}
-		tv, ok := check.Info.Types[arg]
-		if !ok || !isValid(tv.Type) || !isString(tv.Type) {
+		typ, val, ok := check.logosChecked(arg)
+		// Invariant (typed-mirror): untyped or non-string arguments
+		// keep the normal check's diagnostic, never a second one.
+		if !ok || !isValid(typ) || !isString(typ) {
 			return
 		}
-		if tv.Value == nil || tv.Value.Kind() != constant.String {
+		// Invariant (constant obligation): a live non-constant message
+		// fails as not constant without weakening the text.
+		if val == nil || val.Kind() != constant.String {
 			check.error(arg.Pos(), InvalidConstInit, "[comptime::error_not_constant] comptime.Error needs a constant message")
 			return
 		}
-		check.errorf(arg.Pos(), InvalidConstInit, "[comptime::error] %s", constant.StringVal(tv.Value))
+		// Invariant (live error): a live constant message fails with its text.
+		check.errorf(arg.Pos(), InvalidConstInit, "[comptime::error] %s", constant.StringVal(val))
 	}).describef(call, "comptime.Error %s", call.Pos())
 }

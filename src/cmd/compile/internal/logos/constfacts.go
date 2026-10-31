@@ -5,9 +5,10 @@
 package logos
 
 import (
+	"bytes"
+	"encoding/hex"
 	"fmt"
 	"slices"
-	"strconv"
 
 	"cmd/compile/internal/logos/facts"
 	"cmd/compile/internal/syntax"
@@ -207,13 +208,10 @@ type constFuncDecl struct {
 // imported callees consult the recorded facts.
 func emitConstMutations(pkg *types2.Package, info *types2.Info, files []*syntax.File, f *facts.Facts) {
 	decls := collectConstFuncDecls(pkg, info, files)
-	if len(decls) == 0 {
-		return
-	}
 	recvMut := make(map[*types2.Func]bool, len(decls))
-	paramMask := make(map[*types2.Func]uint64, len(decls))
+	paramMask := make(map[*types2.Func][]byte, len(decls))
 	for _, d := range decls {
-		paramMask[d.obj] = 0
+		paramMask[d.obj] = []byte{}
 	}
 	for range len(decls) + 1 {
 		changed := false
@@ -224,7 +222,7 @@ func emitConstMutations(pkg *types2.Package, info *types2.Info, files []*syntax.
 				recvMut[d.obj] = true
 				changed = true
 			}
-			if mask != paramMask[d.obj] {
+			if !bytes.Equal(mask, paramMask[d.obj]) {
 				paramMask[d.obj] = mask
 				changed = true
 			}
@@ -234,38 +232,466 @@ func emitConstMutations(pkg *types2.Package, info *types2.Info, files []*syntax.
 		}
 	}
 	for _, d := range decls {
-		if !recvMut[d.obj] && paramMask[d.obj] == 0 {
+		if !recvMut[d.obj] && len(paramMask[d.obj]) == 0 {
 			continue
 		}
-		entry := -1
-		for i := range f.Fns {
-			if f.Fns[i].Object == d.name {
-				entry = i
-				break
-			}
-		}
-		if entry < 0 {
-			f.Fns = append(f.Fns, facts.FnFact{Object: d.name})
-			entry = len(f.Fns) - 1
-		}
-		fn := &f.Fns[entry]
+		fn := findOrCreateFnFact(f, d.name)
 		fn.ReceiverMutated = fn.ReceiverMutated || recvMut[d.obj]
 		fn.ParamMutated = orHexMask(fn.ParamMutated, paramMask[d.obj])
 	}
+	emitReadonlyFacts(pkg, f, decls, recvMut, paramMask)
 }
 
-func orHexMask(have string, add uint64) string {
-	var cur uint64
-	if have != "" {
-		if v, err := strconv.ParseUint(have, 16, 64); err == nil {
-			cur = v
+func findOrCreateFnFact(f *facts.Facts, object string) *facts.FnFact {
+	for i := range f.Fns {
+		if f.Fns[i].Object == object {
+			return &f.Fns[i]
 		}
 	}
-	cur |= add
-	if cur == 0 {
-		return ""
+	f.Fns = append(f.Fns, facts.FnFact{Object: object})
+	return &f.Fns[len(f.Fns)-1]
+}
+
+func emitReadonlyFacts(pkg *types2.Package, f *facts.Facts, decls []constFuncDecl, recvMut map[*types2.Func]bool, paramMask map[*types2.Func][]byte) {
+	for _, d := range decls {
+		if d.obj == nil || !d.obj.LogosReadonly() {
+			continue
+		}
+		if d.sig != nil {
+			if tp := d.sig.TypeParams(); tp != nil && tp.Len() > 0 {
+				continue
+			}
+			if rp := d.sig.RecvTypeParams(); rp != nil && rp.Len() > 0 {
+				continue
+			}
+			if d.sig.Recv() != nil {
+				if named, ok := constRecvBase(d.sig.Recv().Type()).(*types2.Named); ok {
+					if tp := named.TypeParams(); tp != nil && tp.Len() > 0 {
+						continue
+					}
+				}
+			}
+		}
+		if recvMut[d.obj] || len(paramMask[d.obj]) != 0 {
+			continue
+		}
+		fn := findOrCreateFnFact(f, d.name)
+		fn.Readonly = true
+		if fn.ParamMutated == "" {
+			// The mutation analysis ran over this body and proved it
+			// clean; record the explicit zero so the consumer rule does
+			// not read this readonly-only record as unknown mutation.
+			// Abstract I.M records below carry no body and stay without
+			// ParamMutated: unknown, which is correct.
+			fn.ParamMutated = "0"
+		}
 	}
-	return strconv.FormatUint(cur, 16)
+	scope := pkg.Scope()
+	if scope == nil {
+		return
+	}
+	for _, name := range scope.Names() {
+		obj, ok := scope.Lookup(name).(*types2.TypeName)
+		if !ok || obj == nil || !obj.Exported() || obj.IsAlias() {
+			continue
+		}
+		named, ok := obj.Type().(*types2.Named)
+		if !ok {
+			continue
+		}
+		u, ok := named.Underlying().(*types2.Interface)
+		if !ok {
+			continue
+		}
+		for i := range u.NumExplicitMethods() {
+			m := u.ExplicitMethod(i)
+			if m == nil || !m.Exported() {
+				continue
+			}
+			if !m.LogosReadonly() {
+				continue
+			}
+			findOrCreateFnFact(f, name+"."+m.Name()).Readonly = true
+		}
+	}
+	emitReadonlyNestedFacts(pkg, f)
+}
+
+// EmitAssertEffects records generic assertion-effect masks for pkg into f
+// (allocating it when nil) and returns f. For every exported generic
+// package-level function it records the function's own type-parameter and
+// receiver type-parameter masks; for every method, including unexported
+// ones reachable through dynamic dispatch, of every exported non-alias
+// generic named type it records the method origin's receiver mask with an
+// empty function mask. Objects use the T.M / (*T).M method spelling shared
+// with the opt and const records. Masks render through
+// types2.LogosAssertMaskHex (empty is "0"); every record sets HasAssert
+// because local analysis is complete at emission. Unexported functions and
+// non-generic declarations record nothing; effects that report unknown are
+// skipped so the consumer fails closed. Existing FnFact entries for the
+// same object are merged, never replaced.
+func EmitAssertEffects(pkg *types2.Package, f *facts.Facts) *facts.Facts {
+	if pkg == nil || pkg.Scope() == nil {
+		return f
+	}
+	if f == nil {
+		tmp := &facts.Facts{}
+		emitAssertEffects(pkg, tmp)
+		if len(tmp.Fns) == 0 {
+			return nil
+		}
+		return tmp
+	}
+	emitAssertEffects(pkg, f)
+	return f
+}
+
+func emitAssertEffects(pkg *types2.Package, f *facts.Facts) {
+	scope := pkg.Scope()
+	if scope == nil {
+		return
+	}
+	for _, name := range scope.Names() {
+		obj, ok := scope.Lookup(name).(*types2.Func)
+		if !ok || obj == nil || !obj.Exported() {
+			continue
+		}
+		sig, ok := obj.Type().(*types2.Signature)
+		if !ok || sig.Recv() != nil {
+			continue
+		}
+		if tp := sig.TypeParams(); tp == nil || tp.Len() == 0 {
+			continue
+		}
+		tpMask, rtpMask, known := obj.LogosAssertEffects()
+		if !known {
+			continue
+		}
+		fn := findOrCreateFnFact(f, name)
+		fn.AssertTP = types2.LogosAssertMaskHex(tpMask)
+		fn.AssertRTP = types2.LogosAssertMaskHex(rtpMask)
+		fn.HasAssert = true
+	}
+	for _, name := range scope.Names() {
+		tn, ok := scope.Lookup(name).(*types2.TypeName)
+		if !ok || tn == nil || tn.IsAlias() {
+			continue
+		}
+		named, ok := tn.Type().(*types2.Named)
+		if !ok {
+			continue
+		}
+		// Unexported generic types are emitted too: an exported wrapper
+		// of an unexported clean container must stay exactly clean for
+		// importers, which recompute type aggregates from these records.
+		for i := range named.NumMethods() {
+			m := named.Method(i)
+			if m == nil {
+				continue
+			}
+			sig, ok := m.Type().(*types2.Signature)
+			if !ok {
+				continue
+			}
+			om := m.Origin()
+			if om == nil {
+				continue
+			}
+			if sig.TypeParams().Len() == 0 && sig.RecvTypeParams().Len() == 0 {
+				continue
+			}
+			tpMask, rtpMask, known := om.LogosAssertEffects()
+			if !known {
+				continue
+			}
+			fn := findOrCreateFnFact(f, methodObject(name, sig.Recv(), m.Name()))
+			fn.AssertTP = types2.LogosAssertMaskHex(tpMask)
+			fn.AssertRTP = types2.LogosAssertMaskHex(rtpMask)
+			fn.HasAssert = true
+		}
+	}
+}
+
+func emitReadonlyNestedFacts(pkg *types2.Package, f *facts.Facts) {
+	emit := func(object, path string) {
+		for _, r := range f.Readonlys {
+			if r.Object == object && r.Path == path {
+				return
+			}
+		}
+		f.Readonlys = append(f.Readonlys, facts.ReadonlyFact{Object: object, Path: path})
+	}
+	scope := pkg.Scope()
+	if scope == nil {
+		return
+	}
+	for _, name := range scope.Names() {
+		obj := scope.Lookup(name)
+		if obj == nil || !obj.Exported() {
+			continue
+		}
+		switch obj := obj.(type) {
+		case *types2.Func:
+			sig, ok := obj.Type().(*types2.Signature)
+			if !ok || sig.Recv() != nil {
+				continue
+			}
+			walkReadonlySig(sig, nil, name, emit, make(map[types2.Type]bool))
+		case *types2.TypeName:
+			walkReadonlyType(obj.Type(), nil, name, emit, make(map[types2.Type]bool))
+		}
+	}
+	for _, name := range scope.Names() {
+		obj, ok := scope.Lookup(name).(*types2.TypeName)
+		if !ok || obj == nil || !obj.Exported() || obj.IsAlias() {
+			continue
+		}
+		named, ok := obj.Type().(*types2.Named)
+		if !ok {
+			continue
+		}
+		for i := range named.NumMethods() {
+			m := named.Method(i)
+			if m == nil || !m.Exported() {
+				continue
+			}
+			sig, ok := m.Type().(*types2.Signature)
+			if !ok {
+				continue
+			}
+			walkReadonlySig(sig, nil, methodObject(name, sig.Recv(), m.Name()), emit, make(map[types2.Type]bool))
+		}
+	}
+}
+
+func walkReadonlySig(sig *types2.Signature, base []string, object string, emit func(string, string), seen map[types2.Type]bool) {
+	if sig == nil {
+		return
+	}
+	if tp := sig.TypeParams(); tp != nil {
+		for i := range tp.Len() {
+			p := tp.At(i)
+			if p == nil {
+				continue
+			}
+			walkReadonlyType(p.Constraint(), append(slices.Clone(base), fmt.Sprintf("G%d", i)), object, emit, seen)
+		}
+	}
+	if rp := sig.RecvTypeParams(); rp != nil {
+		for i := range rp.Len() {
+			p := rp.At(i)
+			if p == nil {
+				continue
+			}
+			walkReadonlyType(p.Constraint(), append(slices.Clone(base), fmt.Sprintf("H%d", i)), object, emit, seen)
+		}
+	}
+	if params := sig.Params(); params != nil {
+		for i := range params.Len() {
+			v := params.At(i)
+			if v == nil {
+				continue
+			}
+			walkReadonlyType(v.Type(), append(slices.Clone(base), fmt.Sprintf("P%d", i)), object, emit, seen)
+		}
+	}
+	if results := sig.Results(); results != nil {
+		for i := range results.Len() {
+			v := results.At(i)
+			if v == nil {
+				continue
+			}
+			walkReadonlyType(v.Type(), append(slices.Clone(base), fmt.Sprintf("R%d", i)), object, emit, seen)
+		}
+	}
+}
+
+func walkReadonlyType(t types2.Type, path []string, object string, emit func(string, string), seen map[types2.Type]bool) {
+	if t == nil {
+		return
+	}
+	if a, ok := t.(*types2.Alias); ok {
+		if tp := a.TypeParams(); tp != nil {
+			for i := range tp.Len() {
+				p := tp.At(i)
+				if p == nil {
+					continue
+				}
+				walkReadonlyType(p.Constraint(), append(slices.Clone(path), fmt.Sprintf("G%d", i)), object, emit, seen)
+			}
+		}
+		walkReadonlyType(a.Rhs(), path, object, emit, seen)
+		return
+	}
+	if opt := optAsOption(t); opt != nil {
+		walkReadonlyType(opt.Elem, append(slices.Clone(path), "E"), object, emit, seen)
+		return
+	}
+	if c := constAsView(t); c != nil {
+		walkReadonlyType(c.Elem, append(slices.Clone(path), "E"), object, emit, seen)
+		return
+	}
+	if p, ok := t.(*types2.TypeParam); ok {
+		if seen[p] {
+			return
+		}
+		seen[p] = true
+		defer delete(seen, p)
+		walkReadonlyType(p.Constraint(), path, object, emit, seen)
+		return
+	}
+	u := types2.Unalias(t)
+	switch u := u.(type) {
+	case *types2.Pointer:
+		walkReadonlyType(u.Elem(), append(slices.Clone(path), "D"), object, emit, seen)
+	case *types2.Chan:
+		walkReadonlyType(u.Elem(), append(slices.Clone(path), "D"), object, emit, seen)
+	case *types2.Slice:
+		walkReadonlyType(u.Elem(), append(slices.Clone(path), "E"), object, emit, seen)
+	case *types2.Array:
+		walkReadonlyType(u.Elem(), append(slices.Clone(path), "E"), object, emit, seen)
+	case *types2.Map:
+		walkReadonlyType(u.Key(), append(slices.Clone(path), "K"), object, emit, seen)
+		walkReadonlyType(u.Elem(), append(slices.Clone(path), "E"), object, emit, seen)
+	case *types2.Signature:
+		walkReadonlySig(u, path, object, emit, seen)
+	case *types2.Struct:
+		for i := range u.NumFields() {
+			f := u.Field(i)
+			if f == nil || !f.Exported() {
+				continue
+			}
+			walkReadonlyType(f.Type(), append(slices.Clone(path), "F"+f.Name()), object, emit, seen)
+		}
+	case *types2.Interface:
+		for i := range u.NumExplicitMethods() {
+			m := u.ExplicitMethod(i)
+			if m == nil {
+				continue
+			}
+			if m.LogosReadonly() {
+				emit(object, joinPath(append(slices.Clone(path), "M"+m.Name())))
+			}
+			sig, ok := m.Type().(*types2.Signature)
+			if !ok {
+				continue
+			}
+			walkReadonlySig(sig, append(slices.Clone(path), "M"+m.Name()), object, emit, seen)
+		}
+		for i := range u.NumEmbeddeds() {
+			walkReadonlyType(u.EmbeddedType(i), path, object, emit, seen)
+		}
+	case *types2.Named:
+		if seen[u] {
+			return
+		}
+		seen[u] = true
+		defer delete(seen, u)
+		if tp := u.TypeParams(); tp != nil {
+			for i := range tp.Len() {
+				p := tp.At(i)
+				if p == nil {
+					continue
+				}
+				walkReadonlyType(p.Constraint(), append(slices.Clone(path), fmt.Sprintf("G%d", i)), object, emit, seen)
+			}
+		}
+		walkReadonlyType(u.Underlying(), path, object, emit, seen)
+	case *types2.Tuple:
+		for i := range u.Len() {
+			v := u.At(i)
+			if v == nil {
+				continue
+			}
+			walkReadonlyType(v.Type(), append(slices.Clone(path), fmt.Sprintf("T%d", i)), object, emit, seen)
+		}
+	case *types2.Union:
+		for i := range u.Len() {
+			tm := u.Term(i)
+			if tm == nil {
+				continue
+			}
+			walkReadonlyType(tm.Type(), path, object, emit, seen)
+		}
+	}
+}
+
+func orHexMask(have string, add []byte) string {
+	if len(add) == 0 {
+		return have
+	}
+	hb, _ := parseHexMask(have)
+	return maskHex(orMask(hb, add))
+}
+
+// parseHexMask decodes a normalized hex mutation mask into big-endian
+// bytes. It reports false for malformed input. The empty string never
+// parses: absence of a verdict means unknown, while proven zero is
+// spelled "0" (which decodes to a non-nil empty mask, exact-clean).
+func parseHexMask(s string) ([]byte, bool) {
+	if s == "" {
+		return nil, false
+	}
+	if len(s)%2 != 0 {
+		s = "0" + s
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, false
+	}
+	b = bytes.TrimLeft(b, "\x00")
+	if len(b) == 0 {
+		return []byte{}, true
+	}
+	return b, true
+}
+
+// maskBit reports whether bit i is set in the big-endian mask b. Bits
+// past the end read clear. A nil (unknown) mask never reaches here:
+// callers treat unknown as all-mutated before testing bits.
+func maskBit(b []byte, i int) bool {
+	if i < 0 || i/8 >= len(b) {
+		return false
+	}
+	return b[len(b)-1-i/8]>>(uint(i)%8)&1 != 0
+}
+
+// setMaskBit sets bit i in the big-endian mask b, growing it as needed,
+// and returns the result.
+func setMaskBit(b []byte, i int) []byte {
+	if i < 0 {
+		return b
+	}
+	if i/8 >= len(b) {
+		b = append(make([]byte, i/8+1-len(b)), b...)
+	}
+	b[len(b)-1-i/8] |= 1 << (uint(i) % 8)
+	return b
+}
+
+// orMask returns the bitwise OR of big-endian a and b in a fresh slice.
+func orMask(a, b []byte) []byte {
+	n := len(a)
+	if len(b) > n {
+		n = len(b)
+	}
+	out := make([]byte, n)
+	copy(out[n-len(a):], a)
+	for i := range b {
+		out[n-len(b)+i] |= b[i]
+	}
+	return out
+}
+
+// maskHex renders a big-endian mask as normalized lowercase hex.
+func maskHex(b []byte) string {
+	if s := hex.EncodeToString(bytes.TrimLeft(b, "\x00")); s != "" {
+		if len(s) > 1 && s[0] == '0' {
+			s = s[1:]
+		}
+		return s
+	}
+	return "0"
 }
 
 // collectConstFuncDecls matches every package-level function body with
@@ -341,14 +767,14 @@ type constBodyScan struct {
 	pkg       *types2.Package
 	info      *types2.Info
 	recvMut   map[*types2.Func]bool
-	paramMask map[*types2.Func]uint64
+	paramMask map[*types2.Func][]byte
 	tainted   map[types2.Object]*types2.Var
 	mut       map[*types2.Var]bool
 }
 
 // funcMutations returns the receiver-mutated flag and the parameter
 // mutation mask for one function.
-func (s *constBodyScan) funcMutations(d constFuncDecl) (bool, uint64) {
+func (s *constBodyScan) funcMutations(d constFuncDecl) (bool, []byte) {
 	s.tainted = make(map[types2.Object]*types2.Var)
 	s.mut = make(map[*types2.Var]bool)
 	var params []*types2.Var
@@ -367,14 +793,14 @@ func (s *constBodyScan) funcMutations(d constFuncDecl) (bool, uint64) {
 		}
 	}
 	s.block(d.decl.Body.List)
-	var mask uint64
+	mask := []byte{}
 	bit := 0
 	for _, p := range params {
 		if p == recv {
 			continue
 		}
-		if bit < 64 && s.mut[p] {
-			mask |= 1 << uint(bit)
+		if s.mut[p] {
+			mask = setMaskBit(mask, bit)
 		}
 		bit++
 	}
@@ -410,11 +836,112 @@ func (s *constBodyScan) originOf(obj types2.Object) *types2.Var {
 	return s.tainted[obj]
 }
 
-// mark records the origin parameter of obj as mutated.
+// mark records the origin parameter of obj as mutated for escape/copy
+// propagation (return, send, store of a copy, closure capture, escaping
+// call). A reference-free origin (string, int, plain struct such as Good)
+// cannot alias shared memory, so copying it never mutates the caller;
+// only a reference-bearing origin marks. This mirrors the seal's
+// reference-free cut (types2.LogosReferenceFree) so a pure getter
+// returning a string does not suppress its sealed Readonly fact.
+// Unknown or untyped origins fail closed. Direct writes through a
+// reference must use markWrite, which never applies this cut: writing
+// m.S[0]=1 mutates shared memory even though the stored int is
+// reference-free.
 func (s *constBodyScan) mark(obj types2.Object) {
+	if o := s.originOf(obj); o != nil {
+		if t := o.Type(); t != nil && types2.LogosReferenceFree(t) {
+			return
+		}
+		s.mut[o] = true
+	}
+}
+
+// markWrite records a direct write through obj without the
+// reference-free cut. Stores, index/slice writes, pointer writes, and
+// calls to mutating positions mutate shared memory reachable from the
+// origin even when the written field or element type itself is scalar
+// reference-free (e.g. m.S[0]=1 writes an int through a slice). Only
+// untainted objects skip; reference-free origins still mark here because
+// the write crosses a reference indirection off the origin.
+func (s *constBodyScan) markWrite(obj types2.Object) {
 	if o := s.originOf(obj); o != nil {
 		s.mut[o] = true
 	}
+}
+
+func (s *constBodyScan) writeCrossesRef(e syntax.Expr) bool {
+	e = syntax.Unparen(e)
+	switch n := e.(type) {
+	case *syntax.IndexExpr:
+		t := s.info.TypeOf(n.X)
+		if t == nil {
+			return true
+		}
+		switch types2.Unalias(t).Underlying().(type) {
+		case *types2.Slice, *types2.Map:
+			return true
+		case *types2.Array:
+			return s.writeCrossesRef(n.X)
+		default:
+			return true
+		}
+	case *syntax.SliceExpr:
+		return true
+	case *syntax.Operation:
+		return n.Op == syntax.Mul && n.Y == nil
+	case *syntax.SelectorExpr:
+		t := s.info.TypeOf(n.X)
+		if t == nil {
+			return true
+		}
+		if _, ok := types2.Unalias(t).(*types2.Pointer); ok {
+			return true
+		}
+		return s.writeCrossesRef(n.X)
+	case *syntax.ListExpr:
+		for _, el := range n.ElemList {
+			if ex, ok := el.(syntax.Expr); ok && s.writeCrossesRef(ex) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// markMentionWrite marks direct-write targets: every tainted origin
+// mentioned in e marks without the reference-free cut.
+func (s *constBodyScan) markMentionWrite(e syntax.Node) {
+	syntax.Inspect(e, func(n syntax.Node) bool {
+		if idx, ok := n.(*syntax.IndexExpr); ok {
+			s.markMentionWrite(idx.X)
+			s.scanReads(idx.Index)
+			return false
+		}
+		if sl, ok := n.(*syntax.SliceExpr); ok {
+			s.markMentionWrite(sl.X)
+			for _, bound := range sl.Index {
+				if bound != nil {
+					s.scanReads(bound)
+				}
+			}
+			return false
+		}
+		if name, ok := n.(*syntax.Name); ok {
+			s.markWrite(s.resolve(name))
+			return true
+		}
+		if call, ok := n.(*syntax.CallExpr); ok {
+			s.callEscaping(call)
+			return false
+		}
+		if lit, ok := n.(*syntax.FuncLit); ok {
+			s.markClosure(lit.Body)
+			return false
+		}
+		return true
+	})
 }
 
 // taintedMention returns the origin parameter mentioned in e, if any.
@@ -523,7 +1050,11 @@ func (s *constBodyScan) blockStmt(n syntax.Node) {
 // stores of tainted values, and taint propagation into locals.
 func (s *constBodyScan) assign(st *syntax.AssignStmt) {
 	if st.Rhs == nil {
-		s.markMention(st.Lhs)
+		if ex, ok := syntax.Unparen(st.Lhs).(syntax.Expr); ok && s.writeCrossesRef(ex) {
+			s.markMentionWrite(st.Lhs)
+		} else {
+			s.markMention(st.Lhs)
+		}
 		return
 	}
 	lhs, _ := st.Lhs.(*syntax.Name)
@@ -548,7 +1079,11 @@ func (s *constBodyScan) assign(st *syntax.AssignStmt) {
 			}
 			return
 		}
-		s.markMention(st.Lhs)
+		if ex, ok := syntax.Unparen(st.Lhs).(syntax.Expr); ok && s.writeCrossesRef(ex) {
+			s.markMentionWrite(st.Lhs)
+		} else {
+			s.markMention(st.Lhs)
+		}
 		if s.mentionsPackage(st.Lhs) {
 			s.markMention(st.Rhs)
 		} else {
@@ -556,7 +1091,11 @@ func (s *constBodyScan) assign(st *syntax.AssignStmt) {
 		}
 		return
 	}
-	s.markMention(st.Lhs)
+	if ex, ok := syntax.Unparen(st.Lhs).(syntax.Expr); ok && s.writeCrossesRef(ex) {
+		s.markMentionWrite(st.Lhs)
+	} else {
+		s.markMention(st.Lhs)
+	}
 }
 
 // mentionsPackage reports whether e mentions a package-level variable.
@@ -717,8 +1256,10 @@ func (s *constBodyScan) doFuncCall(fn *types2.Func, recv syntax.Expr, args []syn
 	}
 	mutRecv, mask := s.calleeFacts(fn)
 	if recv != nil {
-		if mutRecv || escaping {
+		if escaping {
 			s.markMention(recv)
+		} else if mutRecv {
+			s.markMentionWrite(recv)
 		} else {
 			s.scanReads(recv)
 		}
@@ -729,8 +1270,12 @@ func (s *constBodyScan) doFuncCall(fn *types2.Func, recv syntax.Expr, args []syn
 				s.scanReads(arg)
 				break
 			}
-			if mask&(1<<uint(i)) != 0 || escaping {
+			if escaping {
 				s.markMention(arg)
+			} else if mask == nil {
+				s.markMention(arg)
+			} else if maskBit(mask, i) {
+				s.markMentionWrite(arg)
 			} else {
 				s.scanReads(arg)
 			}
@@ -742,17 +1287,25 @@ func (s *constBodyScan) doFuncCall(fn *types2.Func, recv syntax.Expr, args []syn
 
 // calleeFacts returns the receiver flag and parameter mask for a
 // callee: the fixpoint state for the current package, recorded facts
-// for imports, and fail-closed for unknown bodies. A universe method
-// such as error.Error has no package and no recorded facts.
-func (s *constBodyScan) calleeFacts(fn *types2.Func) (bool, uint64) {
+// for imports, and fail-closed for unknown bodies. A nil mask means
+// unknown mutation (every parameter mutated); a non-nil mask is exact,
+// with unset bits clean. A record that exists for non-mutation reasons
+// (readonly-only, assert-only, or a record without ParamMutated)
+// therefore never certifies zero; only an explicit "ParamMutated=0" (or
+// any parseable mask) is exact. A universe method such as error.Error
+// has no package and no recorded facts.
+func (s *constBodyScan) calleeFacts(fn *types2.Func) (bool, []byte) {
 	if fn.Pkg() == nil {
-		return true, ^uint64(0)
+		return true, nil
 	}
 	if fn.Pkg() == s.pkg {
 		if mask, ok := s.paramMask[fn]; ok {
+			if mask == nil {
+				mask = []byte{}
+			}
 			return s.recvMut[fn], mask
 		}
-		return true, ^uint64(0)
+		return true, nil
 	}
 	if f, ok := facts.Lookup(fn.Pkg().Path()); ok && f != nil {
 		for i := range f.Fns {
@@ -763,18 +1316,17 @@ func (s *constBodyScan) calleeFacts(fn *types2.Func) (bool, uint64) {
 			if entry.MayYieldOnly() {
 				continue
 			}
-			var mask uint64
-			if entry.ParamMutated != "" {
-				if v, err := strconv.ParseUint(entry.ParamMutated, 16, 64); err == nil {
-					mask = v
-				} else {
-					mask = ^uint64(0)
-				}
+			if entry.ParamMutated == "" {
+				return entry.ReceiverMutated, nil
+			}
+			mask, ok := parseHexMask(entry.ParamMutated)
+			if !ok {
+				return entry.ReceiverMutated, nil
 			}
 			return entry.ReceiverMutated, mask
 		}
 	}
-	return true, ^uint64(0)
+	return true, nil
 }
 
 // constMethodName renders T.M or (*T).M for a method.
@@ -796,9 +1348,17 @@ func (s *constBodyScan) builtinCall(name string, call *syntax.CallExpr) {
 	switch name {
 	case "append", "copy":
 		if len(call.ArgList) > 0 {
-			s.markMention(call.ArgList[0])
+			s.markMentionWrite(call.ArgList[0])
 		}
-	case "delete", "clear", "panic":
+	case "delete", "clear":
+		if len(call.ArgList) > 0 {
+			s.markMentionWrite(call.ArgList[0])
+			s.scanReads(call.ArgList[0])
+			for _, arg := range call.ArgList[1:] {
+				s.scanReads(arg)
+			}
+		}
+	case "panic":
 		for _, arg := range call.ArgList {
 			s.markMention(arg)
 		}

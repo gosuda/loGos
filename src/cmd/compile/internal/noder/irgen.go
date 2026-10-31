@@ -12,6 +12,7 @@ import (
 	"sort"
 
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/logos"
 	"cmd/compile/internal/midway"
 	"cmd/compile/internal/rangefunc"
 	"cmd/compile/internal/syntax"
@@ -49,8 +50,11 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info, map[*
 
 	didMidway := false
 	didLogos := false
+	didSpecialize := false
+	var logosProvenCarry map[string]bool // logos: invocation-local proof carry; see logosSealProvenCarry.
 
 recheck:
+	provenForThisCheck := logosProvenCarry
 	// typechecking
 	base.Logos = allLogos(noders)
 	ctxt := types2.NewContext()
@@ -60,13 +64,14 @@ recheck:
 	}
 	logosMarkImporter(&importer, base.Logos, allLogos(noders) && !didLogos) // logos M2-S7 hook: the import kind selects union handling and overlay restoration.
 	conf := types2.Config{
-		Context:            ctxt,
-		GoVersion:          base.Flag.Lang,
-		IgnoreBranchErrors: true, // parser already checked via syntax.CheckBranches mode
-		Importer:           &importer,
-		Sizes:              types2.SizesFor("gc", buildcfg.GOARCH),
-		Logos:              allLogos(noders) && !didLogos,
-		LogosUnions:        allLogos(noders), // logos M2-S1 hook: unions stay legal in the recheck.
+		Context:             ctxt,
+		GoVersion:           base.Flag.Lang,
+		IgnoreBranchErrors:  true, // parser already checked via syntax.CheckBranches mode
+		Importer:            &importer,
+		Sizes:               types2.SizesFor("gc", buildcfg.GOARCH),
+		Logos:               allLogos(noders) && !didLogos,
+		LogosUnions:         allLogos(noders), // logos M2-S1 hook: unions stay legal in the recheck.
+		LogosProvenReadonly: provenForThisCheck,
 	}
 	if base.Flag.ErrorURL {
 		conf.ErrorURL = " [go.dev/e/%s]"
@@ -82,8 +87,12 @@ recheck:
 		FileVersions:       make(map[*syntax.PosBase]string),
 		// expand as needed
 	}
-	logosConfigureComptime(&conf, info)           // logos M5-S2 hook: configure comptime step and node limits.
-	logosConfigureOwnedConstants(&conf, didLogos) // generated nodes alone receive fresh private-type references.
+	logosConfigureComptime(&conf, info) // logos M5-S2 hook: configure comptime step and node limits.
+	if didLogos {
+		logosConfigureOwnedConstantsLowered(&conf) // generated nodes alone receive fresh private-type references.
+	} else {
+		logosConfigureOwnedConstantsFirst(&conf) // first check: no generated-node registrations.
+	}
 	conf.Error = func(err error) {
 		terr := err.(types2.Error)
 		if logosDeferSoftWarn(terr) { // logos M6-S3 hook: warn-severity rules never fail, and the lint pass resolves them.
@@ -202,9 +211,11 @@ recheck:
 		didLogos = true
 		logosLintHook(&m, files, pkg, info) // logos M9 hook: lints see the unlowered tree.
 		if logosRecheckHook(&conf, pkg, info, files) {
+			logosProvenCarry = logosSealProvenCarry(&conf)
 			goto recheck
 		}
 	}
+	logosStampProvenReadonly(pkg, provenForThisCheck)
 
 	if buildcfg.Experiment.SIMD && !didMidway {
 		didMidway = true
@@ -225,9 +236,17 @@ recheck:
 		}
 	}
 
+	if !didSpecialize {
+		didSpecialize = true
+		if logosSpecializeHook(pkg, info, files) { // logos M13-S3 hook: clone specialization, a neutral phase for Go and loGo/s packages.
+			goto recheck
+		}
+	}
+
 	if len(base.Debug.AstDump) > 0 {
 		dumpSyntax(pkg, info, files, "midway after recheck")
 	}
+	logos.LogosClearErasedAnonReadonly()
 
 	// Rewrite range over function to explicit function calls
 	// with the loop bodies converted into new implicit closures.
@@ -244,6 +263,7 @@ recheck:
 
 	writeLogosEject(files)
 	logosNextHook(pkg, info, files)
+	logosEmitAssertFacts(pkg)
 
 	return pkg, info, rangeInfo
 }

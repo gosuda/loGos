@@ -1,0 +1,707 @@
+# M11-S1/S2: IsZero-only named scalars stay scalar under static JSON
+# (r4373037368). A named int/string/bool implementing only IsZero must
+# encode as a plain scalar, honor the `string` tag option in both
+# directions, consult IsZero for omitzero, and keep custom-marshaler
+# precedence. The walk already does this; the generated MarshalJSON and
+# UnmarshalJSON must match encoding/json byte for byte. Before the fix
+# the static classifier put IsZero-only types in shapeFallback, dropped
+# the `string` option on encode (bare scalar) and rejected quoted input
+# on decode. This is the first public installed-logos generated
+# serializer attack for the finding: it runs the generated methods via
+# `logos run` and compares against the reflective oracle in the same
+# process, under both default and jsonv2 modes via the parent harness.
+# Error parity covers bare unquoted inputs and malformed quoted values
+# per kind (int/string/bool readers differ): presence/class plus shared
+# Value/Type/Field/Offset with literal per-target Struct roots (Obj vs
+# empty anonymous); plain errors compare exact text. The combined `string,omitzero` field,
+# pointer fields (nil and non-nil), and pointer-receiver IsZero
+# (addressability) are covered as controls that must keep passing.
+# Error flow discipline: every fallible call checks its error in explicit
+# control flow before its result is read, so the result is never
+# observed on the error path.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+cd w
+logos run .
+stdout '^encode int ok$'
+stdout '^encode string ok$'
+stdout '^encode bool ok$'
+stdout '^decode quoted ok$'
+stdout '^decode bare rejects ok$'
+stdout '^decode malformed rejects ok$'
+stdout '^decode fatal rejects ok$'
+stdout '^omitzero custom ok$'
+stdout '^combo string omitzero ok$'
+stdout '^pointer string ok$'
+stdout '^ptrrecv omitzero ok$'
+stdout '^marshaler precedence ok$'
+stdout '^numeric parity ok$'
+
+-- w/go.mod --
+module example.com/fallbackstring
+
+go 1.27
+
+require example.com/poracle v0.0.0
+
+replace example.com/poracle => ../poracle
+
+-- w/main.lgo --
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+
+	"example.com/poracle"
+)
+
+type ZInt int
+
+func (z ZInt) IsZero() bool { return z == 42 }
+
+type ZString string
+
+func (z ZString) IsZero() bool { return z == "zero" }
+
+type ZBool bool
+
+func (z ZBool) IsZero() bool { return bool(z) }
+
+type Obj struct {
+	I ZInt    `json:"i,string"`
+	S ZString `json:"s,string"`
+	B ZBool   `json:"b,string"`
+}
+
+type OmitObj struct {
+	I ZInt    `json:"i,omitzero"`
+	S ZString `json:"s,omitzero"`
+	B ZBool   `json:"b,omitzero"`
+}
+
+type ComboObj struct {
+	I ZInt    `json:"i,string,omitzero"`
+	S ZString `json:"s,string,omitzero"`
+	B ZBool   `json:"b,string,omitzero"`
+}
+
+type PtrObj struct {
+	P *ZInt? `json:"p,string"`
+}
+
+type PZInt int
+
+func (z *PZInt) IsZero() bool { return *z == 7 }
+
+type PZObj struct {
+	V PZInt `json:"v,omitzero"`
+}
+
+type MInt int
+
+func (m MInt) MarshalJSON() ([]byte, error) { return []byte(`"custom"`), nil }
+func (m MInt) IsZero() bool                 { return m == 0 }
+
+type MarshalObj struct {
+	V MInt `json:"v,string"`
+}
+
+type NumObj struct {
+	I int64   `json:"i,string"`
+	U uint64  `json:"u,string"`
+	F float64 `json:"f,string"`
+}
+
+func encodeInt() {
+	o := Obj{I: 5, S: "hi", B: true}
+	gen, gerr := o.MarshalJSON()
+	if gerr != nil {
+		panic("gen encode: " + gerr.Error())
+	}
+	genText := string(gen)
+	ref, rerr := json.Marshal(struct {
+		I ZInt    `json:"i,string"`
+		S ZString `json:"s,string"`
+		B ZBool   `json:"b,string"`
+	}{I: 5, S: "hi", B: true})
+	if rerr != nil {
+		panic("ref encode: " + rerr.Error())
+	}
+	refText := string(ref)
+	if genText != refText {
+		panic("encode int: gen " + genText + " ref " + refText)
+	}
+	fmt.Println("encode int ok")
+}
+
+func encodeString() {
+	o2 := Obj{I: 42, S: "zero", B: false}
+	gen2, gerr2 := o2.MarshalJSON()
+	if gerr2 != nil {
+		panic("gen encode2: " + gerr2.Error())
+	}
+	genText2 := string(gen2)
+	ref2, rerr2 := json.Marshal(struct {
+		I ZInt    `json:"i,string"`
+		S ZString `json:"s,string"`
+		B ZBool   `json:"b,string"`
+	}{I: 42, S: "zero", B: false})
+	if rerr2 != nil {
+		panic("ref encode2: " + rerr2.Error())
+	}
+	refText2 := string(ref2)
+	if genText2 != refText2 {
+		panic("encode string: gen " + genText2 + " ref " + refText2)
+	}
+	fmt.Println("encode string ok")
+}
+
+func encodeBool() {
+	o3 := Obj{I: 0, S: "", B: false}
+	gen3, gerr3 := o3.MarshalJSON()
+	if gerr3 != nil {
+		panic("gen encode3: " + gerr3.Error())
+	}
+	genText3 := string(gen3)
+	ref3, rerr3 := json.Marshal(struct {
+		I ZInt    `json:"i,string"`
+		S ZString `json:"s,string"`
+		B ZBool   `json:"b,string"`
+	}{I: 0, S: "", B: false})
+	if rerr3 != nil {
+		panic("ref encode3: " + rerr3.Error())
+	}
+	refText3 := string(ref3)
+	if genText3 != refText3 {
+		panic("encode bool: gen " + genText3 + " ref " + refText3)
+	}
+	fmt.Println("encode bool ok")
+}
+
+func decodeQuoted() {
+	var g Obj
+	gderr := g.UnmarshalJSON([]byte(`{"i":"5","s":"\"hi\"","b":"true"}`))
+	if gderr != nil {
+		panic("decode quoted gen err: " + gderr.Error())
+	}
+	if g.I != 5 || g.S != "hi" || bool(g.B) != true {
+		panic("decode quoted gen value")
+	}
+	var r struct {
+		I ZInt    `json:"i,string"`
+		S ZString `json:"s,string"`
+		B ZBool   `json:"b,string"`
+	}
+	rderr := json.Unmarshal([]byte(`{"i":"5","s":"\"hi\"","b":"true"}`), &r)
+	if rderr != nil {
+		panic("decode quoted ref err: " + rderr.Error())
+	}
+	if r.I != g.I || r.S != g.S || r.B != g.B {
+		panic("decode quoted parity")
+	}
+	fmt.Println("decode quoted ok")
+}
+
+func decodeBare() {
+	bareInputs := []string{
+		`{"i":5,"s":"\"hi\"","b":"true"}`,
+		`{"i":"5","s":5,"b":"true"}`,
+		`{"i":"5","s":"\"hi\"","b":true}`,
+	}
+	for _, input := range bareInputs {
+		var gb Obj
+		gberr := gb.UnmarshalJSON([]byte(input))
+		if gberr == nil {
+			panic("decode bare should reject: " + input)
+		}
+		var rb struct {
+			I ZInt    `json:"i,string"`
+			S ZString `json:"s,string"`
+			B ZBool   `json:"b,string"`
+		}
+		rberr := json.Unmarshal([]byte(input), &rb)
+		if rberr == nil {
+			panic("decode bare oracle should reject: " + input)
+		}
+		parityMismatch := poracle.CheckDecodeParity(poracle.ParityRequest{GErr: gberr, RErr: rberr, Input: input, Label: "decode bare", Expected: "Obj"})
+		if parityMismatch != "" {
+			panic(parityMismatch)
+		}
+		if gb.I != rb.I || gb.S != rb.S || gb.B != rb.B {
+			panic("decode bare value parity: " + input)
+		}
+	}
+	fmt.Println("decode bare rejects ok")
+}
+
+func decodeMalformed() {
+	malformed := []string{
+		`{"i":"nul","s":"\"hi\"","b":"true"}`,
+		`{"i":"5","s":"nul","b":"true"}`,
+		`{"i":"5","s":"\"hi\"","b":"tru"}`,
+		`{"i":"","s":"\"hi\"","b":"true"}`,
+	}
+	for _, input := range malformed {
+		var gm Obj
+		gmerr := gm.UnmarshalJSON([]byte(input))
+		if gmerr == nil {
+			panic("decode malformed should reject: " + input)
+		}
+		var rm struct {
+			I ZInt    `json:"i,string"`
+			S ZString `json:"s,string"`
+			B ZBool   `json:"b,string"`
+		}
+		rmerr := json.Unmarshal([]byte(input), &rm)
+		if rmerr == nil {
+			panic("decode malformed oracle should reject: " + input)
+		}
+		parityMismatch := poracle.CheckDecodeParity(poracle.ParityRequest{GErr: gmerr, RErr: rmerr, Input: input, Label: "decode malformed", Expected: "Obj"})
+		if parityMismatch != "" {
+			panic(parityMismatch)
+		}
+		if gm.I != rm.I || gm.S != rm.S || gm.B != rm.B {
+			panic("decode malformed value parity: " + input)
+		}
+	}
+	fmt.Println("decode malformed rejects ok")
+}
+
+func decodeFatal() {
+	fatalInput := `{"i":"x","s":"\"hi\"","b":"true"}`
+	var gf Obj
+	gferr := gf.UnmarshalJSON([]byte(fatalInput))
+	if gferr == nil {
+		panic("decode fatal should reject")
+	}
+	var rf struct {
+		I ZInt    `json:"i,string"`
+		S ZString `json:"s,string"`
+		B ZBool   `json:"b,string"`
+	}
+	rferr := json.Unmarshal([]byte(fatalInput), &rf)
+	if rferr == nil {
+		panic("decode fatal oracle should reject")
+	}
+	fatalMismatch := poracle.CheckDecodeParity(poracle.ParityRequest{GErr: gferr, RErr: rferr, Input: fatalInput, Label: "decode fatal", Expected: "Obj"})
+	if fatalMismatch != "" {
+		panic(fatalMismatch)
+	}
+	fmt.Println("decode fatal rejects ok")
+}
+
+func omitZero() {
+	omit := OmitObj{I: 42, S: "zero", B: true}
+	gomit, gomitErr := omit.MarshalJSON()
+	if gomitErr != nil {
+		panic("omit gen err: " + gomitErr.Error())
+	}
+	gomitText := string(gomit)
+	romit, romitErr := json.Marshal(struct {
+		I ZInt    `json:"i,omitzero"`
+		S ZString `json:"s,omitzero"`
+		B ZBool   `json:"b,omitzero"`
+	}{I: 42, S: "zero", B: true})
+	if romitErr != nil {
+		panic("omit ref err: " + romitErr.Error())
+	}
+	romitText := string(romit)
+	if gomitText != romitText {
+		panic("omitzero custom: gen " + gomitText + " ref " + romitText)
+	}
+	keep := OmitObj{I: 0, S: "", B: false}
+	gkeep, gkeepErr := keep.MarshalJSON()
+	if gkeepErr != nil {
+		panic("keep gen err: " + gkeepErr.Error())
+	}
+	gkeepText := string(gkeep)
+	rkeep, rkeepErr := json.Marshal(struct {
+		I ZInt    `json:"i,omitzero"`
+		S ZString `json:"s,omitzero"`
+		B ZBool   `json:"b,omitzero"`
+	}{I: 0, S: "", B: false})
+	if rkeepErr != nil {
+		panic("keep ref err: " + rkeepErr.Error())
+	}
+	rkeepText := string(rkeep)
+	if gkeepText != rkeepText {
+		panic("omitzero keep: gen " + gkeepText + " ref " + rkeepText)
+	}
+	fmt.Println("omitzero custom ok")
+}
+
+func comboStringOmitZero() {
+	combo := ComboObj{I: 42, S: "zero", B: true}
+	gcombo, gcomboErr := combo.MarshalJSON()
+	if gcomboErr != nil {
+		panic("combo gen err: " + gcomboErr.Error())
+	}
+	gcomboText := string(gcombo)
+	rcombo, rcomboErr := json.Marshal(struct {
+		I ZInt    `json:"i,string,omitzero"`
+		S ZString `json:"s,string,omitzero"`
+		B ZBool   `json:"b,string,omitzero"`
+	}{I: 42, S: "zero", B: true})
+	if rcomboErr != nil {
+		panic("combo ref err: " + rcomboErr.Error())
+	}
+	rcomboText := string(rcombo)
+	if gcomboText != rcomboText {
+		panic("combo custom: gen " + gcomboText + " ref " + rcomboText)
+	}
+	comboKeep := ComboObj{I: 0, S: "", B: false}
+	gcomboKeep, gcomboKeepErr := comboKeep.MarshalJSON()
+	if gcomboKeepErr != nil {
+		panic("combo keep gen err: " + gcomboKeepErr.Error())
+	}
+	gcomboKeepText := string(gcomboKeep)
+	rcomboKeep, rcomboKeepErr := json.Marshal(struct {
+		I ZInt    `json:"i,string,omitzero"`
+		S ZString `json:"s,string,omitzero"`
+		B ZBool   `json:"b,string,omitzero"`
+	}{I: 0, S: "", B: false})
+	if rcomboKeepErr != nil {
+		panic("combo keep ref err: " + rcomboKeepErr.Error())
+	}
+	rcomboKeepText := string(rcomboKeep)
+	if gcomboKeepText != rcomboKeepText {
+		panic("combo keep: gen " + gcomboKeepText + " ref " + rcomboKeepText)
+	}
+	comboQuoted := ComboObj{I: 5, S: "hi", B: true}
+	gcomboQuoted, gcomboQuotedErr := comboQuoted.MarshalJSON()
+	if gcomboQuotedErr != nil {
+		panic("combo quoted gen err: " + gcomboQuotedErr.Error())
+	}
+	gcomboQuotedText := string(gcomboQuoted)
+	rcomboQuoted, rcomboQuotedErr := json.Marshal(struct {
+		I ZInt    `json:"i,string,omitzero"`
+		S ZString `json:"s,string,omitzero"`
+		B ZBool   `json:"b,string,omitzero"`
+	}{I: 5, S: "hi", B: true})
+	if rcomboQuotedErr != nil {
+		panic("combo quoted ref err: " + rcomboQuotedErr.Error())
+	}
+	rcomboQuotedText := string(rcomboQuoted)
+	if gcomboQuotedText != rcomboQuotedText {
+		panic("combo quoted: gen " + gcomboQuotedText + " ref " + rcomboQuotedText)
+	}
+	fmt.Println("combo string omitzero ok")
+}
+
+func pointerString() {
+	nilPtr := PtrObj{P: nil}
+	gnil, gnilErr := nilPtr.MarshalJSON()
+	if gnilErr != nil {
+		panic("ptr nil gen err: " + gnilErr.Error())
+	}
+	gnilText := string(gnil)
+	rnil, rnilErr := poracle.MarshalNil()
+	if rnilErr != nil {
+		panic("ptr nil ref err: " + rnilErr.Error())
+	}
+	rnilText := string(rnil)
+	if gnilText != rnilText {
+		panic("ptr nil: gen " + gnilText + " ref " + rnilText)
+	}
+	pv := ZInt(5)
+	fullPtr := PtrObj{P: &pv}
+	gfull, gfullErr := fullPtr.MarshalJSON()
+	if gfullErr != nil {
+		panic("ptr full gen err: " + gfullErr.Error())
+	}
+	gfullText := string(gfull)
+	rfull, rfullErr := poracle.MarshalFull(poracle.PInt(5))
+	if rfullErr != nil {
+		panic("ptr full ref err: " + rfullErr.Error())
+	}
+	rfullText := string(rfull)
+	if gfullText != rfullText {
+		panic("ptr full: gen " + gfullText + " ref " + rfullText)
+	}
+	var gp PtrObj
+	gpderr := gp.UnmarshalJSON([]byte(`{"p":"5"}`))
+	if gpderr != nil {
+		panic("ptr decode gen err: " + gpderr.Error())
+	}
+	decodedPointer := gp.P
+	if decodedPointer == nil {
+		panic("ptr decode nil")
+	}
+	if *decodedPointer != 5 {
+		panic("ptr decode gen value")
+	}
+	fmt.Println("pointer string ok")
+}
+
+func ptrRecvOmitZero() {
+	pzOmit := PZObj{V: 7}
+	gpz, gpzErr := pzOmit.MarshalJSON()
+	if gpzErr != nil {
+		panic("ptrrecv gen err: " + gpzErr.Error())
+	}
+	gpzText := string(gpz)
+	rpz, rpzErr := json.Marshal(struct {
+		V PZInt `json:"v,omitzero"`
+	}{V: 7})
+	if rpzErr != nil {
+		panic("ptrrecv ref err: " + rpzErr.Error())
+	}
+	rpzText := string(rpz)
+	if gpzText != rpzText {
+		panic("ptrrecv omit: gen " + gpzText + " ref " + rpzText)
+	}
+	pzKeep := PZObj{V: 0}
+	gpzKeep, gpzKeepErr := pzKeep.MarshalJSON()
+	if gpzKeepErr != nil {
+		panic("ptrrecv keep gen err: " + gpzKeepErr.Error())
+	}
+	gpzKeepText := string(gpzKeep)
+	rpzKeep, rpzKeepErr := json.Marshal(struct {
+		V PZInt `json:"v,omitzero"`
+	}{V: 0})
+	if rpzKeepErr != nil {
+		panic("ptrrecv keep ref err: " + rpzKeepErr.Error())
+	}
+	rpzKeepText := string(rpzKeep)
+	if gpzKeepText != rpzKeepText {
+		panic("ptrrecv keep: gen " + gpzKeepText + " ref " + rpzKeepText)
+	}
+	fmt.Println("ptrrecv omitzero ok")
+}
+
+func checkNumericValues(g NumObj, r NumObj, input string) {
+	if g.I != r.I {
+		panic("numeric I parity: " + input)
+	}
+	if g.U != r.U {
+		panic("numeric U parity: " + input)
+	}
+	gNaN := math.IsNaN(g.F)
+	rNaN := math.IsNaN(r.F)
+	if gNaN != rNaN {
+		panic("numeric F NaN parity: " + input)
+	}
+	if gNaN {
+		return
+	}
+	if g.F != r.F {
+		panic("numeric F parity: " + input)
+	}
+	if math.Signbit(g.F) != math.Signbit(r.F) {
+		panic("numeric F sign parity: " + input)
+	}
+}
+
+func checkNumericRow(input string) {
+	var gn NumObj
+	gerr := gn.UnmarshalJSON([]byte(input))
+	var rn struct {
+		I int64   `json:"i,string"`
+		U uint64  `json:"u,string"`
+		F float64 `json:"f,string"`
+	}
+	rerr := json.Unmarshal([]byte(input), &rn)
+	mismatch := poracle.CheckDecodeParity(poracle.ParityRequest{GErr: gerr, RErr: rerr, Input: input, Label: "numeric", Expected: "NumObj"})
+	if mismatch != "" {
+		panic(mismatch)
+	}
+	if (gerr == nil) != (rerr == nil) {
+		panic("numeric presence: " + input)
+	}
+	rVals := NumObj{I: rn.I, U: rn.U, F: rn.F}
+	checkNumericValues(gn, rVals, input)
+}
+
+func decodeNumeric() {
+	numericInputs := []string{
+		`{"i":"+5","u":"5","f":"1.5"}`,
+		`{"i":"05","u":"5","f":"1.5"}`,
+		`{"i":"-0","u":"5","f":"1.5"}`,
+		`{"i":" 5","u":"5","f":"1.5"}`,
+		`{"i":"0x5","u":"5","f":"1.5"}`,
+		`{"i":"9223372036854775808","u":"5","f":"1.5"}`,
+		`{"i":"5","u":"5","f":"1.5"}`,
+		`{"i":"5","u":"05","f":"1.5"}`,
+		`{"i":"5","u":"-1","f":"1.5"}`,
+		`{"i":"5","u":"18446744073709551615","f":"1.5"}`,
+		`{"i":"5","u":"18446744073709551616","f":"1.5"}`,
+		`{"i":"5","u":"5","f":"+5"}`,
+		`{"i":"5","u":"5","f":"NaN"}`,
+		`{"i":"5","u":"5","f":"+Inf"}`,
+		`{"i":"5","u":"5","f":"-Inf"}`,
+		`{"i":"5","u":"5","f":"1e1000"}`,
+	}
+	for _, input := range numericInputs {
+		checkNumericRow(input)
+	}
+	fmt.Println("numeric parity ok")
+}
+
+func marshalerPrecedence() {
+	m := MarshalObj{V: 5}
+	gm, gmErr := m.MarshalJSON()
+	if gmErr != nil {
+		panic("marshal gen err: " + gmErr.Error())
+	}
+	gmText := string(gm)
+	rm, rmErr := json.Marshal(struct {
+		V MInt `json:"v,string"`
+	}{V: 5})
+	if rmErr != nil {
+		panic("marshal ref err: " + rmErr.Error())
+	}
+	rmText := string(rm)
+	if gmText != rmText {
+		panic("marshaler precedence: gen " + gmText + " ref " + rmText)
+	}
+	if gmText != `{"v":"custom"}` {
+		panic("marshaler precedence bytes: " + gmText)
+	}
+	fmt.Println("marshaler precedence ok")
+}
+
+func main() {
+	encodeInt()
+	encodeString()
+	encodeBool()
+	decodeQuoted()
+	decodeBare()
+	decodeMalformed()
+	decodeFatal()
+	omitZero()
+	comboStringOmitZero()
+	pointerString()
+	ptrRecvOmitZero()
+	marshalerPrecedence()
+	decodeNumeric()
+}
+
+-- poracle/go.mod --
+module example.com/poracle
+
+go 1.27
+
+-- poracle/poracle.go --
+package poracle
+
+import (
+	"encoding/json"
+	"errors"
+	"strconv"
+)
+
+// ParityRequest groups decode parity inputs so helpers stay within the
+// parameter limit. Expected names the generated root (Obj or NumObj);
+// the oracle root stays anonymous empty.
+type ParityRequest struct {
+	GErr     error
+	RErr     error
+	Input    string
+	Label    string
+	Expected string
+}
+
+// CheckDecodeParity compares a generated decode error against the
+// anonymous-struct oracle decode error for the same input. It returns ""
+// on parity and a mismatch description otherwise, so .lgo callers keep a
+// thin assert without nullable-pointer narrowing. Structured
+// *json.UnmarshalTypeError facts compare shared Value, Type, Field and
+// Offset, with per-target Struct root asserted literally against
+// Expected versus empty anonymous; genuinely plain errors compare
+// exact text.
+func CheckDecodeParity(r ParityRequest) string {
+	if r.GErr == nil && r.RErr == nil {
+		return ""
+	}
+	if r.GErr == nil {
+		return r.Label + " presence: gen success ref " + r.RErr.Error() + " input " + r.Input
+	}
+	if r.RErr == nil {
+		return r.Label + " presence: gen " + r.GErr.Error() + " ref success input " + r.Input
+	}
+	return checkParityErrors(r)
+}
+
+func checkParityErrors(r ParityRequest) string {
+	var gUTE *json.UnmarshalTypeError
+	var rUTE *json.UnmarshalTypeError
+	gIsUTE := errors.As(r.GErr, &gUTE)
+	rIsUTE := errors.As(r.RErr, &rUTE)
+	if gIsUTE != rIsUTE {
+		return r.Label + " error class: gen " + r.GErr.Error() + " ref " + r.RErr.Error() + " input " + r.Input
+	}
+	if !gIsUTE {
+		if r.GErr.Error() != r.RErr.Error() {
+			return r.Label + " message: gen " + r.GErr.Error() + " ref " + r.RErr.Error() + " input " + r.Input
+		}
+		return ""
+	}
+	return checkParityFacts(gUTE, rUTE, r)
+}
+
+func checkParityFacts(gUTE *json.UnmarshalTypeError, rUTE *json.UnmarshalTypeError, r ParityRequest) string {
+	if gUTE == nil {
+		return r.Label + " gen UTE nil: " + r.Input
+	}
+	if rUTE == nil {
+		return r.Label + " ref UTE nil: " + r.Input
+	}
+	if gUTE.Struct != r.Expected {
+		return r.Label + " gen Struct: got " + gUTE.Struct + " want " + r.Expected + " input " + r.Input
+	}
+	if rUTE.Struct != "" {
+		return r.Label + " ref Struct: got " + rUTE.Struct + " want empty input " + r.Input
+	}
+	if gUTE.Field != rUTE.Field {
+		return r.Label + " field: gen " + gUTE.Field + " ref " + rUTE.Field + " input " + r.Input
+	}
+	if gUTE.Value != rUTE.Value {
+		return r.Label + " value: gen " + gUTE.Value + " ref " + rUTE.Value + " input " + r.Input
+	}
+	if msg := checkParityType(gUTE, rUTE, r.Input, r.Label); msg != "" {
+		return msg
+	}
+	if gUTE.Offset != rUTE.Offset {
+		return r.Label + " offset mismatch: gen " + strconv.FormatInt(gUTE.Offset, 10) + " ref " + strconv.FormatInt(rUTE.Offset, 10) + " input " + r.Input
+	}
+	return ""
+}
+
+func checkParityType(gUTE *json.UnmarshalTypeError, rUTE *json.UnmarshalTypeError, input string, label string) string {
+	if gUTE.Type == nil || rUTE.Type == nil {
+		if gUTE.Type != rUTE.Type {
+			return label + " type nil mismatch input " + input
+		}
+		return ""
+	}
+	if gUTE.Type.String() != rUTE.Type.String() {
+		return label + " type: gen " + gUTE.Type.String() + " ref " + rUTE.Type.String() + " input " + input
+	}
+	return ""
+}
+
+// PInt mirrors the logos ZInt ground truth in ordinary Go: a named int
+// implementing only IsZero. Plain *PInt fields exercise the genuine
+// encoding/json nullable-pointer path, which .lgo cannot spell because
+// *T there is non-nil.
+type PInt int
+
+func (v PInt) IsZero() bool { return v == 42 }
+
+// Ptr mirrors PtrObj with an ordinary Go pointer.
+type Ptr struct {
+	P *PInt `json:"p,string"`
+}
+
+// MarshalNil marshals the nil-pointer control through encoding/json.
+func MarshalNil() ([]byte, error) {
+	return json.Marshal(Ptr{P: nil})
+}
+
+// MarshalFull marshals a non-nil pointer through encoding/json.
+func MarshalFull(v PInt) ([]byte, error) {
+	return json.Marshal(Ptr{P: &v})
+}

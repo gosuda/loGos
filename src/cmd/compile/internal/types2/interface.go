@@ -164,6 +164,12 @@ func (check *Checker) interfaceType(ityp *Interface, iface *syntax.InterfaceType
 		sig.recv = newVar(RecvVar, f.Name.Pos(), check.pkg, "", recvTyp)
 
 		m := NewFunc(f.Name.Pos(), check.pkg, name, sig)
+		if f.Const {
+			// loGo/s readonly obligation: `interface { const Name() string }`.
+			// Property elements (PropertyType) returned above and never reach
+			// here; Field.Const is set only for the method shape.
+			m.SetLogosReadonly(true)
+		}
 		check.recordDef(f.Name, m)
 		ityp.methods = append(ityp.methods, m)
 	}

@@ -20,43 +20,10 @@ import (
 // their sources through the write-barrier move path and the runtime bulk
 // barrier while marking is active.
 //
-// zgcBarrierRelocate lets a loading thread relocate an unpublished object
-// itself from its page's to-space reservation instead of waiting for a
-// worker. Publication reuses the zgcRelocateObject CAS protocol, so two
-// threads racing one unpublished object keep one copy and the loser
-// unclaims its slot.
-
-// zgcPToSpaceCache is a bump cursor into one reserved to-space span. The
-// reservation happens off the mutator path (mark-termination pause or a
-// preemptible refill); the bump itself is lock-free and allocation-free.
-// Caches live in the page registry, one per span class, serialized by the
-// page mutex.
-type zgcPToSpaceCache struct {
-	span *mspan
-	next uintptr
-}
-
-// zgcRefillPToSpace reserves a fresh to-space span of class sc for pg and
-// installs it as the page's cache. Allocation runs outside the page
-// mutex; only the list install holds it. It runs in preemptible context
-// only; nosplit and signal contexts never reach it.
-func zgcRefillPToSpace(pg *zgcPage, sc spanClass) *zgcPToSpaceCache {
-	ns := zgcReserveToSpace(sc, pageSize)
-	if ns == nil {
-		return nil
-	}
-	st := zgcPageState(pg)
-	lock(&st.mu)
-	st.toSpace = append(st.toSpace, ns)
-	unlock(&st.mu)
-	return &zgcPToSpaceCache{span: ns}
-}
-
-// zgcCanRelocateDeep reports whether the current context may run the
-// relocation deep path: preemptible, with a P, off the g0 and signal
-// stacks. Nosplit and signal contexts get the source address instead;
-// the source stays valid until release, so reads stay sound and only
-// racing writes are residual.
+// zgcCanRelocateDeep reports whether the current context may relocate or
+// heal: preemptible, with a P, off the g0 and signal stacks. Other
+// contexts resolve through the forwarding table only, which keeps reads
+// sound while the source stays valid until release.
 func zgcCanRelocateDeep() bool {
 	gp := getg()
 	mp := gp.m
@@ -84,49 +51,84 @@ func zgcBarrierMark(target uintptr) {
 	}
 	gcw := &mp.p.ptr().gcw
 	if obj, span, objIndex := findObject(target, 0, 0); obj != 0 {
+		// A barrier-loaded word may be stale: it can name a slot the
+		// previous sweep freed and nothing has reused yet. Marking it
+		// would leave a mark with no allocation behind, which the
+		// quarantine vet rejects. Skip free slots exactly as the
+		// conservative scanner does; slots allocated since mark start
+		// are already black, so skipping loses nothing. Large spans hold
+		// one object and cannot name a free slot this way.
+		if span.spanclass.sizeclass() != 0 && span.isFreeOrNewlyAllocated(objIndex) {
+			return
+		}
 		greyobject(obj, 0, 0, span, gcw, objIndex)
 	}
 }
 
-// zgcBarrierRelocate relocates the object holding addr on the registered
-// page pg and returns its copy. Claims serialize on the page mutex inside
-// the copy path; the copy and publication run outside it. It reports
-// false when addr names no relocatable object.
-func zgcBarrierRelocate(pg *zgcPage, addr uintptr) (uintptr, bool) {
-	if pg == nil || !zgcCanRelocateDeep() {
-		return 0, false
-	}
-	return zgcRelocateOneLocked(pg, addr)
-}
+// zgcRelocateStatus is the one core typed outcome for single-object
+// relocation. Done names a stable copy (already-forwarded, large in place,
+// or a winning commit). NotHeap names only a missing heap object for the
+// relocation (nil pg or nil span). NoMemory names only allocator-observed
+// exhaustion (the to-space reservation returned nil). Refused names every
+// other lawful stay: gate-observed freezes (foreign-exposed source at
+// commit) plus concurrent unregister, out-of-range, and holds races that
+// commit maps to 0 and that collapse here so no false OOM ever surfaces.
+// More precise reasons are unnecessary: callers branch Done (use the copy),
+// NotHeap (use the source via the lifetime protocol), NoMemory (throw),
+// Refused (pin the source in place, never retry until unexposure, never
+// throw OOM).
+type zgcRelocateStatus uint8
 
-// zgcRelocateOneLocked copies the single object holding addr into the
-// page's to-space reservation and publishes it. Large spans are pinned,
-// never copied.
-func zgcRelocateOneLocked(pg *zgcPage, addr uintptr) (uintptr, bool) {
+const (
+	zgcRelocateDone zgcRelocateStatus = iota
+	zgcRelocateNotHeap
+	zgcRelocateNoMemory
+	zgcRelocateRefused
+)
+
+// zgcRelocateOneResult copies the single object holding addr into the
+// page's to-space reservation and publishes it, reporting the typed outcome.
+// Large spans never copy and report Done in place (see LargeLocked).
+// Forwarded objects report Done with the published copy plus interior offset.
+// Claim failure reports NoMemory; commit 0 reports Refused; missing heap or
+// page reports NotHeap. This is the single implementation; the boolean
+// wrapper below stays live for barrier and foreign-attach users and shares
+// it, so there is no second pipeline.
+func zgcRelocateOneResult(pg *zgcPage, addr uintptr) (uintptr, zgcRelocateStatus) {
+	if pg == nil {
+		return 0, zgcRelocateNotHeap
+	}
 	s := spanOfHeap(addr)
 	if s == nil {
-		return 0, false
+		return 0, zgcRelocateNotHeap
 	}
 	if s.spanclass.sizeclass() == 0 {
-		return zgcRelocateLargeLocked(pg, s)
+		to, _ := zgcRelocateLargeLocked(pg, s)
+		return to, zgcRelocateDone
 	}
 	idx := s.objIndex(addr)
 	base := s.base() + idx*s.elemsize
 	if to, ok := pg.forward(base); ok {
-		return to + (addr - base), true
+		return to + (addr - base), zgcRelocateDone
 	}
-	if won := zgcCopyOne(pg, s, base, s.elemsize); won != 0 {
-		return won + (addr - base), true
+	won, st := zgcCopyOneResult(pg, s, base, s.elemsize)
+	if st != zgcRelocateDone {
+		return 0, st
 	}
-	return 0, false
+	return won + (addr - base), zgcRelocateDone
 }
 
-// zgcRelocateLargeLocked publishes the large object of span s without
-// copying: large objects never move, and the entry pins the address.
+// zgcRelocateLargeLocked pins the large object of span s without copying:
+// large objects never move, so the source freeze holds without a commit.
+// The locking page query is exact world-running or in a pause; no copy,
+// no identity move and no accounting publish, hence no gate-held commit.
 func zgcRelocateLargeLocked(pg *zgcPage, s *mspan) (uintptr, bool) {
 	base := s.base()
 	if to, ok := pg.forward(base); ok {
 		return to, true
+	}
+	if zgcForeignPagePinned(base) {
+		return base, true
 	}
 	return base, true
 }
@@ -137,6 +139,9 @@ func zgcRelocateLargeLocked(pg *zgcPage, s *mspan) (uintptr, bool) {
 // that fills them publishes them onto the swept sets. Failure abandons
 // the page.
 func zgcReservePageToSpace(pg *zgcPage) bool {
+	if zgcForeignPagePinnedSTW(pg.start) {
+		return false
+	}
 	st := zgcPageState(pg)
 	for _, s := range st.spans {
 		ns := zgcReserveToSpace(s.spanclass, s.npages*pageSize)
@@ -152,31 +157,45 @@ func zgcReservePageToSpace(pg *zgcPage) bool {
 // zgcAbandonPage unregisters a page whose to-space reservation failed and
 // frees its metadata. Nothing copied, nothing published, no source span
 // quarantined: the page stays ordinary heap.
+//
+// The same drain discipline as the retire path: the abandoned page
+// replaces its directory entry with a retiring tombstone this same pause,
+// keeping the granule reserved while a signal-stack or no-P reader that
+// resolved it drains. The domain and refs sample decides when its
+// reservation, state and header go. A drained page frees everything here;
+// a page with a live transient reader or lease is queued for the next
+// pause's retire pass, which re-samples the idempotent gates and drains it
+// there. The never-released page has no remap epoch to await and no
+// quarantined spans to free.
 func zgcAbandonPage(pg *zgcPage) {
-	st := zgcPageState(pg)
-	st.spans = nil
-	for _, ns := range st.toSpace {
-		lock(&mheap_.lock)
-		atomic.Store(&ns.sweepgen, mheap_.sweepgen)
-		mheap_.freeSpanLocked(ns, spanAllocHeap)
-		unlock(&mheap_.lock)
+	pg.abandoned = true
+	zgcPageUnpublish(pg)
+	if zgcPageAcqDomain.Load() == 0 && pg.refs.Load() == 0 {
+		zgcAbandonDrain(pg)
+		return
 	}
-	st.toSpace = nil
-	zgcPageForget(pg)
-	zgcFreePage(pg)
+	zgcRetirePendingAppend(pg)
 }
 
-// zgcDeepRelocate runs the relocation deep path for a barrier slow-path
-// word: when the canonical address lies on a registered page with no
-// published entry yet, the loading thread relocates the object itself.
-// It reports whether the object is now published.
-func zgcDeepRelocate(pg *zgcPage, addr uintptr) bool {
-	if pg == nil || !zgcCanRelocateDeep() {
-		return false
-	}
-	if pg.published.Load() == pg.live {
-		return true
-	}
-	_, ok := zgcRelocateOneLocked(pg, addr)
-	return ok
+// zgcAbandonDrain frees what an abandoned page still owns once the
+// drain sample passed: its reserved to-space spans, then its state and
+// header through Forget and FreePage. The source spans list is not
+// freed — the page never quarantined anything, and those spans stay
+// ordinary heap the allocator keeps owning; Forget clears the list.
+// The reservation free runs under systemstack so the drain is
+// answerable from the pause (already on g0, no switch for the nesting)
+// and from the retire seam on an ordinary goroutine stack, like the
+// retire tail it mirrors.
+func zgcAbandonDrain(pg *zgcPage) {
+	st := zgcPageState(pg)
+	systemstack(func() {
+		lock(&mheap_.lock)
+		for _, ns := range st.toSpace {
+			atomic.Store(&ns.sweepgen, mheap_.sweepgen)
+			mheap_.freeSpanLocked(ns, spanAllocHeap)
+		}
+		unlock(&mheap_.lock)
+	})
+	zgcPageForget(pg)
+	zgcFreePage(pg)
 }

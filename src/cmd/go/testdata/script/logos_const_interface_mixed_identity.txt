@@ -1,0 +1,471 @@
+# Mixed ordinary/qualified identity: named Qual/Ord plus anonymous UseQual/UseOrd share
+# spelling Name() Token. Pure Good accepted everywhere; mutating Mut accepted
+# only on ordinary paths. Go wrapper w re-exports Qual/Ord; contract.Want
+# checks transitive qualified identity. Both import orders plus native lgo/Go
+# consumers run; attacks fail only on qualified with const_view_mutation.
+# No wiring assertions; only build/run and diagnostic code are pinned.
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+mkdir $WORK/bin
+
+# Positive: wrapper builds, both orders share nominal identity, lgo/Go run.
+cd sl
+logos build ./...
+cd ../w
+logos build ./...
+cd ../m
+logos build -o $WORK/bin/m$GOEXE .
+! stderr 'cannot use'
+exec $WORK/bin/m$GOEXE
+cd ../m2
+logos build -o $WORK/bin/m2$GOEXE .
+! stderr 'cannot use'
+exec $WORK/bin/m2$GOEXE
+cd ../lq
+logos build ./...
+logos build -o $WORK/bin/lq$GOEXE ./cmd
+exec $WORK/bin/lq$GOEXE
+stdout '^lgo-ok$'
+cd ../gq
+logos build ./...
+logos build -o $WORK/bin/gq$GOEXE ./cmd
+exec $WORK/bin/gq$GOEXE
+stdout '^go-ok$'
+cd ../contract
+logos build ./...
+cd ../cache
+logos build -o $WORK/bin/cache$GOEXE .
+! stderr 'cannot use'
+! stderr 'const_view_mutation'
+exec $WORK/bin/cache$GOEXE
+cd ..
+
+# Negative: mutating only rejected on qualified paths.
+cd neg
+! logos build ./qual
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./usequal
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./towant
+stderr '\[correctness::const_view_mutation\]'
+cd ..
+
+cd gneg
+! logos build ./...
+stderr '\[correctness::const_view_mutation\]'
+cd ..
+
+-- sl/go.mod --
+module example/sl
+
+go 1.27
+
+-- sl/sl.lgo --
+package sl
+
+type Token struct{ Text string }
+
+type Qual interface {
+	const Name() Token
+}
+
+type Ord interface {
+	Name() Token
+}
+
+type Good struct{}
+
+func (g Good) Name() Token { return Token{Text: "good"} }
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Name() Token {
+	m.S[0] = 1
+	return Token{Text: "mut"}
+}
+
+func UseQual(x interface{ const Name() Token }) Token {
+	return x.Name()
+}
+
+func UseOrd(x interface{ Name() Token }) Token {
+	return x.Name()
+}
+
+func NewQual() Qual {
+	return Good{}
+}
+
+func NewOrd() Ord {
+	return Good{}
+}
+
+func NewMutOrd() Ord {
+	return Mut{S: []int{1}}
+}
+
+-- w/go.mod --
+module example/w
+
+go 1.27
+
+require example/sl v0.0.0
+
+replace example/sl => ../sl
+
+-- w/w.go --
+package w
+
+import "example/sl"
+
+type AliasQual = sl.Qual
+
+type AliasOrd = sl.Ord
+
+func MakeQual() sl.Qual { return sl.NewQual() }
+
+func MakeOrd() sl.Ord { return sl.NewOrd() }
+
+func MakeMutOrd() sl.Ord { return sl.NewMutOrd() }
+
+-- m/go.mod --
+module example/m
+
+go 1.27
+
+require (
+	example/sl v0.0.0
+	example/w v0.0.0
+)
+
+replace example/sl => ../sl
+
+replace example/w => ../w
+
+-- m/main.go --
+package main
+
+import (
+	"example/w"
+	"example/sl"
+)
+
+func main() {
+	var q sl.Qual = w.MakeQual()
+	var a w.AliasQual = q
+	if a.Name().Text != "good" {
+		panic("diamond mismatch")
+	}
+	var o sl.Ord = w.MakeOrd()
+	var ao w.AliasOrd = o
+	if ao.Name().Text != "good" {
+		panic("ord mismatch")
+	}
+	var mo sl.Ord = w.MakeMutOrd()
+	if mo.Name().Text != "mut" {
+		panic("mutord mismatch")
+	}
+}
+
+-- m2/go.mod --
+module example/m2
+
+go 1.27
+
+require (
+	example/sl v0.0.0
+	example/w v0.0.0
+)
+
+replace example/sl => ../sl
+
+replace example/w => ../w
+
+-- m2/main.go --
+package main
+
+import (
+	"example/sl"
+	"example/w"
+)
+
+func main() {
+	var q sl.Qual = w.MakeQual()
+	var a w.AliasQual = q
+	if a.Name().Text != "good" {
+		panic("diamond mismatch")
+	}
+	var o sl.Ord = w.MakeOrd()
+	var ao w.AliasOrd = o
+	if ao.Name().Text != "good" {
+		panic("ord mismatch")
+	}
+	var mo sl.Ord = w.MakeMutOrd()
+	if mo.Name().Text != "mut" {
+		panic("mutord mismatch")
+	}
+}
+
+-- lq/go.mod --
+module example/lq
+
+go 1.27
+
+require example/sl v0.0.0
+
+replace example/sl => ../sl
+
+-- lq/q/q.lgo --
+package q
+
+import "example/sl"
+
+func ViaQual(g sl.Good) string {
+	var q sl.Qual = g
+	return q.Name().Text
+}
+
+func ViaOrd(g sl.Good) string {
+	var o sl.Ord = g
+	return o.Name().Text
+}
+
+func ViaMutOrd(m sl.Mut) string {
+	var o sl.Ord = m
+	return o.Name().Text
+}
+
+func ViaUseQual(g sl.Good) string {
+	return sl.UseQual(g).Text
+}
+
+func ViaUseOrd(g sl.Good) string {
+	return sl.UseOrd(g).Text
+}
+
+func ViaMutUseOrd(m sl.Mut) string {
+	return sl.UseOrd(m).Text
+}
+
+func Run() string {
+	g := sl.Good{}
+	if ViaQual(g) != "good" {
+		return "bad-qual"
+	}
+	if ViaOrd(g) != "good" {
+		return "bad-ord"
+	}
+	m := sl.Mut{S: []int{1}}
+	if ViaMutOrd(m) != "mut" {
+		return "bad-mutord"
+	}
+	if ViaUseQual(g) != "good" {
+		return "bad-usequal"
+	}
+	if ViaUseOrd(g) != "good" {
+		return "bad-useord"
+	}
+	if ViaMutUseOrd(m) != "mut" {
+		return "bad-mutuseord"
+	}
+	return "lgo-ok"
+}
+
+-- lq/cmd/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example/lq/q"
+)
+
+func main() {
+	fmt.Println(q.Run())
+}
+
+-- gq/go.mod --
+module example/gq
+
+go 1.27
+
+require example/sl v0.0.0
+
+replace example/sl => ../sl
+
+-- gq/qq/qq.go --
+package qq
+
+import "example/sl"
+
+func Run() string {
+	g := sl.Good{}
+	var q sl.Qual = g
+	if q.Name().Text != "good" {
+		return "bad-qual"
+	}
+	var o sl.Ord = g
+	if o.Name().Text != "good" {
+		return "bad-ord"
+	}
+	m := sl.Mut{S: []int{1}}
+	var mo sl.Ord = m
+	if mo.Name().Text != "mut" {
+		return "bad-mutord"
+	}
+	if sl.UseQual(g).Text != "good" {
+		return "bad-usequal"
+	}
+	if sl.UseOrd(g).Text != "good" {
+		return "bad-useord"
+	}
+	if sl.UseOrd(m).Text != "mut" {
+		return "bad-mutuseord"
+	}
+	return "go-ok"
+}
+
+-- gq/cmd/main.go --
+package main
+
+import (
+	"fmt"
+
+	"example/gq/qq"
+)
+
+func main() { fmt.Println(qq.Run()) }
+
+-- contract/go.mod --
+module example/contract
+
+go 1.27
+
+require example/sl v0.0.0
+
+replace example/sl => ../sl
+
+-- contract/contract.lgo --
+package contract
+
+import "example/sl"
+
+type Want interface {
+	const Name() sl.Token
+}
+
+type WantOrd interface {
+	Name() sl.Token
+}
+
+-- cache/go.mod --
+module example/cache
+
+go 1.27
+
+require (
+	example/contract v0.0.0
+	example/sl v0.0.0
+	example/w v0.0.0
+)
+
+replace example/contract => ../contract
+
+replace example/sl => ../sl
+
+replace example/w => ../w
+
+-- cache/main.go --
+package main
+
+import (
+	"example/contract"
+	"example/w"
+)
+
+func main() {
+	var q contract.Want = w.MakeQual()
+	if q.Name().Text != "good" {
+		panic("transitive qualified mismatch")
+	}
+	var o contract.WantOrd = w.MakeOrd()
+	if o.Name().Text != "good" {
+		panic("transitive ordinary mismatch")
+	}
+}
+
+-- neg/go.mod --
+module example/neg
+
+go 1.27
+
+require (
+	example/contract v0.0.0
+	example/sl v0.0.0
+)
+
+replace example/contract => ../contract
+
+replace example/sl => ../sl
+
+-- neg/qual/qual.lgo --
+package qual
+
+import "example/sl"
+
+func Attack(m sl.Mut) sl.Qual {
+	return m
+}
+
+-- neg/usequal/usequal.lgo --
+package usequal
+
+import "example/sl"
+
+func Attack(m sl.Mut) sl.Token {
+	return sl.UseQual(m)
+}
+
+-- neg/towant/towant.lgo --
+package towant
+
+import (
+	"example/contract"
+	"example/sl"
+)
+
+func Attack(o sl.Ord) contract.Want {
+	return o
+}
+
+-- gneg/go.mod --
+module example/gneg
+
+go 1.27
+
+require example/sl v0.0.0
+
+replace example/sl => ../sl
+
+-- gneg/main.go --
+package main
+
+import "example/sl"
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Name() sl.Token {
+	m.S[0] = 1
+	return sl.Token{Text: "mut"}
+}
+
+func main() {
+	m := Mut{S: []int{1}}
+	var q sl.Qual = m
+	println(q.Name().Text)
+}

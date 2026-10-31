@@ -1,0 +1,85 @@
+// run -goexperiment logosarena -race
+
+package main
+
+// REDTEAM #35 (SPEC Sec 8.3, T-301.1; IMPLEMENTATION.md M18-S3): arena
+// reuse under -race must report no false race, and watermark moves must
+// stay visible to the race detector (racemalloc on alloc, racefree on
+// restore; the inline bump is off under -race, so this exercises the
+// slow-path hooks). The -race flag on the directive builds the staged
+// module instrumented, so a missing hook fails the run with a detector
+// report instead of passing silently. Rapid iteration-local dynamic
+// allocations restore the watermark at each loop back-edge and hand the
+// same memory to the next iteration; every round fills and checksums its
+// buffer against an allocation-free oracle, so a stale or aliased reuse
+// fails loudly. The instrumented build needs cgo: run the gate with
+// CGO_ENABLED=1. Companion gate: GOEXPERIMENT=logosarena go test -short
+// -race runtime -run LogosArena (M18-S1).
+
+import "fmt"
+
+//go:noinline
+func r35Sum(b []byte) int {
+	s := 0
+	for _, v := range b {
+		s += int(v)
+	}
+	return s
+}
+
+//go:noinline
+func r35Oracle(n, r int) int {
+	s := 0
+	for i := 0; i < n; i++ {
+		s += int(byte((i + r) & 0xFF))
+	}
+	return s
+}
+
+//go:noinline
+func r35Work(n, rounds int) int {
+	total := 0
+	for r := 0; r < rounds; r++ {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte((i + r) & 0xFF)
+		}
+		got := r35Sum(b)
+		want := r35Oracle(n, r)
+		if got != want {
+			panic("redteam35: round reuse corrupted data")
+		}
+		total += got
+	}
+	return total
+}
+
+//go:noinline
+func r35Interleave(n int) int {
+	var kept []byte
+	last := 0
+	for r := 0; r < 4; r++ {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(r + 1)
+		}
+		if r == 0 {
+			kept = b
+		}
+		last = r35Sum(b)
+	}
+	first := r35Sum(kept)
+	if first != n*1 {
+		panic("redteam35: carried buffer aliased by later reuse")
+	}
+	if last != n*4 {
+		panic("redteam35: last buffer has wrong contents")
+	}
+	return first + last
+}
+
+func main() {
+	total := r35Work(1024, 200)
+	fmt.Println("reuse:", total)
+	fmt.Println("interleave:", r35Interleave(1024))
+}

@@ -581,6 +581,66 @@ func TestFallbackSyntaxError(t *testing.T) {
 	}
 }
 
+type fallbackQRecorder struct {
+	got string
+}
+
+func (r *fallbackQRecorder) UnmarshalJSON(b []byte) error {
+	r.got = string(b)
+	return nil
+}
+
+func TestFallbackQUnwrapsStringOption(t *testing.T) {
+	var r fallbackQRecorder
+	s := NewScanner([]byte(`{"v":"7"}`), (*fallbackTarget)(nil))
+	if !s.Object() {
+		t.Fatalf("Object failed: %v", s.Err())
+	}
+	for s.Next() {
+		s.FallbackQ(&r)
+	}
+	if err := s.End(); err != nil {
+		t.Fatalf("End() = %v, Saved() = %v", err, s.Saved())
+	}
+	if r.got != "7" {
+		t.Fatalf("UnmarshalJSON received %q, want %q (inner content, not outer token)", r.got, "7")
+	}
+}
+
+func TestFallbackQNullLeavesValue(t *testing.T) {
+	var n int = 5
+	s := NewScanner([]byte(`{"v":null}`), (*fallbackTarget)(nil))
+	if !s.Object() {
+		t.Fatalf("Object failed: %v", s.Err())
+	}
+	for s.Next() {
+		s.FallbackQ(&n)
+	}
+	if err := s.End(); err != nil {
+		t.Fatalf("End() = %v, Saved() = %v", err, s.Saved())
+	}
+	if n != 5 {
+		t.Fatalf("null changed value to %d, want unchanged 5", n)
+	}
+}
+
+func TestFallbackQBareValueSavesError(t *testing.T) {
+	var r fallbackQRecorder
+	s := NewScanner([]byte(`{"v":7}`), (*fallbackTarget)(nil))
+	if !s.Object() {
+		t.Fatalf("Object failed: %v", s.Err())
+	}
+	for s.Next() {
+		s.FallbackQ(&r)
+	}
+	if s.Err() != nil {
+		t.Fatalf("Err() = %v, want nil (bare should be saved, not fatal)", s.Err())
+	}
+	if s.Saved() == nil {
+		t.Fatal("Saved() = nil, want invalid use of ,string error for bare value")
+	}
+}
+
 func TestSavedAndEndOrdering(t *testing.T) {
 	s := NewScanner([]byte(`{"a":"x"}`), (*user)(nil))
 	s.Object()

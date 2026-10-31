@@ -30,38 +30,44 @@ const rtAlias = "_logos_rt"
 // markerPrefix tags placeholder names that renderText replaces.
 const markerPrefix = "\x00logosP"
 
-// textSub replaces one printed marker with source text.
+// textSub replaces one printed marker with composed text.
 type textSub struct {
 	marker string
-	text   string
+	text   otext
 }
 
 // markerText returns a placeholder name standing for text and records it.
 // The name carries pos: renderText prints through the syntax printer,
 // which requires known positions on every node.
-func markerText(subs *[]textSub, seq *int, pos syntax.Pos, text string) *syntax.Name {
+func markerText(subs *[]textSub, seq *int, pos syntax.Pos, text otext) *syntax.Name {
 	m := fmt.Sprintf("%s%d\x00", markerPrefix, *seq)
 	*seq++
 	*subs = append(*subs, textSub{marker: m, text: text})
 	return nameOf(pos, m)
 }
 
-// renderText prints stmts and replaces every marker with source text.
-func renderText(stmts []syntax.Stmt, subs []textSub) string {
+// renderText prints stmts and replaces every marker with its text. The
+// printed scaffolding is generated; every marker substitution embeds
+// the origin chunks of its text, so the result says which bytes are
+// verbatim source. The bytes equal the plain-Replacer output.
+func renderText(stmts []syntax.Stmt, subs []textSub) otext {
 	var buf bytes.Buffer
 	for _, s := range stmts {
 		_, _ = syntax.Fprint(&buf, s, 0)
 		buf.WriteByte('\n')
 	}
-	out := buf.String()
+	out := gen(buf.String())
 	if len(subs) == 0 {
 		return out
 	}
-	pairs := make([]string, 0, 2*len(subs))
+	byMark := make(map[string]otext, len(subs))
 	for _, sub := range subs {
-		pairs = append(pairs, sub.marker, sub.text)
+		byMark[sub.marker] = sub.text
 	}
-	return strings.NewReplacer(pairs...).Replace(out)
+	return substNul(out, func(mark string) (otext, bool) {
+		t, ok := byMark[mark]
+		return t, ok
+	})
 }
 
 // leftmostOf returns the position of the leftmost token of e. Selector,

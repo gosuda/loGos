@@ -21,7 +21,7 @@ import (
 // capturePiece is one callee or argument of a deferred call.
 type capturePiece struct {
 	expr    syntax.Expr
-	text    string
+	text    otext
 	start   int
 	end     int
 	capture bool
@@ -311,7 +311,7 @@ func (fc *funcLower) lowerDeferTry(s *syntax.CallStmt, t *syntax.TryExpr, call *
 	closureT := deferClosure(cpos, []syntax.Stmt{textStmts[len(textStmts)-1]})
 	headT := append(slices.Clone(textStmts[:len(textStmts)-1]), deferOf(cpos, callOf(cpos, closureT, nil)))
 	prefix := leftoverComments(fl, span{start: stmtOff, end: spanEnd}, planSpans(plan))
-	fl.add(stmtOff, spanEnd, prefix+renderText(headT, tw.subs))
+	fl.addT(stmtOff, spanEnd, cat(prefix, renderText(headT, tw.subs)))
 	return headN
 }
 
@@ -345,7 +345,7 @@ func (fc *funcLower) lowerErrdefer(s *syntax.ErrdeferStmt) []syntax.Stmt {
 	text := fc.guardedDefer(cpos, bodyT, capNamesT, capValsT)
 	spanEnd := skipCloseParens(fl.src, plan.end)
 	prefix := leftoverComments(fl, span{start: stmtOff, end: spanEnd}, planSpans(plan))
-	fl.add(stmtOff, spanEnd, prefix+renderText(text, tw.subs))
+	fl.addT(stmtOff, spanEnd, cat(prefix, renderText(text, tw.subs)))
 	return native
 }
 
@@ -367,7 +367,7 @@ func (fc *funcLower) lowerErrdeferTry(s *syntax.ErrdeferStmt, t *syntax.TryExpr,
 	headN := append(slices.Clone(native[:len(native)-1]), fc.guardedDefer(cpos, bodyN, nil, nil)[0])
 	headT := append(slices.Clone(textStmts[:len(textStmts)-1]), fc.guardedDefer(cpos, bodyT, nil, nil)[0])
 	prefix := leftoverComments(fl, span{start: stmtOff, end: spanEnd}, planSpans(plan))
-	fl.add(stmtOff, spanEnd, prefix+renderText(headT, tw.subs))
+	fl.addT(stmtOff, spanEnd, cat(prefix, renderText(headT, tw.subs)))
 	return headN
 }
 
@@ -394,14 +394,14 @@ func planSpans(plan *callPlan) []span {
 
 // leftoverComments lifts the comments of a replaced span that fall outside
 // every piece, so interior comments survive in the eject text.
-func leftoverComments(fl *fileLower, whole span, pieces []span) string {
-	var prefix string
+func leftoverComments(fl *fileLower, whole span, pieces []span) otext {
+	var parts []otext
 	for _, c := range commentsIn(fl.src, whole.start, whole.end) {
 		if !insideAny(c, pieces) {
-			prefix += string(fl.src[c.start:c.end]) + "\n"
+			parts = append(parts, fl.srcUser(c.start, c.end), gen("\n"))
 		}
 	}
-	return prefix
+	return cat(parts...)
 }
 
 // insideAny reports whether c lies inside one of pieces.
@@ -456,7 +456,7 @@ func (fc *funcLower) lowerReturn(s *syntax.ReturnStmt) []syntax.Stmt {
 	resMark := tw.mark(retPos, resText)
 	text := renderText(build([]syntax.Expr{resMark}), tw.subs)
 	prefix := leftoverComments(fl, span{start: retOff, end: end}, []span{trimmed})
-	fl.add(retOff, end, prefix+text)
+	fl.addT(retOff, end, cat(prefix, text))
 	return native
 }
 

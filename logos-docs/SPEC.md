@@ -118,7 +118,7 @@ The `logos lint` check MUST run inside escape analysis for escape rules, on Go p
 Lint overhead carries target: 2% of compile time, measured by BenchmarkLintOverhead [T-102].
 `logos lint` MUST lint Go packages with the language-neutral rules only [T-102][R-U1].
 A rule MUST count as language-neutral when a Go package can trigger it with Go syntax and types alone and the code it guards exists in Go packages. A loGo/s form inside its detection, such as a group child, a const view, or `?`, MUST stay inactive in Go [T-102][R-U1].
-The language-neutral rules MUST be `correctness::typed_nil_return` (in Go, the `(*T)(nil)` form only), `correctness::arena_pointer_escape`, `correctness::infinite_recursion`, `correctness::unclosed_io_closer`, `correctness::unbounded_channel_op`, `concurrency::concurrent_multiword_race`, `concurrency::reentrant_withlock_deadlock`, `slop::err_chain_reset`, `slop::discarded_error`, `slop::todo_placeholder`, `complexity::cognitive_overflow`, `perf::large_backing_array_pin`, `perf::time_after_in_loop`, `correctness::printf_misuse`, `suspicious::copy_lock`, `correctness::structtag_malformed`, and `suspicious::string_intconv` [T-102][R-U1].
+The language-neutral rules MUST be `correctness::typed_nil_return` (in Go, the `(*T)(nil)` form only), `correctness::arena_pointer_escape`, `correctness::infinite_recursion`, `correctness::unclosed_io_closer`, `correctness::unbounded_channel_op`, `concurrency::concurrent_multiword_race`, `concurrency::reentrant_withlock_deadlock`, `slop::err_chain_reset`, `slop::discarded_error`, `slop::todo_placeholder`, `complexity::cognitive_overflow`, `perf::large_backing_array_pin`, `perf::time_after_in_loop`, `correctness::printf_misuse`, `suspicious::copy_lock`, `correctness::structtag_malformed`, `suspicious::string_intconv`, `suspicious::self_assignment`, `suspicious::defer_in_loop`, and `correctness::httpresponse` [T-102][R-U1].
 The rules `correctness::nil_deref_unproven`, `correctness::defer_erases_errdefer_state`, `concurrency::unsupervised_goroutine`, `suspicious::unapplied_struct_default`, `suspicious::side_effect_before_sort`, `portability::serialized_unsized_int`, `portability::alias_extension`, and `pedantic::exhaustive_union_switch` MUST NOT apply to Go packages, because each depends on loGo/s syntax, types, or generated code [T-102][R-U1].
 The rule `portability::serialized_unsized_int` guards the generated binary layout of Sec 12.1, which Go packages do not get [T-102][R-U1].
 A Go package MUST get the default group severities, the `logos.toml [lints]` table, and the `//logos:allow(<rule>)` directive of this section, with the cap that the next line states [T-102][R-U1].
@@ -171,6 +171,13 @@ The warnings of `suspicious::unapplied_struct_default`, `suspicious::side_effect
 A `//logos:allow(portability::alias_extension)` directive MUST silence the rule for an alias-extension file only when it sits in the comment block directly above the package clause of that file [T-102].
 The compiler MUST enforce `perf::time_after_in_loop` as `warn` against `time.After` inside a loop body [T-102].
 The compiler MUST enforce `pedantic::exhaustive_union_switch` as `allow` against a `default` clause in a switch over a closed union [T-102].
+The compiler MUST enforce `correctness::printf_misuse` as `forbid` against format verbs mismatched to argument count or types in formatted print calls [T-102].
+The compiler MUST enforce `suspicious::copy_lock` as `warn` against assignment, pass-by-value, or receiver copying of a struct holding a lock [T-102].
+The compiler MUST enforce `correctness::structtag_malformed` as `forbid` against a struct field tag literal not following key-value pairs [T-102].
+The compiler MUST enforce `suspicious::string_intconv` as `warn` against conversion of non-rune non-byte integers to string [T-102].
+The compiler MUST enforce `suspicious::self_assignment` as `warn` against an assignment where left-hand and right-hand expressions resolve to identical storage without side effects [T-102].
+The compiler MUST enforce `suspicious::defer_in_loop` as `warn` against a `defer` statement directly inside a loop body where cleanup delays until function exit [T-102].
+The compiler MUST enforce `correctness::httpresponse` as `forbid` against a deferred response `Body.Close()` call directly following an HTTP call before checking for errors [T-102].
 JSON output MUST offer autofix candidates for optional chaining with default, early-return guard, split of a misplaced `?`, verb fix to `%w`, and addition of `?` in an error-returning function [T-102].
 JSON output for a Go package MUST offer only the verb fix to `%w`, because the other candidates name loGo/s syntax [T-102][R-U1].
 
@@ -321,9 +328,10 @@ A bare spelling such as `2` MUST fail validation like an unknown level [T-105].
 An invalid level MUST fail with text that lists the six accepted levels [T-105].
 O0 MUST pass debug flags for no inline and no debug-info loss protection [T-105].
 O1 MUST be the upstream baseline [T-105].
-O2 MUST set inline budget 120 and variable-make stack buffer 256 bytes with standard synthetic PGO [T-105].
-O3 MUST set inline budget 400 with 80 inside recursive cycles, clone specialization, variable-make buffer 4096 bytes, and aggressive synthetic PGO [T-105].
+O2 MUST set inline budget 120 and variable-make stack buffer 256 bytes for non-standard packages with standard synthetic PGO [T-105].
+O3 MUST set inline budget 400 with 80 inside recursive cycles, clone specialization, variable-make buffer 4096 bytes for non-standard packages, and aggressive synthetic PGO [T-105].
 A function in a recursive call-graph cycle MUST keep the upstream variable-make buffer of 32 bytes at every level, inlined bodies included [T-105][T-302].
+A standard-library-provenance package (a standard library package or its external test package) MUST keep the default variable-make buffer of 32 bytes at every opt level; non-standard packages MUST use 256 bytes at O2 and 4096 bytes at O3 [T-105][T-302].
 Os and Oz MUST set inline budget 15 with linker identical code folding [T-105].
 Linker identical code folding MUST fold only functions with identical machine code, relocations, call ABI, and function metadata (frame sizes, function identity and flags, stack-height, file, inline-mark, pcdata, and liveness tables); only the name and line table MAY be shared, with the kept function's name and line table serving every folded function, and cgo-exported functions MUST keep their own entries [T-105].
 Synthetic PGO MUST mark `?` error blocks, panics, and `os.Exit` paths unlikely through the intrinsic `logos/rt.cold()` [T-105].
@@ -404,6 +412,36 @@ A slice expression with a bound above `len` (such as `b[:cap(b)]`) MUST fail wit
 A call to a method with a pointer receiver that lacks `const` MUST fail with the same diagnostic. [T-201]
 
 A method with a `const` pointer receiver (such as `func (r const *T) M()`) MUST be allowed. [T-201]
+
+An interface method written `const M() T` (such as `const Name() string`) MUST be a readonly method obligation, distinct from a property element `const F T` (such as `const Name string`). [T-201]
+
+The `const` on an interface method MUST NOT declare an accessor property and MUST NOT lower to `Logos_Get` or `Logos_Set` methods. [T-201]
+
+A concrete type MUST satisfy an interface readonly method only with a method proven readonly; an unknown or mutating effect MUST fail satisfaction with `[correctness::const_view_mutation]` naming the method. [T-201]
+
+A trusted imported `FnFact.Readonly` fact for the concrete method MUST count as the proof; an absent or old fact MUST NOT prove readonly. [T-201][T-Sec6]
+
+Satisfaction MUST NOT depend on declaration order; a local proof finalized after method bodies MUST give the same legality, and the compiler MUST emit no code before the final satisfaction errors. [T-201]
+
+Interface identity MUST distinguish the obligation: an ordinary interface with the same method name and signature MUST NOT acquire the readonly obligation, and an ordinary method set MUST NOT satisfy a readonly requirement without the proof above. [T-201]
+
+A value of an interface with a readonly method MUST be assignable to the same method set without the obligation; the reverse direction MUST require the proof above. [T-201]
+
+A dynamic call through a constant view to a method the interface declares `const` MUST be allowed. [T-201]
+
+A dynamic call through a constant view to a method the interface does not declare `const` MUST fail with `[correctness::const_view_mutation]`. [T-201]
+
+The explicit `const` receiver rule and the inference for ordinary concrete value receivers MUST stay unchanged. [T-201]
+
+Receiver readonlyness MUST NOT imply parameter purity: a `FnFact.Readonly` fact proves only the receiver obligation, and a readonly-only or assertion-only fact MUST NOT prove that arguments are unmodified. An absent `ParamMutated` summary MUST be treated as unknown, distinct from an explicit proven-zero `ParamMutated=0` summary. [T-201][T-Sec6]
+
+Ordinary generic assertion definitions, including `func As[T any](x any) T { return x.(T) }` and assertion methods on generic receivers, MUST remain legal. The compiler MUST record their assertion and type-switch effects and validate relevant function and receiver-type instantiations, including transitive wrappers and cross-package uses, independently of declaration order. An instantiation MUST NOT manufacture a readonly obligation erased from runtime interface identity; an unsafe instantiation MUST fail with `[correctness::const_view_mutation]`. [T-201][T-Sec6]
+
+Qualified type arguments in assertion-relevant positions MUST require verified effects. Unknown effects MUST be conservative, not proven zero; rejection MUST be limited to arguments whose assertion could manufacture an erased readonly obligation. Ordinary concrete named types and nominal nesting MUST remain legal. Known-zero generics such as `Identity[Qualified]` and storage-only containers such as `StoreBox[Qualified]` MUST remain legal; those names alone MUST NOT exempt an imported generic whose effects are unknown. [T-201][T-Sec6]
+
+Assertion-effect masks for function and receiver type parameters and mutation masks for value parameters MUST support arbitrary arity; positions at or above 64 MUST NOT be truncated into a false proof of safety. [T-201][T-Sec6]
+
+A `const []I`, `const *I`, or `const map[K]I` where `I` is an interface MUST remain allowed as a container qualifier; container covariance MUST NOT imply method readonlyness and method readonlyness MUST NOT ban interface containers. [T-201]
 
 Passing a constant view to a non-constant parameter of an `.lgo` function MUST fail with the same diagnostic. [T-201]
 
@@ -690,7 +728,7 @@ Read-only and read-write declarations of one name in one interface MUST merge in
 type Creature interface {
     const Name string
     HP int
-    Start() error
+    const Start() error
 }
 type Monster struct : Creature {
     Name string
@@ -700,6 +738,10 @@ func (m Monster) Start() error {
     return nil
 }
 ```
+
+The `Monster.Start` value receiver above MUST satisfy the `const Start` obligation by the unchanged value-receiver inference, without an explicit `const` receiver. [T-201]
+
+The `const Start` method obligation MUST stay distinct from the `const Name` property element: the method MUST NOT gain accessor methods and MUST NOT count as a property. [T-201][T-203.2]
 
 `type S struct : I, J { ... }` MUST assert that `*S` implements each listed interface at the declaration. [T-203.3]
 
@@ -712,8 +754,6 @@ An assertion list on a non-struct type MUST be a syntax error. [T-203.3]
 At O2 and O3 the compiler MAY clone a same-package function and retype an interface parameter to the concrete argument type. [T-203.4]
 
 Such a clone MUST apply only when the parameter serves solely as a method receiver or a passed-on argument. [T-203.4]
-
-A `p == nil` test on the specialized parameter MUST fold to `false`. [T-203.4]
 
 Specialization MUST stop at type depth 4. [T-203.4]
 
@@ -730,6 +770,10 @@ A parameter compared with `nil`, reassigned, or stored MUST block specialization
 A call site with more than 4 concrete types MUST NOT specialize. [T-203.4]
 
 A `const []Creature` parameter receiving `[]*Monster` MUST specialize with no copy loop. [T-203.4]
+
+The `const` in `const []Creature` MUST be a container qualifier over the slice; it MUST NOT require the element interface methods to be `const`, and an interface element MUST NOT ban the container qualifier. [T-201][T-203.4]
+
+Whether a dynamic call through that parameter is allowed MUST depend only on whether the called method is declared `const` in the interface, not on the container qualifier. [T-201]
 
 No run-time call-site cache MUST exist. [T-203.4]
 
@@ -958,6 +1002,8 @@ A child block MUST have type `func() error`. [T-206]
 
 `go f(args)` inside a group body MUST form a child, sending an error-last result to the group. [T-206]
 
+The function value and arguments MUST be evaluated in the calling goroutine before the child is submitted to the group, including when the concurrency limit would block submission. [T-206]
+
 `go f()` outside any group body MUST fail with `[concurrency::unsupervised_goroutine]`. [T-206]
 
 A child outside a group body MUST fail with `[correctness::child_outside_group]`. [T-206]
@@ -1047,7 +1093,7 @@ Scan-region objects MUST carry a type word. [T-301.1]
 The collector MUST scan them with the goroutine stack. [T-301.1]
 Greentea MUST scale background workers by heap use. [T-301.2]
 It MUST keep mark assist as backstop when heap use reaches 95% of goal. [T-301.2]
-Under `GOEXPERIMENT=logosgen`, greentea MUST use a generational card table. [T-301.2]
+Under GOEXPERIMENT=logosgen, amd64 greentea MUST use a generational card table. [T-301.2]
 Batch MUST collect stop-the-world only. [T-301.2]
 It MUST start with `GOGC` off. [T-301.2]
 It MUST trigger collection at 90% of `GOMEMLIMIT`. [T-301.2]
@@ -1067,8 +1113,9 @@ Go runtime states objects do not move, so zgc and immix stay research tracks unt
 ### 3.2 RFC-302: Smart stack engine
 
 The variable-size `make` stack buffer MUST default to 32 bytes. [T-302]
-At O2 it MUST be 256 bytes. [T-302]
-At O3 it MUST be 4096 bytes. [T-302]
+At O2 it MUST be 256 bytes for non-standard packages. [T-302]
+At O3 it MUST be 4096 bytes for non-standard packages. [T-302]
+A standard-library-provenance package MUST keep the default 32-byte variable-make buffer at every opt level [T-105][T-302].
 A slice `make` with variable effective capacity that flows into a cgo call argument or an `unsafe.Pointer` conversion MUST NOT use the stack buffer and MUST allocate its backing storage on the heap. Effective capacity is the explicit capacity when present, otherwise the length; it is fixed only when the compiler proves it constant with `ir.IsSmallIntConst` after literal rewriting. Fixed-effective-capacity makes MUST retain ordinary escape and size behavior, not a guarantee of stack allocation. [T-302]
 Under `GOEXPERIMENT=logosstack`, the runtime MUST choose the initial goroutine stack size from the per-PC exponential moving average of final stack sizes. [T-302]
 Without history for a PC, it MUST fall back to the upstream global average. [T-302]
@@ -1108,8 +1155,8 @@ Go code MUST need no new directive and no new syntax for the fast path. [T-304][
 A C function that carries only one of the two directives, or none, MUST keep the upstream call path. [T-304]
 `//logos:cgo_fastcall` MUST be the `.lgo` spelling of the same pair and MUST mark a cgo call `noescape` and `nocallback`. [T-304]
 One fast path MUST serve Go packages and loGo/s packages: the single `runtime.logosCgocallFast` trampoline and the one cgo pipeline of this section. [T-304][R-U1]
-The fast path MUST skip P hand-off. [T-304]
-It MUST record the call start. [T-304]
+The fast path MUST use the syscall-style `reentersyscall`/`asmcgocall`/`exitsyscall` sequence, so it may release the P like a syscall; fast-call diagnostics stay on the original M. [T-304]
+It MUST NOT read a clock: `m.fastCallEnterNano` stays zero on the original M, because a per-call monotonic read dominated the measured fast path and no consumer read the value. A build MAY populate that slot behind a diagnostic switch, and no code may treat it as a call start. [T-304]
 Sysmon MUST retake the P from a fast call under the same rule and the same threshold as from a syscall, as the upstream `retake` does, with no longer grace period. [T-304][R-U1]
 Managed `logos` package commands MUST enable `logosfastcgo` by default. These commands include `build`, `run`, `test`, `install`, `list`, and `env`. [T-304][R-U1]
 Plain `go` MUST require explicit `GOEXPERIMENT=logosfastcgo` to enable the fast path. [T-304][R-U1]
@@ -1131,15 +1178,15 @@ The fast path MUST NOT change the cgo file layout, the generated file names, or 
 Profiling with `SIGPROF` during fast calls MUST NOT crash. [T-304]
 A C function marked `nocallback` that calls into Go MUST still panic on the fast path. It MUST NOT hang and MUST NOT corrupt state. [T-304][R-U1]
 A CPU profile MUST attribute time in a fast-called C function to its Go call site. [T-304][R-U1]
-Go pointer arguments MUST stay valid under every GC mode. [T-304]
-Pointer arguments in slots 0 to 3 MUST stay valid during the call. [T-304]
-They MUST read zero after return. [T-304]
+Go pointer validity under moving modes stays an M20 gate requirement, not a passing claim: the fast path canonicalizes only the top-level foreign word (`logosZgcForeignArg`) inside a `logosZgcForeignHoldEnter`/`Exit` bracket, and `runtime.Pinner`-pinned, conservatively scanned, and pointer-keyed-map-key objects are excluded from moving by the separate pin pass. [T-304]
+The original M holds diagnostics only: `m.fastCgoFrame[0]` records the DI/arg address copy and `m.inFastCall` marks entry; the slots are plain `uintptr`, not pins or roots, and only slot 0 is written. [T-304]
+The flag, the timestamp, and the slots MUST read zero after return. [T-304]
 POD and primitive-slice arguments MUST skip `_cgoCheckPointer`. [T-304]
 Pin cost MUST be reported through `BenchmarkFastcall`. [T-PERF]
 Pin cost MUST NOT gate a test pass; only the speed rule and the blocking rule above use their ratios. [T-PERF]
 
 Implementation note (informative): Fast calls preserve `runtime.NumCgoCall` accounting and reset the cgo traceback buffer.
-The original M owns the diagnostic slots and monotonic start time, even when sysmon retakes its P.
+The original M owns the diagnostic slots, which stay zero under the no-clock rule above, even when sysmon retakes its P.
 Normal return and rejected callbacks clear this record before leaving syscall state.
 The slots contain address copies, not GC roots or pins.
 The ordinary cgo pointer-lifetime rules still apply.
@@ -1185,11 +1232,11 @@ The original text of this section described implementation internals; it is arch
 
 ### 5.1 Tokens and contextual words
 
-The language MUST add no new global keywords [T-0.2]. The words `errdefer`, `yield`, `scope`, and `group` MUST act as contextual words valid only in `.lgo` files [T-0.2]. The word `errdefer` MUST start a statement only when an identifier or `func` follows it [T-0.2][T-104.2]. The word `yield` MUST start a statement only inside a generator function [T-0.2]. The word `scope` MUST appear only directly before `defer` [T-0.2]. The word `group` MUST appear only directly after `go` [T-0.2]. The word `const` MUST gain new positions before `for`, `if`, `switch`, and `func`, and those positions MUST remain syntax errors in plain Go [T-0.2]. Code MUST NOT declare `errdefer`, `yield`, `scope`, or `group` as ordinary names in those positions [T-0.2]. Outside those positions each word MUST keep its ordinary identifier meaning, so `errdefer := 1` MUST parse as an assignment [T-0.2][T-104.2]. The form `?` MUST scan as a postfix operator only in `.lgo` files [T-104.1]. The form `?.` MUST scan as one unit only when `?` joins `.` with no gap [T-104.3]. The form `??` MUST scan as one binary operator only when two `?` marks join with no gap [T-104.3]. The form `=>` MUST scan as one unit only when `=` joins `>` with no gap in `.lgo` files [T-104.6]. The form `$"..."` MUST scan as an interpolated string only when `$` joins an opening quote with no gap in `.lgo` files [T-104.4].
+The language MUST add no new global keywords [T-0.2]. The words `errdefer`, `yield`, `scope`, and `group` MUST act as contextual words valid only in `.lgo` files [T-0.2]. The word `errdefer` MUST start a statement only when an identifier or `func` follows it [T-0.2][T-104.2]. The word `yield` MUST start a statement only inside a generator function [T-0.2]. The word `scope` MUST appear only directly before `defer` [T-0.2]. The word `group` MUST appear only directly after `go` [T-0.2]. The word `const` MUST gain new positions before `for`, `if`, `switch`, and `func`, and those positions MUST remain syntax errors in plain Go [T-0.2]. The word `const` MUST also appear before an interface method declaration to mark a readonly obligation, and only there outside the listed positions; that method position MUST remain a syntax error in plain Go [T-0.2][T-201]. Code MUST NOT declare `errdefer`, `yield`, `scope`, or `group` as ordinary names in those positions [T-0.2]. Outside those positions each word MUST keep its ordinary identifier meaning, so `errdefer := 1` MUST parse as an assignment [T-0.2][T-104.2]. The form `?` MUST scan as a postfix operator only in `.lgo` files [T-104.1]. The form `?.` MUST scan as one unit only when `?` joins `.` with no gap [T-104.3]. The form `??` MUST scan as one binary operator only when two `?` marks join with no gap [T-104.3]. The form `=>` MUST scan as one unit only when `=` joins `>` with no gap in `.lgo` files [T-104.6]. The form `$"..."` MUST scan as an interpolated string only when `$` joins an opening quote with no gap in `.lgo` files [T-104.4].
 
 ### 5.2 Grammar
 
-New forms MUST follow this grammar [T-0.2][T-104.1][T-104.3][T-104.4][T-104.6][T-202][T-203.1][T-203.2][T-203.3]:
+New forms MUST follow this grammar [T-0.2][T-104.1][T-104.3][T-104.4][T-104.6][T-201][T-202][T-203.1][T-203.2][T-203.3]:
 
 ```
 PostfixTry   ::= Operand "?"
@@ -1207,6 +1254,7 @@ UnionDecl    ::= "type" Name "interface" "{" UnionTerms [";"] Methods [";"] "}"
 UnionTerms   ::= Term ("|" Term)*
 AssertDecl   ::= "type" Name "struct" ":" InterfaceList "{" Fields "}"
 PropertyElem ::= ["const"] Name Type
+ReadonlyMethod ::= "const" Name Signature
 ConstView    ::= "const" ("[]" Type | "*" Type | "map" "[" Type "]" Type)
 ConstDecl    ::= "const" Name "=" (CompositeLit | ConstFuncCall)
 ConstIf      ::= "const" "if" ConstExpr Block ["else" (Block | ConstIf)]
@@ -1223,7 +1271,7 @@ SpreadElem   ::= ".." Expr
 DefaultField ::= Field Name Type "=" ConstExpr [Tag]
 ```
 
-The type `T??` MUST remain a syntax error [T-202]. The type `(T?)?` MUST nest as an option of an option [T-202]. The union in `UnionDecl` MUST list a finite set of terms with no `~` term [T-203.1]. A struct MUST satisfy a property interface only through an explicit `: I` list [T-203.2][R-U4]. The operands `{expr}` inside `$"..."` MUST accept only string, integer, bool, float32, float64, `[]byte`, `error`, or `fmt.Stringer` values [T-104.4]. The texts `{{` and `}}` MUST mean literal braces [T-104.4].
+The type `T??` MUST remain a syntax error [T-202]. The type `(T?)?` MUST nest as an option of an option [T-202]. The union in `UnionDecl` MUST list a finite set of terms with no `~` term [T-203.1]. A struct MUST satisfy a property interface only through an explicit `: I` list [T-203.2][R-U4]. A `ReadonlyMethod` MUST appear only as an interface method; `const Name() string` MUST be a readonly method obligation and MUST stay distinct from property `const Name string` [T-201][T-203.2]. No other grammar production MUST gain a `const` prefix [T-201]. The operands `{expr}` inside `$"..."` MUST accept only string, integer, bool, float32, float64, `[]byte`, `error`, or `fmt.Stringer` values [T-104.4]. The texts `{{` and `}}` MUST mean literal braces [T-104.4].
 
 ```lgo
 v := parse(s)?
@@ -1244,7 +1292,7 @@ An opening `(` MUST parse its element list once and then branch on the next toke
 
 ### 6.1 Cross-package facts
 
-Cross-package facts MUST travel in the archive member `__.LOGOS` [T-Sec6]. The member MUST hold a text header of the package exported declarations in loGo/s syntax with nilability, const views, unions, tuples, and property interfaces [T-Sec6]. The member MUST hold one fact line per function for `ReturnsNonNil`, `AlwaysNilError`, `PureConst`, `ReceiverMutated`, the `ParamMutated` mask, and `MayYield` [T-Sec6]. The member MUST hold comptime generic sources [T-Sec6]. The facts MUST bind to the `__.PKGDEF` fingerprint, and a stale fingerprint MUST fail the dependent build [T-Sec6]. A Go importer of a loGo/s package MUST see the signatures that `logos eject` emits: a closed union value type as its methods-only interface with the terms dropped, `*T?` as the bare pointer when `*T` is non-nil and as `logos/rt.Option[T]` otherwise, a non-nil `*T` as a plain `*T`, a property interface as its `Logos_GetF` and `Logos_SetF` accessor methods, and a const view as its plain type [T-Sec6][R-U2]. A Go package MUST emit per-function fact lines only, namely `MayYield`, `AlwaysNilError`, and `ParamMutated`, plus one `lang go` record, with no declaration header [T-Sec6][R-U1]. An importer MUST NOT read a package that carries the `lang go` record as a loGo/s package: no non-nil pointer check, no const-view mutation fact, and no overlay applies to it [T-Sec6][R-U1]. It MUST write `__.LOGOS` only under `logos` or on `GOARCH=wasm` under either command, and plain `go` MUST write no `__.LOGOS` elsewhere [T-Sec6][T-Sec14]. When this toolchain compiles a Go package that calls a loGo/s function or method, the compiler MUST insert a `logos/rt.MustNonNil` check for each non-nil pointer parameter of the callee in a direct call, in a `go` statement, and in a `defer` statement, using the callee facts from `__.LOGOS` [T-Sec6][R-U2]. A call through a function value, a method value, or an interface has no such check; this is a documented hole [T-Sec6][R-U2][A-GOBOUNDARY]. A nil receiver that a Go caller passes to a method with a non-nil pointer receiver has no such check either; this is a documented hole [T-Sec6][R-U2][A-GOBOUNDARY]. Code that an upstream toolchain builds from eject output has no such check either; this is a documented hole, like reflection and `unsafe` [T-Sec6][R-U2][A-GOBOUNDARY]. A Go mutation through a const view and a Go store of a non-member into a closed union are documented holes, and the compiler does not check them [T-Sec6][R-U2][A-GOBOUNDARY].
+Cross-package facts MUST travel in the archive member `__.LOGOS` [T-Sec6]. The member MUST hold a text header of the package exported declarations in loGo/s syntax with nilability, const views, readonly interface methods, unions, tuples, and property interfaces [T-Sec6][T-201]. The member MUST hold one fact line per function for `ReturnsNonNil`, `AlwaysNilError`, `PureConst`, `ReceiverMutated`, the `ParamMutated` mask, `FnFact.Readonly`, `MayYield`, and generic assertion effects `AssertTP` and `AssertRTP` [T-Sec6][T-201]. Facts MUST use format version 3; older members MUST be rejected rather than read through a compatibility path [T-Sec6][T-201]. Presence of assertion-effect flags MUST distinguish analyzed effects from unknown effects; explicit `AssertTP=0,AssertRTP=0` MUST denote proven-zero effects [T-Sec6][T-201]. Assertion and mutation masks MUST use arbitrary-arity hexadecimal masks without a 64-parameter limit [T-Sec6][T-201]. Clone and substitution MUST preserve `FnFact.Readonly` [T-201][T-Sec6]. The member MUST hold comptime generic sources [T-Sec6]. The facts MUST bind to the `__.PKGDEF` fingerprint, and a stale fingerprint MUST fail the dependent build [T-Sec6]. A Go importer of a loGo/s package MUST see the signatures that `logos eject` emits: a closed union value type as its methods-only interface with the terms dropped, `*T?` as the bare pointer when `*T` is non-nil and as `logos/rt.Option[T]` otherwise, a non-nil `*T` as a plain `*T`, a property interface as its `Logos_GetF` and `Logos_SetF` accessor methods, a readonly interface method as its plain method, and a const view as its plain type [T-Sec6][R-U2][T-201]. Lowering and eject MUST erase only the `const` keyword of a readonly method for emitted Go, keeping source positions and qualification facts for loGo/s importers [T-201][T-0.3][T-Sec6]. A Go package MUST emit per-function fact lines only, namely `MayYield`, `AlwaysNilError`, `ParamMutated`, and generic assertion effects `AssertTP` and `AssertRTP`, plus one `lang go` record, with no declaration header [T-Sec6][R-U1][T-201]. An importer MUST NOT read a package that carries the `lang go` record as a loGo/s package: no non-nil pointer check, no const-view mutation fact, and no overlay applies to it [T-Sec6][R-U1]. Exported generic assertion effects, including explicit known-zero effects, MUST be emitted for both Go and `.lgo` packages at every optimization level and under either command, regardless of `GOARCH`; a Go package carrying these effects MUST write `__.LOGOS` even outside `logos` and wasm builds [T-Sec6][T-201]. Importers MUST consume these effects from `lang go` members without applying loGo/s declaration overlays or treating assertion effects as parameter-mutation proof [T-Sec6][R-U1][T-201]. The other Go-package facts retain their `logos` or `GOARCH=wasm` emission condition [T-Sec6][T-Sec14]. When this toolchain compiles a Go package that calls a loGo/s function or method, the compiler MUST insert a `logos/rt.MustNonNil` check for each non-nil pointer parameter of the callee in a direct call, in a `go` statement, and in a `defer` statement, using the callee facts from `__.LOGOS` [T-Sec6][R-U2]. A call through a function value, a method value, or an interface has no such check; this is a documented hole [T-Sec6][R-U2][A-GOBOUNDARY]. A nil receiver that a Go caller passes to a method with a non-nil pointer receiver has no such check either; this is a documented hole [T-Sec6][R-U2][A-GOBOUNDARY]. Code that an upstream toolchain builds from eject output has no such check either; this is a documented hole, like reflection and `unsafe` [T-Sec6][R-U2][A-GOBOUNDARY]. A Go mutation through a const view and a Go store of a non-member into a closed union are documented holes, and the compiler does not check them [T-Sec6][R-U2][A-GOBOUNDARY].
 
 ### 6.2 Options, non-nil pointers, unions, and map index
 
@@ -1252,13 +1300,13 @@ The pointer type `*T` in `.lgo` code MUST mean non-nil [T-202]. The type `*T?` M
 
 ### 6.3 Interface properties
 
-A property interface MUST hold at least one `const F T` or `F T` element [T-203.2]. Satisfaction MUST be explicit: only a struct whose declaration lists `: I` MUST satisfy property interface `I`, in any package [T-203.2][R-U4]. For each property `F`, the declaring package MUST generate `Logos_GetF() T` and, for read-write properties, `Logos_SetF(T)` [T-203.2]. An exported field MUST source its accessors with a value-receiver getter and a pointer-receiver setter, and `F() T` or `SetF(T)` methods MUST source them by forwarding with the same receiver kind [T-203.2]. Property elements MUST lower to those interface methods, so dynamic assertions such as `any(x).(I)` MUST work [T-203.2]. A Go importer MUST see a property interface as the interface of those accessor methods [T-203.2][T-Sec6][R-U2]. Identifiers that start with `Logos_` or `_logos_` MUST remain reserved in `.lgo` code [T-203.2]. Read-write properties MUST need a pointer type [T-203.2]. The form `&c.HP` MUST fail compilation [T-203.2]. Compound updates through a property MUST evaluate the receiver once and write the result back [T-203.2]. Only types with a `: I` list MUST gain accessor methods, and `reflect` MUST count exactly those methods; types without the list MUST gain none [T-203.2][R-U4]. Non-struct types MUST NOT satisfy a property interface [T-203.2][R-U4]. The assertion `type S struct : I, J` MUST require `*S` to implement `I` and `J` at the declaration [T-203.3].
+A property interface MUST hold at least one `const F T` or `F T` element [T-203.2]. A readonly method `const M() T` MUST NOT count as a property element and MUST NOT satisfy a property requirement [T-201][T-203.2]. Satisfaction MUST be explicit: only a struct whose declaration lists `: I` MUST satisfy property interface `I`, in any package [T-203.2][R-U4]. For each property `F`, the declaring package MUST generate `Logos_GetF() T` and, for read-write properties, `Logos_SetF(T)` [T-203.2]. An exported field MUST source its accessors with a value-receiver getter and a pointer-receiver setter, and `F() T` or `SetF(T)` methods MUST source them by forwarding with the same receiver kind [T-203.2]. Property elements MUST lower to those interface methods, so dynamic assertions such as `any(x).(I)` MUST work [T-203.2]. A Go importer MUST see a property interface as the interface of those accessor methods [T-203.2][T-Sec6][R-U2]. Identifiers that start with `Logos_` or `_logos_` MUST remain reserved in `.lgo` code [T-203.2]. Read-write properties MUST need a pointer type [T-203.2]. The form `&c.HP` MUST fail compilation [T-203.2]. Compound updates through a property MUST evaluate the receiver once and write the result back [T-203.2]. Only types with a `: I` list MUST gain accessor methods, and `reflect` MUST count exactly those methods; types without the list MUST gain none [T-203.2][R-U4]. Non-struct types MUST NOT satisfy a property interface [T-203.2][R-U4]. The assertion `type S struct : I, J` MUST require `*S` to implement `I` and `J` at the declaration [T-203.3].
 
 ```lgo
 type Creature interface {
     const Name string
     HP         int
-    Start() error
+    const Start() error
 }
 type Monster struct : Creature {
     Name string
@@ -1309,7 +1357,9 @@ Recursion MUST return arena-allocated results to the caller intact. [T-301.1]
 A value stored into `sync.Pool` MUST stay on the heap. [T-301.1]
 A returned value that the caller keeps MUST allocate in the caller region. [T-301.1]
 It MUST live until the caller exits. [T-301.1]
-A goroutine parked with empty regions MUST hold no chunk. [T-301.1]
+When a goroutine parks, it MUST release every chunk whose noscan and scan regions are both empty, including empty chunks behind a live chunk. [T-301.1]
+It MUST retain every live chunk and preserve all live-object addresses. [T-301.1]
+A goroutine parked with no live chunks MUST hold no chunk. [T-301.1]
 Idle parked goroutines MUST consume 0 bytes of arena memory. [T-301.1]
 `runtime.SetFinalizer` on an arena object MUST panic with `runtime: SetFinalizer on loGo/s arena object`. [T-301.1]
 Cgo pointer checks MUST NOT panic on arena addresses. [T-301.1]
@@ -1319,7 +1369,7 @@ After a frame exit, collection MUST find no stale pointers in popped scan memory
 ### 8.4 Pluggable GC write and load barrier dispatch
 
 The `-gc` flag MUST select the barrier emitter at compile time. [T-301.2]
-Under greentea built with `GOEXPERIMENT=logosgen`, pointer stores into mature spans MUST mark the card table. [T-301.2]
+Under GOEXPERIMENT=logosgen, on amd64 greentea, pointer stores into mature spans MUST mark the card table. [T-301.2]
 Under greentea, pointer loads MUST be plain loads with no barrier instructions. [T-301.2][T-PERF]
 Under zgc, pointer loads MUST test the color and heal or remap on mismatch. [T-301.2]
 Under zgc, pointer stores MUST be plain. [T-301.2]
@@ -1524,7 +1574,11 @@ A field of type int or uint warns portability::serialized_unsized_int. [T-Sec12.
 Sized kinds are preferred. [T-Sec12.1]
 Tag options change nothing in binary output. [T-Sec12.1]
 UnmarshalBinary rejects truncation, bad presence bytes, version mismatch, and trailing bytes with errors naming field and offset. [T-Sec12.1]
-A count header MUST pre-allocate at most min(len(rest)/2, 1 MB / sizeof(elem)) elements and MUST grow past that only as input bytes arrive. [T-Sec12.1]
+For elements with a nonzero wire payload, a count header MUST pre-allocate at most min(len(rest)/2, 1 MB / sizeof(elem)) elements and MUST grow past that only as input bytes arrive. [T-Sec12.1]
+Charge nothing against a total budget on the count header; a count whose element bytes are all present in the input is lawful and MUST decode, even when the total exceeds 1 MiB. [T-Sec12.1]
+For slices whose elements have zero wire payload, the count itself MUST NOT exceed 1,048,576 (the 1 MiB prealloc bound at unit 1); larger counts MUST be rejected with a count-out-of-range error, encoder symmetric, checked before allocation or element iteration. [T-Sec12.1]
+Zero-wire slices MUST be handled in constant time with respect to count, without per-element iteration. [T-Sec12.1]
+These resource bounds MUST NOT change the wire bytes of accepted values. [T-Sec12.1]
 
 ## 13. Capabilities auditor
 
@@ -1691,8 +1745,8 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #1 Split-union pointer scalar overlap confusion: Unions MUST use the upstream interface representation. Ejected value unions MUST keep methods with a member comment. See Sec 2.3. [T-203.1]
 - #2 String constBytes mutated via surviving alias: String to const byte views MUST allocate nothing. Views of other provenance to string MUST copy. See Sec 2.1. [T-201]
 - #3 Rodata map breaks from runtime hash seed: Const maps MUST lower to a switch up to 8 keys. Larger maps MUST use a static perfect hash in read-only data. See Sec 9.1. [T-Sec9]
-- #4 Side-stack arena growth across parked goroutines: A goroutine parked with empty arena regions MUST return its leased chunk. Such a goroutine MUST retain no arena capacity; its ordinary stack and runtime metadata still exist. See Sec 8.3. [T-301.1]
-- #5 Cgo fastcall blocks OS thread forever: The fast path MUST record the call start. Sysmon MUST retake the P from a fast call under the same rule and threshold as from a syscall. See Sec 3.4. [T-304]
+- #4 Side-stack arena growth across parked goroutines: On park, a goroutine MUST release every empty arena chunk, including empty chunks behind a live chunk. It MUST retain every live chunk and preserve all live-object addresses. With no live chunks, it MUST retain no arena capacity; its ordinary stack and runtime metadata still exist. See Sec 8.3. [T-301.1]
+- #5 Cgo fastcall blocks OS thread forever: The fast path MUST NOT read a clock to fill `m.fastCallEnterNano`, which stays zero; Sysmon MUST retake the P from a fast call under the same rule and threshold as from a syscall. A fast call MUST NOT block other goroutines. See Sec 3.4. [T-304]
 - #6 Block lambda return ambiguity inside map: Lambdas MUST allow expression and block forms with known target types. A ? in an expression lambda MUST propagate from the enclosing function. See Sec 1.4. [T-104.6]
 - #7 Non-nil pointer bypass via arrays maps JSON: Zero values of non-nil pointers MUST fail with correctness::nonnil_uninitialized. Absent map and JSON values MUST check through V? and MissingFieldError. An absent key MUST read as none while a present nil payload MUST read as some. See Sec 2.2. [T-202][T-Sec12]
 - #8 Go functions returning nil into lgo: Pointers from Go declarations, in the standard library and in every other Go package, MUST act as platform pointers. Stores into non-nil locations MUST panic with logos: nil from Go value at the source line. See Sec 2.2. [T-202][R-U2]
@@ -1808,7 +1862,7 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #118 Embedded fields satisfying property contract depth: Embedded fields MUST satisfy properties by Go selector depth rules. An ambiguous equal-depth selector MUST fail as ambiguous. See Sec 6.3. [T-203.2]
 - #119 Spread dropping mismatched same-name fields: Spread MUST copy fields with identical names and identical types. A different type MUST fail with `correctness::spread_type_mismatch`. See Sec 1.4. [T-104.5]
 - #120 Synthetic getters polluting reflection method count: Only a type with a `: I` list MUST gain accessor methods. `reflect` MUST count the generated accessors. See Sec 6.3. [T-203.2]
-- #121 Slice of pointers to interface slice copy: A `const []Creature` parameter receiving `[]*Monster` MUST specialize with no copy loop. No run-time call-site cache MUST exist. See Sec 2.3. [T-203.4]
+- #121 Slice of pointers to interface slice copy: A `const []Creature` parameter receiving `[]*Monster` MUST specialize with no copy loop. The `const` there is container covariance, not a method effect obligation, and it MUST NOT ban `const []` over an interface. No run-time call-site cache MUST exist. See Sec 2.3. [T-203.4]
 - #122 Emoji file extensions with variation selectors: The loader MUST strip trailing U+FE0E and U+FE0F before matching. NFC normalization MUST be the identity on extension strings. See Sec 1.1. [T-101.1]
 - #123 Default value overriding explicit JSON false: Decoding MUST fill defaults first, then parse. Duplicate keys MUST keep the last value. See Sec 12.2. [T-Sec12]
 - #124 Specialized call breaking dynamic type assertion: A dynamic assertion in a specialized clone MUST give the same result as the unspecialized call. Function values MUST keep working. See Sec 2.3. [T-203.4]
@@ -1826,7 +1880,7 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #136 go group sibling hanging on channel receive: Plain channel operations in a child MUST lower to a `select` with `<-gctx.Done()`. Cancellation MUST reach blocked siblings. See Sec 2.6. [T-206]
 - #137 Call-free loop starving scheduler blocking GC: Back-edge checks MUST fire every 4096 iterations where async preemption is absent. A call-free loop MUST NOT starve its peers. See Sec 15.3. [T-303]
 - #138 Arena pointer stored into sync Pool: A value stored into `sync.Pool` MUST stay on the heap. The compiler MUST keep such values out of the arena. See Sec 8.3. [T-301.1]
-- #139 Malicious JSON array triggering huge preallocation: JSON decoders MUST grow arrays incrementally with no pre-allocation cap. Binary counts MUST pre-allocate at most `min(len(rest)/2, 1 MB / sizeof(elem))`. See Sec 12.2. [T-Sec12][T-Sec12.1]
+- #139 Malicious JSON array triggering huge preallocation: JSON decoders MUST grow arrays incrementally with no pre-allocation cap. Binary counts for elements with nonzero wire payload MUST pre-allocate at most `min(len(rest)/2, 1 MB / sizeof(elem))` and grow only as bytes arrive, charging nothing on the count header; lawful large payloads with all bytes present MUST decode. Zero-wire slice counts MUST NOT exceed 1,048,576, rejected with count-out-of-range, encoder symmetric, constant-time without per-element iteration. Accepted wire bytes MUST stay unchanged. See Sec 12.2 and Sec 12.3. [T-Sec12][T-Sec12.1]
 - #140 Known hash seed enabling hash-flooding DoS: Large const maps MUST provide one-probe lookup from a static perfect-hash table in read-only data with constant-time auxiliary metadata reads plus exactly one final key/value-slot probe with full-key validation. Construction MUST use at most 1,000,000 seed-candidate trials in total per const map. A logarithmic fallback MUST NOT satisfy the contract. Exhaustion MUST fail with `comptime::constmap_seed_not_found`. See Sec 9.1. [T-Sec9]
 - #141 Method call on property value losing mutation: A method call on a property value MUST use read-call-write-back around the call. The write MUST reach the struct. See Sec 6.3. [T-203.2]
 - #142 Chain map leaking file descriptors on failure: Partial chain failure MUST close already produced `io.Closer` elements in reverse order. The fused loop MUST run that rollback before returning. See Sec 1.4. [T-104.6]
@@ -1847,7 +1901,7 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #157 Unconditional self-recursion in const switch branch: The compiler MUST fail a function whose every path calls itself with identical arguments before return with [correctness::infinite_recursion]. See Sec 1.2. [T-102]
 - #158 Substring pinning large backing array in heap: Escape analysis MUST warn with [perf::large_backing_array_pin] when a subslice or substring of a backing array above 64 KB escapes. See Sec 1.2. [T-102]
 - #159 Moving collector breaking pointer-keyed map lookup: Pinned blocks MUST NOT evacuate. Pointer-keyed maps under zgc MUST use a side-table identity hash that survives relocation. See Sec 8.4. [T-301.2]
-- #160 Collection moves live cgo arguments: Go pointer arguments MUST remain valid throughout a fast call under every GC mode. Temporary pin records MUST be released after return without clearing the caller's argument values. See Sec 3.4. [T-304]
+- #160 Collection moves live cgo arguments: Go pointer validity under moving modes stays an M20 gate requirement, not a passing claim. The fast path holds only the top-level word with a foreign-hold bracket; `Pinner`-pinned, conservatively scanned, and pointer-keyed-map-key objects are excluded by the pin pass, not by slots. The M diagnostics (flag, timestamp, slots) MUST read zero after return without clearing the caller's argument values. See Sec 3.4. [T-304]
 - #161 Removing mark assist causing out-of-memory failure: Greentea background goal MUST follow 0.25 below u 0.80, linear rise to 0.75 below u 0.95, and 0.75 at or above u 0.95. Mark assists MUST still run when u reaches 0.95 or more. See Sec 19.1. [T-301.2]
 - #162 Strict lint breaking third-party module libraries: Third-party modules of either kind MUST get no code lints. Capability checks MUST apply to every module in the build. See Sec 1.2. [T-102][R-U1]
 - #163 Buffered channel send flagged as unbounded operation: The compiler MUST allow a channel operation outside a select with a done case only for a locally made channel with constant capacity and send count within capacity. Other operations MUST fail with [correctness::unbounded_channel_op]. See Sec 1.2. [T-102]
@@ -1877,6 +1931,7 @@ Each entry from #1 to #182 states the tailored resolution of its original attack
 - #187 Wasm loader missing for a Go main package: `logos build` MUST emit the loader for a Go main package with a `.wasm` output, and `go build` MUST emit the same loader when `--wasm-loader` is passed. See Sec 14.2. [T-Sec14]
 - #188 nocallback C function calling into Go on the fast path: A C function marked `nocallback` that calls into Go MUST panic on the fast path. It MUST NOT hang and MUST NOT corrupt state. See Sec 3.4. [T-304]
 - #189 CPU profile losing fast-called C time: A CPU profile MUST attribute time in a fast-called C function to its Go call site. See Sec 3.4. [T-304]
+- #190 Generic assertions manufacturing erased readonly obligations: Ordinary generic assertion definitions MUST remain legal. Function and receiver-type instantiations, including wrappers and cross-package uses, MUST require verified effects before manufacturing qualified targets; unsafe instantiations MUST fail with `correctness::const_view_mutation`. Unknown effects MUST NOT count as proven zero. Concrete named arguments and known-zero identity/storage containers MUST remain legal. Assertion and mutation masks MUST NOT truncate parameter positions at or above 64, and receiver-readonly MUST NOT prove parameter purity. See Sec 2.1 and Sec 6.1. Parent verification is pending in REDTEAM.md. [T-201][T-Sec6]
 
 ## 18. Upstream file manifest
 
@@ -1889,7 +1944,7 @@ The build MUST select the collector with `-gc=MODE` on `logos build` or `go buil
 MODE MUST be one of `greentea`, `zgc`, `immix`, `wasm`, `batch`, or `epsilon`. [T-301.2]
 Any other mode MUST fail with `logos build: unknown -gc mode "x" (want greentea, zgc, immix, wasm, batch, epsilon)`. [T-301.2]
 Under `logos`, the default MUST be `greentea`, or `wasm` when `GOARCH` equals `wasm`. [T-301.2]
-Plain `go` MUST keep the upstream collector and pacing until `./run.bash` passes with a changed default, as the flip rule of Sec 0.1 states. [T-301.2][T-0.1]
+Elastic pacing MUST be the default for `greentea`; every other mode, including an empty production-controller mode, MUST keep upstream pacing. [T-301.2]
 Until phase 1 passes `go test -short std` with the experiment on, `-gc=immix` MUST fail with `logos build: -gc=immix requires GOEXPERIMENT=logosgcmoving phase 1, which is not complete`. [T-301.2]
 Until phase 2 passes, `-gc=zgc` MUST fail with `logos build: -gc=zgc requires GOEXPERIMENT=logosgcmoving phase 2, which is not complete`. [T-301.2]
 Batch MUST run no collection until heap use reaches 90% of `GOMEMLIMIT`. [T-301.2]
@@ -1906,27 +1961,26 @@ Mark slices MUST run during idle time of the JS event loop. [T-301.2]
 The heap MUST split into a low permanent region and a high scratch region. [T-301.2]
 Growth MUST extend only the high region. [T-301.2]
 The modes of this section MUST apply to Go packages and to loGo/s packages. [T-301.2][R-U1]
-The plain `go` default MUST keep the upstream pacing until `./run.bash` passes with the `logos` default. [T-301.2][T-0.1][R-U1]
 Under plain `go`, each `logos build:` message above MUST use the prefix `go build:`. [T-301.2]
 
 ### 19.1 Engine 1: Enhanced Green Tea GC
 
 A pointer store into a span MUST set the mark bit and the dirty flag without dereferencing the pointer. [T-301.2]
-Workers MUST drain dirty spans in monotonic address order. [T-301.2]
+Workers MUST drain dirty spans in monotonic address order, except on GOARCH=wasm where the span deck stays off. [T-301.2]
+`nologosspandeck` MUST retain the FIFO comparison path. [T-301.2]
 A single-page 8KB span MUST scan its grey objects sequentially in one pass. [T-301.2]
 The sequential span scan MUST use hardware prefetch on amd64. [T-301.2]
-Under `GOEXPERIMENT=logosgen`, the card table MUST hold one byte per 512 bytes of heap. [T-301.2]
-A minor cycle MUST trigger when the heap grows 50% since the last cycle. [T-301.2]
-A span MUST count as mature after surviving 2 cycles. [T-301.2]
-A minor cycle MUST skip clean mature spans without reading their mark bits. [T-301.2]
-A full cycle MUST follow every 4 minor cycles. [T-301.2]
+Under greentea built with GOEXPERIMENT=logosgen, the card table MUST hold one byte per 512 bytes of heap. [T-301.2]
+Under GOEXPERIMENT=logosgen, a minor cycle MUST trigger when the heap grows 50% since the last cycle. [T-301.2]
+Under GOEXPERIMENT=logosgen, a span MUST count as mature after surviving 2 cycles. [T-301.2]
+Under GOEXPERIMENT=logosgen, a minor cycle MUST skip clean mature spans without reading their mark bits. [T-301.2]
+Under GOEXPERIMENT=logosgen, a full cycle MUST follow every 4 minor cycles. [T-301.2]
 Background CPU goal MUST be 0.25 when u is below 0.80. [T-301.2]
 It MUST rise linearly from 0.25 to 0.75 when u is at least 0.80 and below 0.95. [T-301.2]
 It MUST stay 0.75 when u is at or above 0.95. [T-301.2]
 Here u means live heap over heap goal. [T-301.2]
 Assists MUST still run when u reaches 0.95 or more. [T-301.2]
-The generational gate has passed: `-gc=greentea` builds with `GOEXPERIMENT=logosgen` MUST run the generational collector. [T-301.2]
-Without the experiment, `-gc=greentea` behavior is unchanged, and `logosgen` stays opt-in (never a global default). [T-301.2]
+Under GOEXPERIMENT=logosgen, amd64 greentea MUST use a generational card table. [T-301.2]
 
 ### 19.2 Engine 2: Colored-pointer compactor
 
@@ -1945,8 +1999,11 @@ They MUST NOT move. [T-301.2]
 
 ### 19.3 Engine 3: Immix line and block throughput engine
 
-Each 32KB block MUST split into 256 128B lines. [T-301.2]
+Each 32KiB block MUST split into 256 128B lines. [T-301.2]
 Line marks MUST live off-heap in block metadata. [T-301.2]
+Each active block MUST be exactly one 32KiB-aligned span with slot stride unchanged; occupancy and dirtiness are separate off-heap planes and no allocation decision derives from line marks. [T-301.2]
+Occupancy MUST be the `freeindex` OR `allocBits` composite set on every served slot and rebuilt at sweep from the post-swap composite; the barrier and the marker MUST NOT write it. [T-301.2]
+Dirtiness MUST be a parity pair flipped at cycle start and cleared for exactly the dirtied blocks at termination, both with the world stopped; the barrier MUST only OR into the active table and MUST never clear a mark. [T-301.2]
 The fast path MUST bump-allocate inside the current free hole. [T-301.2]
 Hole search carries target: 3ns, measured by BenchmarkLogosImmixHoleScan. [T-PERF]
 Blocks with the pin bit set MUST NOT evacuate. [T-301.2]
@@ -1997,6 +2054,9 @@ m.WithLock(func(c *Config) {
 
 - `logos lsp` MUST act as a proxy over `gopls` for `.lgo` packages and for Go packages. [T-Sec21][R-U1]
 - It MUST serve stdio JSON-RPC and rewrite URIs and positions between `.lgo` files and the lowered overlay. [T-Sec21]
+- Position translation MUST rest on the compiler-written origin segments of the eject map: a lowered offset inside a copied segment maps to its exact original offset, and offsets inside compiler-generated runs have no `.lgo` position of their own; no heuristic or size-capped textual matching takes part. [T-Sec21]
+- Closing an unsaved `.lgo` document MUST discard its unsaved overlay and MUST refresh the retained package's compiler results. [T-Sec21]
+- A `textDocument/formatting` request for a `.lgo` document MUST be refused instead of returning edits to lowered Go. Formatting requests for Go documents MUST pass through to `gopls`. [T-Sec21][R-U1]
 - It MUST merge compiler JSON diagnostics into `publishDiagnostics`. [T-Sec21]
 - It MUST report `logos lsp: gopls not found on PATH` when `gopls` is missing. [T-Sec21]
 - Stock LSP clients reach `.lgo` files through the proxy with no editor-specific code. [T-Sec21]

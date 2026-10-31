@@ -234,11 +234,11 @@ func (fc *funcLower) scopeBlockList(list []syntax.Stmt, owner syntax.Node, endOf
 		fl := fc.fl
 		gapStart := stmtEnd(fl.src, fl.off(syntax.StartPos(list[len(list)-1])))
 		prefix := leftoverComments(fl, span{start: gapStart, end: endOff}, nil)
-		gap := prefix + renderText(text, tw.subs)
-		if prefix == "" {
-			gap = "\n" + gap
+		gap := cat(prefix, renderText(text, tw.subs))
+		if prefix.s == "" {
+			gap = cat(gen("\n"), gap)
 		}
-		fl.add(gapStart, endOff, gap)
+		fl.addT(gapStart, endOff, gap)
 	}
 	return out
 }
@@ -251,7 +251,7 @@ func (fc *funcLower) scopeFallthrough(br *syntax.BranchStmt, ctx *scopeDeferCtx)
 		return []syntax.Stmt{br}
 	}
 	native, text, tw := fc.scopeStanza(br.Pos(), ownScopeItems(ctx))
-	fc.fl.add(fc.fl.off(br.Pos()), fc.fl.off(br.Pos()), renderText(text, tw.subs))
+	fc.fl.addT(fc.fl.off(br.Pos()), fc.fl.off(br.Pos()), renderText(text, tw.subs))
 	return append(native, br)
 }
 
@@ -286,7 +286,7 @@ func unwrapScopeLabels(s syntax.Stmt) (syntax.Stmt, []*syntax.Name) {
 // (`L: scope defer f()`): the labels stay on the first prelude statement
 // in source and tree, so a `goto L` re-registers the defer.
 func (fc *funcLower) scopeLabeledPrelude(sd *syntax.ScopeDeferStmt, labels []*syntax.Name, ctx *scopeDeferCtx) []syntax.Stmt {
-	stmtOff, prefix := fc.fl.off(sd.Pos()), ""
+	stmtOff, prefix := fc.fl.off(sd.Pos()), gen("")
 	if len(labels) > 0 {
 		stmtOff, prefix = fc.fl.off(labels[0].Pos()), fc.labelPrefixText(sd, labels)
 	}
@@ -302,13 +302,13 @@ func (fc *funcLower) scopeLabeledPrelude(sd *syntax.ScopeDeferStmt, labels []*sy
 
 // labelPrefixText spells the source from the first label to the scope
 // statement, so the prelude replacement keeps `L1: L2:` verbatim.
-func (fc *funcLower) labelPrefixText(sd *syntax.ScopeDeferStmt, labels []*syntax.Name) string {
-	return string(fc.fl.src[fc.fl.off(labels[0].Pos()):fc.fl.off(sd.Pos())])
+func (fc *funcLower) labelPrefixText(sd *syntax.ScopeDeferStmt, labels []*syntax.Name) otext {
+	return fc.fl.srcUser(fc.fl.off(labels[0].Pos()), fc.fl.off(sd.Pos()))
 }
 
 // scopePrelude emits the capture bindings, armed flag, and guard defer
 // of one scope defer, replacing its statement span.
-func (fc *funcLower) scopePrelude(sd *syntax.ScopeDeferStmt, ctx *scopeDeferCtx, stmtOff int, prefix string) []syntax.Stmt {
+func (fc *funcLower) scopePrelude(sd *syntax.ScopeDeferStmt, ctx *scopeDeferCtx, stmtOff int, prefix otext) []syntax.Stmt {
 	fl := fc.fl
 	pos := sd.Pos()
 	call, ok := syntax.Unparen(sd.Call).(*syntax.CallExpr)
@@ -354,7 +354,7 @@ func (fc *funcLower) scopePrelude(sd *syntax.ScopeDeferStmt, ctx *scopeDeferCtx,
 	)
 	spanEnd := skipCloseParens(fl.src, plan.end)
 	kept := leftoverComments(fl, span{start: stmtOff, end: spanEnd}, planSpans(plan))
-	fl.add(stmtOff, spanEnd, prefix+kept+renderText(text, tw.subs))
+	fl.addT(stmtOff, spanEnd, cat(prefix, kept, renderText(text, tw.subs)))
 	return native
 }
 
@@ -485,7 +485,7 @@ func (fc *funcLower) scopeReturn(s *syntax.ReturnStmt, active []*scopeDeferCtx) 
 	results := syntax.UnpackListExpr(s.Results)
 	if len(results) == 0 || (len(results) != len(fc.specs) && !(len(results) == 1 && len(fc.specs) > 1)) {
 		native, text, tw := fc.scopeStanza(pos, items)
-		fc.fl.add(fc.fl.off(pos), fc.fl.off(pos), renderText(text, tw.subs))
+		fc.fl.addT(fc.fl.off(pos), fc.fl.off(pos), renderText(text, tw.subs))
 		return append(native, s)
 	}
 	names := make([]syntax.Expr, len(fc.specs))
@@ -506,7 +506,7 @@ func (fc *funcLower) scopeReturn(s *syntax.ReturnStmt, active []*scopeDeferCtx) 
 	text := append([]syntax.Stmt{assignOf(pos, namesT, marks)}, stanzaT...)
 	text = append(text, returnOf(pos, nil))
 	fl := fc.fl
-	fl.add(fl.off(pos), stmtEnd(fl.src, fl.off(pos)), renderText(text, tw.subs))
+	fl.addT(fl.off(pos), stmtEnd(fl.src, fl.off(pos)), renderText(text, tw.subs))
 	return native
 }
 
@@ -550,7 +550,7 @@ func (fc *funcLower) scopeBranch(s *syntax.BranchStmt, active []*scopeDeferCtx, 
 		return []syntax.Stmt{s}
 	}
 	native, text, tw := fc.scopeStanza(pos, items)
-	fc.fl.add(fc.fl.off(pos), fc.fl.off(pos), renderText(text, tw.subs))
+	fc.fl.addT(fc.fl.off(pos), fc.fl.off(pos), renderText(text, tw.subs))
 	return append(native, s)
 }
 

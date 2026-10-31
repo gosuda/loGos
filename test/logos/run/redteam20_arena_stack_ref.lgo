@@ -1,0 +1,54 @@
+// run -goexperiment logosarena
+
+package main
+
+// REDTEAM #20 (SPEC Sec 8.3; IMPLEMENTATION.md M18-S3): a side-stack
+// (arena) object pointing to a call-stack variable must stay valid across
+// stack growth and collection. A local whose address flows into an arena
+// object must allocate in the arena, so stack growth must not invalidate
+// the arena-held pointer.
+//
+// Attack: an arena-eligible dynamic scan slice takes the address of a
+// frame local, a deep recursion forces stack growth, two collections run,
+// and the value read back through the arena pointer must still be intact.
+// Value-only check: no alloc counters are asserted, so a conservative
+// heap placement also passes; only a dangling arena-to-stack edge fails.
+
+import (
+	"fmt"
+	"runtime"
+)
+
+//go:noinline
+func r20Grow(depth int) int {
+	if depth <= 0 {
+		return 0
+	}
+	var buf [1024]byte
+	buf[0] = byte(depth)
+	buf[1023] = byte(depth >> 8)
+	return int(buf[0]) + int(buf[1023]) + r20Grow(depth-1)
+}
+
+//go:noinline
+func r20Capture(n int) int {
+	x := 13579
+	s := make([]*int, 0, n)
+	s = append(s, &x)
+	// Force stack growth while the arena holds &x.
+	r20Grow(64)
+	runtime.GC()
+	runtime.GC()
+	v := *s[0]
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(&x)
+	return v
+}
+
+func main() {
+	got := r20Capture(64)
+	fmt.Println(got)
+	if got != 13579 {
+		panic("redteam20: arena-held stack pointer invalidated")
+	}
+}

@@ -43,6 +43,14 @@ func LogosArenaAlloc(elem any, size uintptr) unsafe.Pointer {
 	return logosArenaAlloc(logosEfaceType(elem), size)
 }
 
+// LogosArenaMakeSlice calls logosArenaMakeSlice with the dynamic type of elem.
+func LogosArenaMakeSlice(elem any, len64, cap64 int64) unsafe.Pointer {
+	return logosArenaMakeSlice(logosEfaceType(elem), len64, cap64)
+}
+
+// LogosArenaMaxAlloc is maxAlloc, the largest size makeslice accepts.
+const LogosArenaMaxAlloc uintptr = maxAlloc
+
 // LogosArenaAllocScan calls logosArenaAllocScan with the dynamic type of elem.
 func LogosArenaAllocScan(elem any, size uintptr) unsafe.Pointer {
 	return logosArenaAllocScan(logosEfaceType(elem), size)
@@ -98,6 +106,63 @@ func LogosArenaStat() LogosArenaInfo {
 		info.Free = c.scanCur - c.noscanCur
 	}
 	return info
+}
+
+// LogosArenaChunk describes one chunk of a goroutine's chain.
+type LogosArenaChunk struct {
+	Addr       uintptr
+	NoscanUsed uintptr
+	ScanUsed   uintptr
+}
+
+// LogosArenaGoid is the calling goroutine's id.
+func LogosArenaGoid() uint64 {
+	return getg().goid
+}
+
+// LogosArenaChainOf stops the world and copies goroutine goid's chunk chain,
+// newest first, into buf. It returns the chain length, which may exceed
+// len(buf), and whether the goroutine is waiting. gopark runs the park hook
+// before park_m sets the waiting status, so a waiting goroutine has already run
+// the hook. An unknown goid yields 0 and false. It does not allocate.
+func LogosArenaChainOf(goid uint64, buf []LogosArenaChunk) (n int, waiting bool) {
+	stw := stopTheWorld(stwForTestCountPagesInUse)
+	forEachG(func(gp *g) {
+		if gp.goid != goid {
+			return
+		}
+		waiting = readgstatus(gp)&^_Gscan == _Gwaiting
+		for c := gp.logosArena; c != nil; c = c.next {
+			if n < len(buf) {
+				buf[n] = LogosArenaChunk{
+					Addr:       uintptr(unsafe.Pointer(c)),
+					NoscanUsed: c.noscanCur - c.noscanBase,
+					ScanUsed:   c.scanBase - c.scanCur,
+				}
+			}
+			n++
+		}
+	})
+	startTheWorld(stw)
+	return n, waiting
+}
+
+// LogosArenaEmptyChunk empties in place the chunk at addr of the calling
+// goroutine's chain: its objects are discarded and its watermarks return to
+// the empty state, while the chunks linked after it stay. Save, Restore, and
+// allocation cannot reach this state for a chunk below the head: a restore
+// pops the chunks above its mark, and a chunk is linked only above a head that
+// holds an object. The seam builds it so the park rule for empty chunks behind
+// a live chunk can be exercised.
+func LogosArenaEmptyChunk(addr uintptr) bool {
+	for c := getg().logosArena; c != nil; c = c.next {
+		if uintptr(unsafe.Pointer(c)) == addr {
+			c.popScan(c.scanBase)
+			c.noscanCur = c.noscanBase
+			return true
+		}
+	}
+	return false
 }
 
 // LogosArenaCounts stops the world and reports the chunks that exist, the

@@ -1,0 +1,101 @@
+// run
+
+package main
+
+import "fmt"
+
+// PRRT_kwDOVOeymc6vs9fj (SPEC Sec 2.1, T-201): readonly receiver-effect
+// runtime controls. Companion to the frozen
+// test/logos/compile/const_view_receiver_refs.lgo, which stays rejected.
+// Every method below has a value receiver whose type carries a reference
+// field, yet each body is transitively pure: scalar/string field reads,
+// len, index and range reads, map reads, pointer loads, and calls to
+// local pure helpers only. No imported method, closure invocation,
+// channel operation, append/copy/delete/clear, or store through a
+// reference appears. The scalar-copy bump writes a scalar field of the
+// receiver copy only, crossing no reference indirection. Each printed
+// line is a hand-computed literal.
+
+type Item struct {
+	Name string
+	Tags []string
+}
+
+func (v Item) Label() string { return v.Name }
+
+type SliceBox struct {
+	Items []int
+}
+
+func (b SliceBox) Len() int   { return len(b.Items) }
+func (b SliceBox) First() int { return b.Items[0] }
+
+func (b SliceBox) Sum() int {
+	total := 0
+	for _, x := range b.Items {
+		total += x
+	}
+	return total
+}
+
+func add(a, b int) int { return a + b }
+
+func (b SliceBox) SumPlus(k int) int { return add(b.Sum(), k) }
+
+type MapBox struct {
+	M map[string]int
+}
+
+func (b MapBox) Get(k string) int { return b.M[k] ?? 0 }
+func (b MapBox) Len() int         { return len(b.M) }
+
+type PtrBox struct {
+	P *int
+}
+
+func (b PtrBox) Load() int { return *b.P }
+
+type Mixed struct {
+	N     int
+	Items []int
+}
+
+func (m Mixed) Next() int {
+	m.N++
+	return m.N
+}
+
+func LabelControl(v const *Item) string       { return v.Label() }
+func SliceLenControl(v const *SliceBox) int   { return v.Len() }
+func SliceFirstControl(v const *SliceBox) int { return v.First() }
+func SliceSumControl(v const *SliceBox) int   { return v.Sum() }
+func SlicePlusControl(v const *SliceBox, k int) int { return v.SumPlus(k) }
+func MapGetControl(v const *MapBox, k string) int   { return v.Get(k) }
+func MapLenControl(v const *MapBox) int             { return v.Len() }
+func PtrLoadControl(v const *PtrBox) int            { return v.Load() }
+func CopyBumpControl(v const *Mixed) int            { return v.Next() }
+
+func main() {
+	item := Item{Name: "ok", Tags: []string{"a", "b"}}
+	fmt.Println(LabelControl(&item))
+
+	sb := SliceBox{Items: []int{10, 20, 30}}
+	var cvSlice const *SliceBox = &sb
+	fmt.Println(SliceLenControl(cvSlice))
+	fmt.Println(SliceFirstControl(&sb))
+	fmt.Println(SliceSumControl(&sb))
+	fmt.Println(SlicePlusControl(&sb, 5))
+
+	mb := MapBox{M: map[string]int{"a": 1, "b": 2}}
+	fmt.Println(MapGetControl(&mb, "a"))
+	fmt.Println(MapGetControl(&mb, "missing"))
+	fmt.Println(MapLenControl(&mb))
+
+	n := 7
+	pb := PtrBox{P: &n}
+	fmt.Println(PtrLoadControl(&pb))
+
+	mx := Mixed{N: 41, Items: []int{1, 2}}
+	got := CopyBumpControl(&mx)
+	fmt.Println(got, mx.N)
+}

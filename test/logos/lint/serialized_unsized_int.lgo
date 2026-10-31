@@ -1,4 +1,4 @@
-// errorcheck -0
+// errorcheck
 
 // portability::serialized_unsized_int (SPEC Sec 1.2, #182): a field of
 // type int or uint in a struct with json tags. The generated binary layout
@@ -62,8 +62,8 @@ type TagOptions struct {
 
 // Several names share one type: each name is flagged.
 type Shared struct {
-	A, B int `json:"ab"` // ERROR "field A has type int" "field B has type int"
-	C, D int32 `json:"cd"`
+	A, B int `json:"ab"` // ERROR "field A has type int" "field B has type int" "\[nogo::structtag\]"
+	C, D int32 `json:"cd"` // ERROR "\[nogo::structtag\]"
 }
 
 // A field default sits between the type and the tag; the field is checked
@@ -71,7 +71,7 @@ type Shared struct {
 type Defaults struct {
 	Port   int    = 8080 `json:"port"` // ERROR "\[portability::serialized_unsized_int\] field Port has type int"
 	Host   string = "localhost" `json:"host"`
-	Lo, Hi uint   = 3 `json:"range"` // ERROR "field Lo has type uint" "field Hi has type uint"
+	Lo, Hi uint   = 3 `json:"range"` // ERROR "field Lo has type uint" "field Hi has type uint" "\[nogo::structtag\]"
 	Small  int32  = 4
 	Plain  int    = 1 // ERROR "\[portability::serialized_unsized_int\] field Plain has type int"
 }

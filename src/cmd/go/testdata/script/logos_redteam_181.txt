@@ -1,0 +1,24 @@
+# REDTEAM #181 (SPEC Sec 8.3, T-301.1): a loop back-edge MUST restore the
+# watermark for iteration-local objects; a loop with only iteration-local
+# allocation MUST NOT grow arena use across iterations. This script runs the
+# bounded-watermark unit gates under the arena experiment.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+env GOEXPERIMENT=logosarena
+go test -v -count=1 -run 'TestLogosArenaLoopWatermarkBounded|TestLogosArenaSwitchBreakWatermarkBounded|TestLogosArenaSelectBreakWatermarkBounded' runtime
+stdout '--- PASS: TestLogosArenaLoopWatermarkBounded'
+stdout '--- PASS: TestLogosArenaSwitchBreakWatermarkBounded'
+stdout '--- PASS: TestLogosArenaSelectBreakWatermarkBounded'
+stdout '^ok\s+runtime'
+! stderr 'no tests to run'
+go test -race -v -count=1 -run 'TestLogosArenaLoopWatermarkBounded|TestLogosArenaSwitchBreakWatermarkBounded|TestLogosArenaSelectBreakWatermarkBounded' runtime
+stdout '--- PASS: TestLogosArenaLoopWatermarkBounded'
+stdout '--- PASS: TestLogosArenaSwitchBreakWatermarkBounded'
+stdout '--- PASS: TestLogosArenaSelectBreakWatermarkBounded'
+stdout '^ok\s+runtime'
+! stderr 'no tests to run'
+
+-- go.mod --
+module example.com/redteam181
+
+go 1.27

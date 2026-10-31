@@ -392,22 +392,38 @@ func TestLogosImmixMediumPath(t *testing.T) {
 	})
 }
 
-// TestLogosImmixStoreBarrier checks that a pointer-sized destination range
-// marks only its owning line and never marks the off-heap line header.
+// TestLogosImmixStoreBarrier checks that the production barrier marks only
+// its owning line in the active dirty parity table (atomic OR + bounded
+// enlist) and never marks the off-heap line header. It forces the cached
+// immix mode to exercise the real production gate (one byte test), not a
+// low-level marker bypass; lines must stay clear because the barrier no
+// longer writes the recompute view.
 func TestLogosImmixStoreBarrier(t *testing.T) {
+	if !runtime.LogosImmixMovingExperiment() {
+		t.Skip("logos moving experiment off; production barrier correctly disabled")
+	}
+	prev := runtime.LogosImmixForceOnForTest()
+	defer runtime.LogosImmixRestoreOnForTest(prev)
 	base := runtime.LogosImmixNewBlocks(1)
 	b := runtime.LogosImmixBlockFor(base)
 	b.ClearLines()
+	b.ClearDirtyAll()
 	dst := base + 3*immixLine + 17
 	runtime.LogosImmixStoreBarrier(dst, unsafe.Sizeof(uintptr(0)))
-	lines := b.Lines()
-	for i, mark := range *lines {
+	dirty := b.DirtyActive()
+	for i, mark := range *dirty {
 		if want := i == 3; (mark != 0) != want {
-			t.Fatalf("line %d = %d, want marked=%v", i, mark, want)
+			t.Fatalf("dirty line %d = %d, want marked=%v", i, mark, want)
 		}
 	}
-	b.ClearLines()
+	if *b.Lines() != (runtime.LogosLineMark{}) {
+		t.Fatal("production barrier wrote legacy lines; it must write dirty parity only")
+	}
+	b.ClearDirtyAll()
 	runtime.LogosImmixStoreBarrier(b.Addr(), unsafe.Sizeof(uintptr(0)))
+	if *b.DirtyActive() != (runtime.LogosLineMark{}) {
+		t.Fatal("store barrier marked dirty for its off-heap header destination")
+	}
 	if *b.Lines() != (runtime.LogosLineMark{}) {
 		t.Fatal("store barrier marked lines for its off-heap header destination")
 	}

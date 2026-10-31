@@ -590,3 +590,47 @@ type Container struct {
 		}
 	}
 }
+
+// TestFallbackStringQuoting is the red repro for finding (2): fallback-classified
+// scalars with `,string` must preserve tag-aware quoting in both directions.
+// Unmarshal-only types have no marshal methods so the encoder must quote;
+// marshal-only types have no unmarshal methods so the decoder must use the
+// quoted reader; exact json.Number must wrap the number literal in quotes.
+func TestFallbackStringQuoting(t *testing.T) {
+	text := lowerStaticText(t, "package p\ntype MyInt int\nfunc (m *MyInt) UnmarshalJSON(b []byte) error { return nil }\ntype S struct {\n\tV MyInt `json:\"v,string\"`\n}\n")
+	mbody := methodBody(t, text, "func (_logos_v S) MarshalJSON() ([]byte, error) {")
+	if strings.Contains(mbody, "MarshalField") {
+		t.Errorf("unmarshal-only encoder uses fallback, want quoted scalar (AppendInt with quotes):\n%s", mbody)
+	}
+	if !strings.Contains(mbody, "AppendInt") {
+		t.Errorf("unmarshal-only encoder lacks quoted int encoding:\n%s", mbody)
+	}
+	text2 := lowerStaticText(t, "package p\ntype MyInt2 int\nfunc (m MyInt2) MarshalJSON() ([]byte, error) { return []byte(`123`), nil }\ntype S2 struct {\n\tV MyInt2 `json:\"v,string\"`\n}\n")
+	ubody := methodBody(t, text2, "func (_logos_v *S2) UnmarshalJSON(_logos_data []byte) error {")
+	if strings.Contains(ubody, "Fallback(") {
+		t.Errorf("marshal-only decoder uses Fallback, want IntQ for ,string:\n%s", ubody)
+	}
+	if !strings.Contains(ubody, "IntQ") {
+		t.Errorf("marshal-only decoder lacks IntQ:\n%s", ubody)
+	}
+	mbody2 := methodBody(t, text2, "func (_logos_v S2) MarshalJSON() ([]byte, error) {")
+	if !strings.Contains(mbody2, "MarshalField") {
+		t.Errorf("marshal-only encoder lacks MarshalField (method wins, unquoted):\n%s", mbody2)
+	}
+	ubody1 := methodBody(t, text, "func (_logos_v *S) UnmarshalJSON(_logos_data []byte) error {")
+	if !strings.Contains(ubody1, "FallbackQ(") {
+		t.Errorf("unmarshal-only decoder lacks FallbackQ unwrapping for ,string (want inner content, not outer token):\n%s", ubody1)
+	}
+	text3 := lowerStaticText(t, "package p\nimport \"encoding/json\"\ntype S3 struct {\n\tN json.Number `json:\"n,string\"`\n}\n")
+	mbody3 := methodBody(t, text3, "func (_logos_v S3) MarshalJSON() ([]byte, error) {")
+	if !strings.Contains(mbody3, "MarshalField") {
+		t.Errorf("number encoder lacks MarshalField:\n%s", mbody3)
+	}
+	if strings.Count(mbody3, `append(_logos_buf, '"')`) < 1 {
+		t.Errorf("number encoder lacks quoted wrapping for ,string (want value quotes):\n%s", mbody3)
+	}
+	ubody3 := methodBody(t, text3, "func (_logos_v *S3) UnmarshalJSON(_logos_data []byte) error {")
+	if !strings.Contains(ubody3, "FallbackQ(") {
+		t.Errorf("number decoder lacks FallbackQ unwrapping for ,string:\n%s", ubody3)
+	}
+}

@@ -37,7 +37,7 @@ type chainResult struct {
 // the mark of a moved region, which resolves before edits are emitted.
 type chainHoist struct {
 	stmts []syntax.Stmt
-	text  string
+	text  otext
 }
 
 // chainOp is one fused operation. savedBody captures the lambda body
@@ -233,7 +233,7 @@ func (fl *fileLower) lowerChainStmt(s syntax.Stmt, enc []chainResult) []syntax.S
 	var hoists []syntax.Stmt
 	for _, h := range fl.lowerChainUnit(s, calls, enc) {
 		hoists = append(hoists, h.stmts...)
-		fl.add(stmtStart, stmtStart, h.text+"; ")
+		fl.addT(stmtStart, stmtStart, cat(h.text, gen("; ")))
 	}
 	return hoists
 }
@@ -274,17 +274,16 @@ func (fl *fileLower) lowerChainElseIfHead(ifs *syntax.IfStmt, els *syntax.IfStmt
 	}
 	calls := fl.chainsInStmt(els)
 	var hoists []syntax.Stmt
-	var text strings.Builder
-	text.WriteString("{ ")
+	parts := []otext{gen("{ ")}
 	for _, h := range fl.lowerChainUnit(els, calls, enc) {
 		hoists = append(hoists, h.stmts...)
-		text.WriteString(h.text + "; ")
+		parts = append(parts, h.text, gen("; "))
 	}
 	if len(hoists) == 0 {
 		return
 	}
 	elsPos := fl.off(syntax.StartPos(els))
-	fl.add(elsPos, elsPos, text.String())
+	fl.addT(elsPos, elsPos, cat(parts...))
 	fl.add(fl.off(syntax.EndPos(els)), fl.off(syntax.EndPos(els)), " }")
 	ifs.Else = &syntax.BlockStmt{List: append(hoists, els)}
 }
@@ -324,11 +323,10 @@ func (fl *fileLower) lowerChainConstBodies(s syntax.Stmt, enc []chainResult) {
 // hoist leaves, as lowerChainIf does for a leading if.
 func (fl *fileLower) lowerChainElseIfInit(ifs *syntax.IfStmt, els *syntax.IfStmt, enc []chainResult) {
 	var pre []syntax.Stmt
-	var text strings.Builder
-	text.WriteString("{ ")
+	parts := []otext{gen("{ ")}
 	for _, h := range fl.lowerChainPiece(els.Init, enc) {
 		pre = append(pre, h.stmts...)
-		text.WriteString(h.text + "; ")
+		parts = append(parts, h.text, gen("; "))
 	}
 	errName := chainErrName(els.Pos())
 	hoists := fl.lowerChainPieceExit(els.Cond, enc, condFail(errName))
@@ -337,13 +335,13 @@ func (fl *fileLower) lowerChainElseIfInit(ifs *syntax.IfStmt, els *syntax.IfStmt
 	}
 	if len(hoists) > 0 {
 		pre = append(pre, parseChainStmtFrag(fl, "var "+errName+" error", els.Pos())...)
-		text.WriteString("var " + errName + " error; ")
+		parts = append(parts, gen("var "+errName+" error; "))
 		cond, check := fl.rewriteIfCond(els, hoists, enc, errName)
 		els.Cond = cond
 		els.Then.List = append(check, els.Then.List...)
 	}
 	elsPos := fl.off(syntax.StartPos(els))
-	fl.add(elsPos, elsPos, text.String())
+	fl.addT(elsPos, elsPos, cat(parts...))
 	end := fl.off(syntax.EndPos(els))
 	fl.add(end, end, " }")
 	wrapper := blockOf(els.Pos(), append(pre, els))
@@ -909,7 +907,7 @@ func (cg *chainGen) lowerArgChains(arg syntax.Expr) {
 // text of its receiver span. A chain call in base position, such as a
 // mid-chain sortBy, lowers as its own run; its value feeds the outer
 // loop.
-func (cg *chainGen) sub(e syntax.Expr, recv span) string {
+func (cg *chainGen) sub(e syntax.Expr, recv span) otext {
 	var nested []*syntax.CallExpr
 	if bc, ok := syntax.Unparen(e).(*syntax.CallExpr); ok && cg.fl.isChainCall(bc) {
 		nested = []*syntax.CallExpr{bc}
@@ -990,11 +988,11 @@ type chainEmit struct {
 	call     *syntax.CallExpr
 	ops      []chainOp
 	term     chainOp
-	baseText string
+	baseText otext
 	elemT    types2.Type
 	resultT  types2.Type
 	isTry    bool
-	closures []string
+	closures []otext
 	outElem  string
 }
 
@@ -1010,13 +1008,13 @@ func (ce *chainEmit) prepare() {
 		switch op.method {
 		case "take":
 			ce.closures = append(ce.closures,
-				fmt.Sprintf("%s_tn%d := %s", cg.prefix, i, ce.argText(op)),
-				fmt.Sprintf("%s_tc%d := 0", cg.prefix, i),
+				cat(gen(fmt.Sprintf("%s_tn%d := ", cg.prefix, i)), ce.argText(op)),
+				gen(fmt.Sprintf("%s_tc%d := 0", cg.prefix, i)),
 			)
 		case "drop":
 			ce.closures = append(ce.closures,
-				fmt.Sprintf("%s_d%d := %s", cg.prefix, i, ce.argText(op)),
-				fmt.Sprintf("%s_di%d := 0", cg.prefix, i),
+				cat(gen(fmt.Sprintf("%s_d%d := ", cg.prefix, i)), ce.argText(op)),
+				gen(fmt.Sprintf("%s_di%d := 0", cg.prefix, i)),
 			)
 		default:
 			if op.lam != nil {
@@ -1024,7 +1022,7 @@ func (ce *chainEmit) prepare() {
 			} else if op.arg != nil && takesFunc(op.method) {
 				// A non-lambda func value evaluates once, like any call
 				// argument; the loop then reuses the bound name.
-				ce.closures = append(ce.closures, cg.prefix+fmt.Sprintf("_f%d := %s", i, cg.fl.textOf(op.argSpan)))
+				ce.closures = append(ce.closures, cat(gen(cg.prefix+fmt.Sprintf("_f%d := ", i)), cg.fl.textOf(op.argSpan)))
 			}
 		}
 		if op.method == "map" {
@@ -1034,9 +1032,9 @@ func (ce *chainEmit) prepare() {
 	if ce.term.lam != nil {
 		ce.closures = append(ce.closures, cg.closure(cg.prefix+"_ft", ce.term, elem, ce.opResult(ce.term)))
 	} else if ce.term.arg != nil && takesFunc(ce.term.method) {
-		ce.closures = append(ce.closures, cg.prefix+"_ft := "+cg.fl.textOf(ce.term.argSpan))
+		ce.closures = append(ce.closures, cat(gen(cg.prefix+"_ft := "), cg.fl.textOf(ce.term.argSpan)))
 	} else if ce.term.method == "get" {
-		ce.closures = append(ce.closures, fmt.Sprintf("%s_i := %s", cg.prefix, ce.argText(ce.term)))
+		ce.closures = append(ce.closures, cat(gen(fmt.Sprintf("%s_i := ", cg.prefix)), ce.argText(ce.term)))
 	}
 	ce.outElem = elem
 }
@@ -1181,32 +1179,35 @@ func (cg *chainGen) blockProdType(block *syntax.BlockStmt) types2.Type {
 // closure builds one per-element closure for a lambda op whose
 // parameter has type elem. Pure bodies return the value; `?` bodies
 // return value and error explicitly.
-func (cg *chainGen) closure(name string, op chainOp, elem, result string) string {
+func (cg *chainGen) closure(name string, op chainOp, elem, result string) otext {
 	fl := cg.fl
 	pname := op.lam.Params[0].Value
 	if op.isTry {
 		body, ok := op.savedBody.(syntax.Expr)
 		if !ok {
-			return ""
+			return gen("")
 		}
 		tryBody, ok := syntax.Unparen(body).(*syntax.TryExpr)
 		if !ok {
-			return ""
+			return gen("")
 		}
 		inner, ok := syntax.Unparen(tryBody.X).(*syntax.CallExpr)
 		if !ok {
-			return ""
+			return gen("")
 		}
 		callText := fl.textOf(span{fl.exprStart(inner), fl.chainCallEnd(inner)})
 		zero := cg.zeroText(cg.inferType(op, result))
 		vn := cg.prefix + "_v"
 		en := cg.prefix + "_e"
-		return fmt.Sprintf("%s := func(%s %s) (%s, error) { %s, %s := %s; if %s != nil { return %s, %s }; return %s, nil }", name, pname, elem, result, vn, en, callText, en, zero, en, vn)
+		return cat(gen(name+" := func("+pname+" "+elem+") ("+result+", error) { "+vn+", "+en+" := "), callText, gen("; if "+en+" != nil { return "+zero+", "+en+" }; return "+vn+", nil }"))
 	}
 	if block, ok := op.savedBody.(*syntax.BlockStmt); ok {
-		text := fl.textOf(span{fl.off(syntax.StartPos(block)), fl.off(syntax.EndPos(block))})
-		inner := strings.TrimPrefix(text, "{")
-		return fmt.Sprintf("%s := func(%s %s) %s {%s }", name, pname, elem, result, inner)
+		bt := fl.textOf(span{fl.off(syntax.StartPos(block)), fl.off(syntax.EndPos(block))})
+		inner := bt
+		if strings.HasPrefix(bt.s, "{") {
+			inner = bt.slice(1, len(bt.s))
+		}
+		return cat(gen(name+" := func("+pname+" "+elem+") "+result+" {"), inner, gen(" }"))
 	}
 	if expr, ok := op.savedBody.(syntax.Expr); ok {
 		// D4: a top-level `??`/`?.` wrapper records its head insert
@@ -1214,9 +1215,9 @@ func (cg *chainGen) closure(name string, op chainOp, elem, result string) string
 		// end, which textOf keeps pending. Drain those boundary
 		// inserts here; strictly interior wrappers already drained.
 		bodyText := fl.drainBodyWrapper(expr, fl.textOf(op.bodySpan))
-		return fmt.Sprintf("%s := func(%s %s) %s { return %s }", name, pname, elem, result, bodyText)
+		return cat(gen(name+" := func("+pname+" "+elem+") "+result+" { return "), bodyText, gen(" }"))
 	}
-	return ""
+	return gen("")
 }
 
 // inferType resolves the checked type behind a result spelling.
@@ -1296,16 +1297,16 @@ func (cg *chainGen) spellType(t types2.Type) string {
 // loop builds the fused loop body lines and the epilogue for a run.
 // It returns the prelude lines (receiver, closures, counters), the
 // per-element lines, and the epilogue lines.
-func (ce *chainEmit) loop() (prelude, body, epilogue []string) {
+func (ce *chainEmit) loopO() (prelude []otext, body, epilogue []string) {
 	cg := ce.cg
 	p := cg.prefix
-	prelude = append(prelude, p+"_rcv := "+ce.baseText)
+	prelude = append(prelude, cat(gen(p+"_rcv := "), ce.baseText))
 	prelude = append(prelude, ce.closures...)
 	if ce.needOut() {
-		prelude = append(prelude, "var "+p+"_out []"+ce.outElem)
+		prelude = append(prelude, gen("var "+p+"_out []"+ce.outElem))
 	}
 	if ce.term.method == "count" {
-		prelude = append(prelude, p+"_c := 0")
+		prelude = append(prelude, gen(p+"_c := 0"))
 	}
 	cur := p + "_e"
 	loopHead := fmt.Sprintf("for _, %[1]s_e := range %[1]s_rcv {", p)
@@ -1339,6 +1340,14 @@ func (ce *chainEmit) loop() (prelude, body, epilogue []string) {
 	return prelude, body, epilogue
 }
 
+func (ce *chainEmit) loop() (prelude, body, epilogue []string) {
+	pre, body, epilogue := ce.loopO()
+	for _, p := range pre {
+		prelude = append(prelude, p.s)
+	}
+	return prelude, body, epilogue
+}
+
 // needOut reports whether the run materializes elements: slice and
 // sum, sort, last, and get terminals always append; value terminals
 // append only when a `?` rollback may need produced elements.
@@ -1365,10 +1374,10 @@ func (ce *chainEmit) needElem() bool {
 }
 
 // argText returns the composed text of an index argument.
-func (ce *chainEmit) argText(op chainOp) string {
+func (ce *chainEmit) argText(op chainOp) otext {
 	cg := ce.cg
 	if op.arg == nil {
-		return "0"
+		return gen("0")
 	}
 	return cg.fl.textOf(op.argSpan)
 }
@@ -1632,46 +1641,69 @@ func (ce *chainEmit) epilogueSort(p string) []string {
 	}
 }
 
+// runLoopO builds the loop lines of a run. It mirrors runLoop in
+// simdslice.go; keep them in sync. A bare slice `.sum()` with a vector
+// form replaces the scalar loop with the vector form behind its feature
+// check; when no check guards it, prelude[:1] keeps only the user
+// receiver line.
+func (ce *chainEmit) runLoopO() (prelude []otext, body, epilogue []string) {
+	prelude, body, epilogue = ce.loopO()
+	f, ok := ce.sliceSumForm()
+	if !ok {
+		return prelude, body, epilogue
+	}
+	ce.cg.fl.needSimd = true
+	p := ce.cg.prefix
+	if f.isFloat {
+		return prelude, ce.guardedBody(f, simdSliceStage(p, f), body), epilogue
+	}
+	vector := simdSliceAccumulate(p, f)
+	if ce.cg.fl.simdGuardCond(f.feat) == "" {
+		return prelude[:1], vector, nil
+	}
+	return prelude, ce.guardedBody(f, vector, body), epilogue
+}
+
 // emit assembles one chain: closures, loop, replacement, and hoists.
-func (cg *chainGen) emit(call *syntax.CallExpr, ops []chainOp, baseText string, elemT, resultT types2.Type, term chainOp, isTry bool) {
+func (cg *chainGen) emit(call *syntax.CallExpr, ops []chainOp, baseText otext, elemT, resultT types2.Type, term chainOp, isTry bool) {
 	fl := cg.fl
 	cg.elemT = elemT
 	ce := &chainEmit{cg: cg, call: call, ops: ops, term: term, baseText: baseText, elemT: elemT, resultT: resultT, isTry: isTry}
 	ce.prepare()
-	prelude, body, epilogue := ce.runLoop()
-	var b strings.Builder
+	prelude, body, epilogue := ce.runLoopO()
+	var parts []otext
 	for _, line := range prelude {
-		b.WriteString(line + "; ")
+		parts = append(parts, line, gen("; "))
 	}
 	for _, line := range body {
-		b.WriteString(line + "; ")
+		parts = append(parts, gen(line), gen("; "))
 	}
 	for _, line := range epilogue {
-		b.WriteString(line + "; ")
+		parts = append(parts, gen(line), gen("; "))
 	}
-	loopText := leftoverComments(fl, cg.whole, cg.kept) + strings.TrimSpace(b.String())
+	loopText := cat(leftoverComments(fl, cg.whole, cg.kept), cat(parts...).trimRight(" "))
 	if !isTry {
-		text := "func() " + ce.resultSpelling() + " { " + loopText + " }()"
-		native := parseChainExprFrag(fl, text, call.Pos())
+		text := cat(gen("func() "+ce.resultSpelling()+" { "), loopText, gen(" }()"))
+		native := parseChainExprFrag(fl, text.s, call.Pos())
 		replaceTupleExpr(fl.file, call, native)
-		fl.add(cg.whole.start, cg.whole.end, text)
+		fl.addT(cg.whole.start, cg.whole.end, text)
 		return
 	}
 	if cg.enc == nil {
 		base.Fatalf("logos: ?-chain outside function at %s", call.Pos().String())
 	}
-	text := "func() (" + ce.resultSpelling() + ", error) { " + loopText + " }"
+	text := cat(gen("func() ("+ce.resultSpelling()+", error) { "), loopText, gen(" }"))
 	temp := cg.prefix + "_t"
 	errName := cg.prefix + "_err"
 	fail := cg.failText(errName)
-	hoistText := temp + ", " + errName + " := " + text + "(); if " + errName + " != nil { " + fail + " }"
+	hoistText := cat(gen(temp+", "+errName+" := "), text, gen("(); if "+errName+" != nil { "+fail+" }"))
 	if cg.guard != "" {
 		// The result outlives the guard block: the statement reads it
 		// only where its own short-circuit operands let it run, which
 		// are exactly the cases the guard admits.
-		hoistText = "var " + temp + " " + ce.resultSpelling() + "; if " + cg.guard + " { var " + errName + " error; " + temp + ", " + errName + " = " + text + "(); if " + errName + " != nil { " + fail + " } }"
+		hoistText = cat(gen("var "+temp+" "+ce.resultSpelling()+"; if "+cg.guard+" { var "+errName+" error; "+temp+", "+errName+" = "), text, gen("(); if "+errName+" != nil { "+fail+" } }"))
 	}
-	hoistNative := parseChainStmtFrag(fl, hoistText, call.Pos())
+	hoistNative := parseChainStmtFrag(fl, hoistText.s, call.Pos())
 	cg.hoists = append(cg.hoists, chainHoist{stmts: hoistNative, text: hoistText})
 	native := nameOf(call.Pos(), temp)
 	replaceTupleExpr(fl.file, call, native)

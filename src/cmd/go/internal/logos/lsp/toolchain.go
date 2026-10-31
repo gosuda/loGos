@@ -282,19 +282,14 @@ func (t *toolchain) eject(ctx context.Context, dir string, ov *overlay, targets 
 	return err
 }
 
-// executableDirFlag returns the -o flag that sends executables to bin when
-// the build would write one. A build of a single main package writes its
-// executable into the current directory, the user's package directory;
-// every other build writes none. The directory form of -o is an error when
-// no main package is built, so the flag is given for that case alone.
-func executableDirFlag(targets []pkgInfo, bin string) ([]string, error) {
+// executableDirFlag prevents a single-main eject build from writing an
+// executable into the user's package directory. The null device also keeps
+// the build on the ordinary path that emits lowering sidecars.
+func executableDirFlag(targets []pkgInfo, _ string) ([]string, error) {
 	if len(targets) != 1 || targets[0].name != "main" {
 		return nil, nil
 	}
-	if err := os.MkdirAll(bin, 0o777); err != nil {
-		return nil, err
-	}
-	return []string{"-o", bin + string(filepath.Separator)}, nil
+	return []string{"-o", os.DevNull}, nil
 }
 
 // collect reads the lowered files of package p into low. A file is
@@ -364,7 +359,47 @@ func (t *toolchain) Diagnose(ctx context.Context, dir string, buffers map[string
 			diags = append(diags, d)
 		}
 	}
-	return diags, nil
+	// A lint run type-checks the package on two compile paths: the native
+	// lint compile and the archive compile the nogo action needs for its
+	// binary analyzer and export correlation. A hard type error such as an
+	// unused variable is a rule-less native diagnostic from both paths, so
+	// it reaches stderr twice with the same file, span, severity, and
+	// message. Report each such diagnostic once. Only rule-less exact
+	// duplicates merge: every lint and helper finding carries a rule, so
+	// helper failures and distinct findings always survive, and positions
+	// keep their mapped original coordinates.
+	return dedupNativeDiagnostics(diags), nil
+}
+
+// dedupNativeDiagnostics collapses the rule-less diagnostics a lint run
+// reports once per compile path: the two compile paths deliver each native
+// diagnostic at least once, so Diagnose consumes them idempotently and
+// reports each unique diagnostic a single time. Only rule-less exact
+// duplicates merge; the first occurrence, with its raw line, is kept.
+func dedupNativeDiagnostics(diags []Diagnostic) []Diagnostic {
+	var out []Diagnostic
+	for _, d := range diags {
+		if d.RuleID != "" || !hasDiagnostic(out, d) {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// hasDiagnostic reports whether out already holds the rule-less diagnostic
+// d: same mapped file, span, severity, and message, and no rule on either
+// side. Every lint and helper finding carries a rule, so only the native
+// type errors both compile paths emit can match here.
+func hasDiagnostic(out []Diagnostic, d Diagnostic) bool {
+	if d.RuleID != "" {
+		return false
+	}
+	for _, e := range out {
+		if e.RuleID == "" && e.File == d.File && e.Span == d.Span && e.Severity == d.Severity && e.Message == d.Message {
+			return true
+		}
+	}
+	return false
 }
 
 // Hints returns the hints JSON of the package in dir, the file the

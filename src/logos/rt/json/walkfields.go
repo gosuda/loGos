@@ -347,7 +347,19 @@ func (s *Walk) appendStruct(buf []byte, rv reflect.Value) ([]byte, error) {
 		buf = append(buf, f.nameHTML...)
 		var err error
 		if f.quoted {
-			buf, err = s.appendStringOptionValue(buf, fv)
+			// A honoured MarshalJSON or MarshalText method ignores the
+			// `string` option, so it dispatches before the quoted-scalar
+			// path through the addressable, nil-preserving honour branch.
+			// Exact json.Number (and non-nil *json.Number) stays quoted:
+			// under goexperiment.jsonv2 Number implements MarshalJSONTo,
+			// which would emit the literal unquoted.
+			isNum := fv.Type() == numberType ||
+				(fv.Kind() == reflect.Pointer && !fv.IsNil() && fv.Type().Elem() == numberType)
+			if !isNum && s.honorsJSONMethod(fv) {
+				buf, err = appendHonored(buf, fv)
+			} else {
+				buf, err = s.appendStringOptionValue(buf, fv)
+			}
 		} else {
 			buf, err = s.appendValue(buf, fv)
 		}

@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build unix || (js && wasm) || wasip1 || windows
+
 package runtime_test
 
 import (
@@ -9,7 +11,6 @@ import (
 	"errors"
 	"net"
 	"os"
-	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -186,42 +187,6 @@ func TestLogosGroupNetpollOtherGroupStaysBlocked(t *testing.T) {
 	}
 }
 
-// A waiter's late release must not erase a cancellation that a new
-// waiter received on the reused descriptor: the purge on reuse drops
-// the stale entry, and a release without an entry clears nothing.
-func TestLogosGroupNetpollStaleReleaseKeepsCancel(t *testing.T) {
-	if !runtime.LogosStaleReleaseKeepsCancel() {
-		t.Fatal("a stale waiter's release erased the cancel bit of a reused descriptor")
-	}
-}
-
-// A descriptor reused while no group waiter is registered anywhere still
-// starts without a stale cancel bit, and the published waiter count
-// returns to zero once the registry empties: the idle fast path of the
-// purge must neither skip a stale bit nor lag behind the registry.
-func TestLogosGroupNetpollIdlePurgeAndCount(t *testing.T) {
-	if !runtime.LogosPurgeClearsBit() {
-		t.Fatal("a stale cancel bit survived the purge of a reused descriptor")
-	}
-	if !runtime.LogosStaleReleaseKeepsCancel() {
-		t.Fatal("a stale waiter's release erased the cancel bit of a reused descriptor")
-	}
-	if !runtime.LogosRegistryIdle() {
-		t.Fatal("the registry count stayed positive after every waiter left")
-	}
-}
-
-// Cancel visits only the registered waiters of its own group.
-func TestLogosGroupNetpollCancelFiltersByGroup(t *testing.T) {
-	otherBit, ownBit := runtime.LogosCancelFiltersByGroup()
-	if otherBit {
-		t.Fatal("cancelling a different group set the cancel bit")
-	}
-	if !ownBit {
-		t.Fatal("cancelling the waiter's own group did not set the cancel bit")
-	}
-}
-
 // A child that reaches conn.Read only after the sibling's failure was
 // recorded still wakes: the cancel outlives the registry scan, so a
 // registration after the scan arms the wait instead of parking forever.
@@ -285,10 +250,99 @@ func TestLogosGroupNetpollCancelRacingDataUnblocksNextRead(t *testing.T) {
 	}
 }
 
-// A slot lent out again after its group's failure starts clean: a child
-// of the new group registers without inheriting the old cancellation.
-func TestLogosGroupNetpollReusedSlotStartsClean(t *testing.T) {
-	if !runtime.LogosReusedSlotStartsClean() {
-		t.Fatal("a cancelled slot was not reused clean: same slot not lent out, or it carried its cancellation")
+// A cancelled group waiter that leaves its wait does not erase the
+// cancellation a later waiter on the same descriptor still needs: two
+// sequential reads after the sibling's failure both time out instead of
+// the second parking forever.
+func TestLogosGroupNetpollSecondReadAfterCancelStillTimesOut(t *testing.T) {
+	_, server := logosConnPair(t)
+	g, _ := rt.NewGroup(t.Context(), 0)
+	var firstTimedOut, secondTimedOut atomic.Bool
+	g.Go(func(ctx context.Context) error {
+		<-ctx.Done()
+		time.Sleep(200 * time.Millisecond)
+		buf := make([]byte, 1)
+		_, err := server.Read(buf)
+		firstTimedOut.Store(os.IsTimeout(err))
+		_, err = server.Read(buf)
+		secondTimedOut.Store(os.IsTimeout(err))
+		return nil
+	})
+	g.Go(func(ctx context.Context) error {
+		return errLogosSibling
+	})
+	if err := logosGroupWait(t, g, 5*time.Second); !errors.Is(err, errLogosSibling) {
+		t.Fatalf("Wait = %v, want %v", err, errLogosSibling)
+	}
+	if !firstTimedOut.Load() {
+		t.Fatal("first Read after the sibling's cancel did not return a timeout error")
+	}
+	if !secondTimedOut.Load() {
+		t.Fatal("second Read after the cancel did not return a timeout error; the first waiter's release must not clear it")
+	}
+}
+
+// A descriptor closed after its group's cancel starts clean when reused:
+// the next group's child on a reopened connection stays parked until
+// data arrives instead of timing out from the old cancellation. Closing
+// retires the descriptor through the reuse purge, so no stale waiter or
+// cancel bit leaks onto its next occupant.
+func TestLogosGroupNetpollReusedDescriptorStartsClean(t *testing.T) {
+	client, server := logosConnPair(t)
+	g, _ := rt.NewGroup(t.Context(), 0)
+	var timedOut atomic.Bool
+	g.Go(func(ctx context.Context) error {
+		buf := make([]byte, 1)
+		_, err := server.Read(buf)
+		timedOut.Store(os.IsTimeout(err))
+		return nil
+	})
+	g.Go(func(ctx context.Context) error {
+		time.Sleep(50 * time.Millisecond)
+		return errLogosSibling
+	})
+	if err := logosGroupWait(t, g, 5*time.Second); !errors.Is(err, errLogosSibling) {
+		t.Fatalf("Wait = %v, want %v", err, errLogosSibling)
+	}
+	if !timedOut.Load() {
+		t.Fatal("blocked Read did not return a timeout error")
+	}
+	client.Close()
+	server.Close()
+
+	client, server = logosConnPair(t)
+	next, _ := rt.NewGroup(t.Context(), 0)
+	started := make(chan struct{})
+	readDone := make(chan error, 1)
+	next.Go(func(ctx context.Context) error {
+		close(started)
+		buf := make([]byte, 1)
+		_, err := server.Read(buf)
+		readDone <- err
+		return nil
+	})
+	<-started
+	// Let the child park. A leaked cancel bit from the closed descriptor
+	// would wake it with a timeout; still-blocked proves the reuse purge
+	// left no stale waiter or bit behind.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-readDone:
+		t.Fatalf("new group's Read returned %v without data; want still blocked", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if _, err := client.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("new group's Read = %v after data arrived, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("new group's Read still blocked after data arrived")
+	}
+	if err := logosGroupWait(t, next, 5*time.Second); err != nil {
+		t.Fatalf("next group Wait = %v, want nil", err)
 	}
 }

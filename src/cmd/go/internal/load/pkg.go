@@ -1994,6 +1994,19 @@ func (p *Package) load(ld *modload.Loader, ctx context.Context, opts PackageOpts
 			addImport("logos/rt/json", true)
 		}
 
+		// Synthesized nojsonv2 binary helpers directly import fmt,
+		// encoding/binary, math and slices (json_binary.go
+		// binaryImportTable); unsafe already rides the interp edge.
+		// The front end cannot predict which markers lowering emits,
+		// so every logos package carries them and unused entries are
+		// harmless, mirroring the json edge above.
+		if needsLogosBinary(p) {
+			addImport("fmt", true)
+			addImport("encoding/binary", true)
+			addImport("math", true)
+			addImport("slices", true)
+		}
+
 		// Interpolated strings lower to strconv appends and unsafe
 		// conversions, so every logos package carries both imports
 		// even when no source file names them (M6-S1).

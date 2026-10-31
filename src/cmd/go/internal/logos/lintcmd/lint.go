@@ -73,6 +73,9 @@ func runLint(ctx context.Context, cmd *base.Command, args []string) {
 	for _, p := range pkgs {
 		if work.LintsPackage(p) {
 			root.Deps = append(root.Deps, b.LintAction(p))
+			if na := b.NogoAction(moduleLoader, p); na != nil {
+				root.Deps = append(root.Deps, na)
+			}
 		}
 	}
 	b.Do(ctx, root)

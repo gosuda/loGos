@@ -331,9 +331,6 @@ func TestAppendGrowthHeap(t *testing.T) {
 }
 
 func TestAppendGrowthStack(t *testing.T) {
-	if logosOptAppendGrowthStack(t) {
-		return
-	}
 	if race.Enabled || asan.Enabled || msan.Enabled {
 		t.Skip("instrumentation breaks this optimization")
 	}

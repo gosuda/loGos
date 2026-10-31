@@ -1451,17 +1451,17 @@ func (ul *unionLower) expandCaseList(guard *syntax.TypeSwitchGuard, site caseSit
 	}
 	spans := caseElemSpans(fl.src, fl.off(elems[0].Pos()), fl.off(site.colon))
 	var out []syntax.Expr
-	var texts []string
+	var texts []otext
 	var first *unionUse
 	insertOK := guard.Lhs != nil
 	unions := 0
 	for i, e := range elems {
 		t := fl.pkg.info.TypeOf(e)
-		var text string
+		var text otext
 		if i < len(spans) {
-			text = string(fl.src[spans[i].start:spans[i].end])
+			text = fl.srcUser(spans[i].start, spans[i].end)
 		} else {
-			text = renderExpr(e)
+			text = gen(renderExpr(e))
 		}
 		if members, ok := unionTerms(t); ok {
 			u := ul.useOf(t, e.Pos())
@@ -1488,7 +1488,7 @@ func (ul *unionLower) expandCaseList(guard *syntax.TypeSwitchGuard, site caseSit
 					base.Fatalf("logos: cannot respell type %q", u.texts[k])
 				}
 				out = append(out, me)
-				texts = append(texts, u.texts[k])
+				texts = append(texts, gen(u.texts[k]))
 			}
 			continue
 		}
@@ -1512,7 +1512,7 @@ func (ul *unionLower) expandCaseList(guard *syntax.TypeSwitchGuard, site caseSit
 		// non-members.
 		return siteResult{drop: true}
 	}
-	fl.add(spans[0].start, spans[len(spans)-1].end, strings.Join(texts, ", "))
+	fl.addT(spans[0].start, spans[len(spans)-1].end, joinO(texts, ", "))
 	var bind *unionBind
 	if insertOK && unions == 1 {
 		bind = &unionBind{name: guard.Lhs.Value, use: first}

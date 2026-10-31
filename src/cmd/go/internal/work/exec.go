@@ -260,6 +260,12 @@ func (b *Builder) Do(ctx context.Context, root *Action) {
 	writeActionGraph()
 }
 
+// logosNogoWPrefixFull expands the W worktree prefix to a full absolute path
+// for every Nogo tool invocation (helper module dir and host go binary).
+func logosNogoWPrefixFull() string {
+	return cfg.GOROOT
+}
+
 // buildActionID computes the action ID for a build action.
 func (b *Builder) buildActionID(a *Action) cache.ActionID {
 	p := a.Package
@@ -364,7 +370,7 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 	default:
 		base.Fatalf("buildActionID: unknown build toolchain %q", cfg.BuildToolchainName)
 	case "gc":
-		fmt.Fprintf(h, "compile %s %q %q\n", b.toolID("compile"), forcedGcflags, p.Internal.Gcflags)
+		fmt.Fprintf(h, "compile %s %q %q\n", b.toolID("compile"), logosForcedGcflags(p), p.Internal.Gcflags)
 		if len(p.SFiles) > 0 {
 			fmt.Fprintf(h, "asm %q %q %q\n", b.toolID("asm"), forcedAsmflags, p.Internal.Asmflags)
 		}

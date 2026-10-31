@@ -772,6 +772,9 @@ func (p *printer) printMethodList(methods []*Field) {
 			if pt, ok := m.Type.(*PropertyType); ok { // M4-S1 hook: `const F T` / `F T` elements.
 				logosPrintProperty(p, m.Name, pt)
 			} else {
+				if m.Const {
+					p.print(_Const, blank)
+				}
 				p.printNode(m.Name)
 				p.printSignature(m.Type.(*FuncType))
 			}

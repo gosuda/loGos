@@ -8,6 +8,7 @@ import (
 	"cmd/internal/goobj"
 	"cmd/internal/objabi"
 	"cmd/link/internal/loader"
+	"cmd/link/internal/sym"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -37,16 +38,21 @@ const (
 // capabilitySinks maps sink symbol names to their capability kind. The
 // PLAN name runtime.logosFastCgoCall names no symbol in this tree; the
 // tailored sink is runtime.logosCgocallFast, the M20 fast path.
+// Process creation sinks syscall.StartProcess (src/syscall/exec_unix.go:272)
+// beside os.StartProcess/os.startProcess; net sinks syscall.Connect
+// (src/syscall/syscall_unix.go:295) beside syscall.Socket.
 var capabilitySinks = map[string]CapabilityKind{
 	"reflect.ValueOf":          CapReflect,
 	"reflect.TypeOf":           CapReflect,
 	"reflect.New":              CapReflect,
 	"syscall.Exec":             CapExec,
 	"syscall.ForkExec":         CapExec,
+	"syscall.StartProcess":     CapExec,
 	"os.StartProcess":          CapExec,
 	"os.startProcess":          CapExec,
 	"net.sysSocket":            CapNet,
 	"syscall.Socket":           CapNet,
+	"syscall.Connect":          CapNet,
 	"runtime.cgocall":          CapCgo,
 	"runtime.logosCgocallFast": CapCgo,
 }
@@ -114,6 +120,8 @@ type logosCapAuditor struct {
 	queue  []loader.Sym
 	impls  []logosCapImpl
 	hits   []logosCapHit
+	fanned bool
+	deps   []string
 }
 
 // logosCapAudit runs the capabilities reachability audit after deadcode.
@@ -140,6 +148,7 @@ func logosCapAudit(ctxt *Link, d *deadcodePass) {
 		graph:  newCapGraph(),
 		roles:  make(map[loader.Sym]capRole),
 	}
+	a.deps = parseLogosModinfoDeps(strdata["runtime.modinfo"])
 	a.collectImpls(d)
 	a.seedRoots(d)
 	a.flood(d)
@@ -190,14 +199,38 @@ func (a *logosCapAuditor) collectImpls(d *deadcodePass) {
 	}
 }
 
-// seedRoots enqueues the link roots: the entry symbol, dynamic exports,
-// the main inittasks, and the package init functions deadcode recorded.
+// seedRoots enqueues the link roots deadcode starts from. A shared library
+// roots every definition it keeps, then the main inittasks. Any other
+// build roots the entry symbol (main.main and its inittask under
+// -linkshared), the plugin entry points and exports, dynamic exports, the
+// main inittasks, and the package init functions deadcode recorded.
 func (a *logosCapAuditor) seedRoots(d *deadcodePass) {
+	if a.ctxt.BuildMode == BuildModeShared {
+		for i, n := 1, a.ldr.NDef(); i < n; i++ {
+			s := loader.Sym(i)
+			if a.ldr.SymType(s).IsText() && a.ldr.SymSize(s) == 0 {
+				continue
+			}
+			a.enqueue(s, 0)
+		}
+		a.enqueue(a.ctxt.mainInittasks, 0)
+		return
+	}
 	var names []string
 	if a.ctxt.linkShared && (a.ctxt.BuildMode == BuildModeExe || a.ctxt.BuildMode == BuildModePIE) {
 		names = append(names, "main.main", "main..inittask")
 	} else {
 		names = append(names, *flagEntrySymbol)
+	}
+	if a.ctxt.BuildMode == BuildModePlugin {
+		prefix := objabi.PathToPrefix(*flagPluginPath)
+		names = append(names, prefix+"..inittask", prefix+".main", "go:plugin.tabs")
+		if exports := a.ldr.Lookup("go:plugin.exports", 0); exports != 0 {
+			relocs := a.ldr.Relocs(exports)
+			for i := range relocs.Count() {
+				a.enqueue(relocs.At(i).Sym(), 0)
+			}
+		}
 	}
 	for _, name := range names {
 		a.enqueue(a.ldr.Lookup(name, 0), 0)
@@ -254,6 +287,7 @@ func (a *logosCapAuditor) flood(d *deadcodePass) {
 		}
 		a.followRelocs(d, s)
 		a.followAux(s)
+		a.followInlTree(s)
 		if a.ldr.IsExternal(s) {
 			a.enqueue(a.ldr.OuterSym(s), s)
 			a.enqueue(a.ldr.SubSym(s), s)
@@ -276,7 +310,66 @@ var reflectLookupSyms = []string{
 // reflect.Value.Method without calling it, and counting them would make
 // every function that mentions reflect.Value reach every exported method.
 func (a *logosCapAuditor) isReflectSite(s loader.Sym) bool {
-	return a.ldr.SymType(s).IsText() && (a.ldr.IsReflectMethod(s) || a.callsReflectLookup(s))
+	if !a.ldr.SymType(s).IsText() {
+		return false
+	}
+	if a.ldr.IsReflectMethod(s) || a.callsReflectLookup(s) {
+		return true
+	}
+	fi := a.ldr.FuncInfo(s)
+	if fi.Valid() {
+		fi.Preload()
+		for i := range int(fi.NumInlTree()) {
+			inlined := fi.InlTree(i).Func
+			if inlined != 0 && (a.ldr.IsReflectMethod(inlined) || a.callsReflectLookup(inlined) || capIsReflectLookupName(a.ldr.SymName(inlined))) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// followInlTree scans the inlined call tree of s to record inlined call edges,
+// register inlined sinks, and trigger reflective lookups without requiring
+// inlined symbols to carry physical function bodies or deadcode reachability.
+func (a *logosCapAuditor) followInlTree(s loader.Sym) {
+	fi := a.ldr.FuncInfo(s)
+	if !fi.Valid() {
+		return
+	}
+	fi.Preload()
+	ninl := int(fi.NumInlTree())
+	for i := range ninl {
+		node := fi.InlTree(i)
+		inlined := node.Func
+		if inlined == 0 {
+			continue
+		}
+		var p loader.Sym
+		if node.Parent >= 0 && int(node.Parent) < ninl {
+			p = fi.InlTree(int(node.Parent)).Func
+		}
+		if p == 0 {
+			p = s
+		}
+		if inlined == p {
+			continue
+		}
+		a.graph.visit(inlined, p)
+		name := a.ldr.SymName(inlined)
+		if kind, ok := capabilitySinks[capSinkName(name)]; ok {
+			a.hits = append(a.hits, logosCapHit{sink: inlined, kind: kind, name: capSinkName(name)})
+		} else if capIsCgoTrampoline(name) {
+			a.hits = append(a.hits, logosCapHit{sink: inlined, kind: CapCgo, name: "runtime.cgocall"})
+		}
+		if capIsReflectLookupName(name) || a.ldr.IsReflectMethod(inlined) || a.callsReflectLookup(inlined) {
+			for _, impl := range a.impls {
+				if capIsExportedMethod(impl.name) {
+					a.enqueue(impl.fn, inlined)
+				}
+			}
+		}
+	}
 }
 
 // callsReflectLookup reports whether s references a reflective method
@@ -290,7 +383,7 @@ func (a *logosCapAuditor) callsReflectLookup(s loader.Sym) bool {
 		if t == 0 || r.Type() == objabi.R_METHODOFF {
 			continue
 		}
-		if slices.Contains(reflectLookupSyms, a.ldr.SymName(t)) {
+		if capIsReflectLookupName(a.ldr.SymName(t)) {
 			return true
 		}
 	}
@@ -326,7 +419,12 @@ func (a *logosCapAuditor) followRelocs(d *deadcodePass, s loader.Sym) {
 			}
 			continue
 		case objabi.R_USEIFACEMETHOD:
-			m := d.decodeIfaceMethod(a.ldr, a.ctxt.Arch, r.Sym(), r.Add())
+			rs := r.Sym()
+			if a.ctxt.linkShared && (a.ldr.SymType(rs) == sym.SDYNIMPORT || a.ldr.SymType(rs) == sym.Sxxx) {
+				a.followExportedImpls(s)
+				continue
+			}
+			m := d.decodeIfaceMethod(a.ldr, a.ctxt.Arch, rs, r.Add())
 			a.followIfaceMethod(s, m.name, m.typ)
 			continue
 		case objabi.R_USENAMEDMETHOD:
@@ -334,6 +432,24 @@ func (a *logosCapAuditor) followRelocs(d *deadcodePass, s loader.Sym) {
 			continue
 		}
 		a.enqueue(r.Sym(), s)
+	}
+}
+
+// followExportedImpls adds synthetic edges from an interface use site
+// whose interface type lives in a shared library to every exported method
+// implementation. The type cannot be decoded here, as in deadcode, and a
+// dynamic link retains every method, so the exported methods are the ones
+// the site can name from outside. The first site reached is the shortest
+// chain, so later sites add no reachability and record no edges.
+func (a *logosCapAuditor) followExportedImpls(from loader.Sym) {
+	if a.fanned {
+		return
+	}
+	a.fanned = true
+	for _, impl := range a.impls {
+		if capIsExportedMethod(impl.name) {
+			a.enqueue(impl.fn, from)
+		}
 	}
 }
 
@@ -448,6 +564,9 @@ func (a *logosCapAuditor) judge(f capFinding) {
 	if rule.sev == logosWarn {
 		word = "WARNING"
 	}
+	if word == "WARNING" && isLogosTestBinary() {
+		return
+	}
 	a.emit(word, rule.id, f.dep, f.sink, f.chain,
 		fmt.Sprintf("Remove the dependency or explicitly authorize %q under '%s' in logos.toml.", f.dep+"/**", rule.allowKey))
 }
@@ -552,21 +671,73 @@ func (a *logosCapAuditor) namedPkg(name string) string {
 }
 
 // exemptPkg reports whether pkg never takes blame: the program's own
-// packages, first-party packages under a main module, and the standard
+// packages, first-party packages owned by a main module, and the standard
 // library as the compiler marked it. The module path is no evidence of
 // the standard library: a replaced dependency may have a dotless path.
+// Ownership follows the module graph's longest-prefix rule (see mainOwns),
+// so a nested module (its own go.mod) consumed as a dependency stays
+// blamed even though a main module path prefixes it.
 func (a *logosCapAuditor) exemptPkg(pkg string) bool {
-	return capIsLocalPkg(pkg) || a.underMainModules(pkg) || a.std[pkg]
+	if capIsLocalPkg(pkg) || a.std[pkg] {
+		return true
+	}
+	return a.mainOwns(pkg)
 }
 
-// underMainModules reports whether pkg sits under a main module.
-func (a *logosCapAuditor) underMainModules(pkg string) bool {
+// mainOwns reports whether pkg belongs to a main module: pkg sits under a
+// main module path and no dependency module claims a longer prefix of pkg.
+// Dependency paths come from the runtime.modinfo blob cmd/go ships in
+// importcfg (stored unquoted in strdata by the modinfo case in ld.go),
+// parsed once in logosCapAudit; absent (hand-driven links) they default to
+// none and ownership falls back to the pure-prefix rule. A main module
+// nested inside a dependency directory still owns its own packages,
+// because only a strictly longer dependency prefix takes blame; ties (a
+// path listed as both) stay with the main module.
+func (a *logosCapAuditor) mainOwns(pkg string) bool {
+	owner := ""
 	for _, m := range a.policy.MainModules {
-		if m != "" && (pkg == m || strings.HasPrefix(pkg, m+"/")) {
-			return true
+		if m != "" && (pkg == m || strings.HasPrefix(pkg, m+"/")) && len(m) > len(owner) {
+			owner = m
 		}
 	}
-	return false
+	if owner == "" {
+		return false
+	}
+	for _, d := range a.deps {
+		if d != "" && (pkg == d || strings.HasPrefix(pkg, d+"/")) && len(d) > len(owner) {
+			return false
+		}
+	}
+	return true
+}
+
+// parseLogosModinfoDeps extracts dependency module paths from the
+// runtime.modinfo blob: BuildInfo text (src/runtime/debug/mod.go) wrapped
+// in binary markers. "mod\t<main>..." names the main module,
+// "dep\t<path>\t<version>..." names each dependency, and "=>..."
+// continues a replaced entry. Only dep paths are returned; absent or
+// empty blobs yield none.
+func parseLogosModinfoDeps(blob string) []string {
+	var out []string
+	for _, line := range strings.Split(blob, "\n") {
+		f := strings.Split(line, "\t")
+		if len(f) < 2 || f[0] != "dep" || f[1] == "" {
+			continue
+		}
+		out = append(out, f[1])
+	}
+	return out
+}
+
+// isLogosTestBinary reports whether the linked binary is a generated test
+// binary: cmd/go adds -X testing.testBinary=1 to test links
+// (src/cmd/go/internal/load/test.go:307) for the testing.testBinary string
+// (src/testing/testing.go:758). Only WARNINGs consult this; ERRORs still
+// fail under `logos test` per the scope script cases D, E deny, F deny,
+// and H. Unlike a _testmain.go filename check this cannot be triggered by
+// a normal `logos build` file and survives unknown/trimpath file info.
+func isLogosTestBinary() bool {
+	return strdata["testing.testBinary"] == "1"
 }
 
 // frameOf renders one symbol as a report frame, falling back to
@@ -660,16 +831,37 @@ func renderCapReport(word, ruleID, dep, sink string, frames []capFrame, help str
 }
 
 // capSinkName normalizes a linker symbol name for sink matching by
-// stripping ABI wrapper suffixes: cgo trampolines and other ABI0 callers
-// reach runtime.cgocall through its .abi0 wrapper, not the bare symbol.
+// stripping clone suffixes to the base (SPEC T-203.4, T-205, red-team #9:
+// a cloned sink such as syscall.Connect·logosspec1 or a comptime copy
+// <f>_logosct1 is the same sink as its base) and ABI wrapper suffixes
+// (cgo trampolines and other ABI0 callers reach runtime.cgocall through
+// its .abi0 wrapper, not the bare symbol). Stripping loops to a fixpoint
+// so chained suffixes (<f>_logosct<M>·logosspec<N>.abi0) collapse fully;
+// the link symbol itself keeps the full suffix, so clones stay stable,
+// unique, and resolvable in the symbol table while the audit sees one
+// sink identity across shared, plugin, and internal links.
 func capSinkName(name string) string {
-	if base, ok := strings.CutSuffix(name, ".abi0"); ok {
-		return base
+	for {
+		next := logosCloneBaseName(name)
+		if base, ok := strings.CutSuffix(next, ".abi0"); ok {
+			next = base
+		} else if base, ok := strings.CutSuffix(next, ".abiinternal"); ok {
+			next = base
+		}
+		if next == name {
+			return name
+		}
+		name = next
 	}
-	if base, ok := strings.CutSuffix(name, ".abiinternal"); ok {
-		return base
-	}
-	return name
+}
+
+// capIsReflectLookupName reports whether name, after clone and ABI
+// normalization, names a reflective method-lookup function. Cloned
+// reflect helpers (reflect.Value.Method·logosspec1) are the same lookup
+// point as their base; without normalization a clone would evade the
+// reflective fan-out and capability metadata would not survive cloning.
+func capIsReflectLookupName(name string) bool {
+	return slices.Contains(reflectLookupSyms, capSinkName(name))
 }
 
 // capIsLocalPkg reports whether pkg is a package of the program itself that

@@ -30,6 +30,12 @@ func LogosGCModeIsSTW() bool {
 	return logosGCModeIsSTW()
 }
 
+// LogosGCModeName exposes the selected collector mode, which is empty
+// when the upstream collector runs.
+func LogosGCModeName() string {
+	return logosGCMode
+}
+
 // LogosSanePhysMem exposes logosSanePhysMem.
 func LogosSanePhysMem(phys uint64) uint64 {
 	return logosSanePhysMem(phys)

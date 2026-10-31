@@ -491,6 +491,12 @@ func mallocinit() {
 
 	// Initialize the heap.
 	mheap_.init()
+	if goexperiment.LogosGCMoving {
+		// Invariant: the cached moving-mode enable precedes every first use
+		// (mcaches, spans, barriers). The zero value disables every moving
+		// path, so the enable must be set before anything can consult it.
+		logosImmixSetEnabled()
+	}
 	mcache0 = allocmcache()
 	lockInit(&gcBitsArenas.lock, lockRankGcBitsArenas)
 	lockInit(&profInsertLock, lockRankProfInsert)
@@ -643,6 +649,9 @@ func mallocinit() {
 			hint.addr = p
 			hint.next, *hintList = *hintList, hint
 		}
+		if logosZgcHeapEnabled() {
+			logosZgcPruneHeapHints()
+		}
 	} else {
 		// On a 32-bit machine, we're much more concerned
 		// about keeping the usable heap contiguous.
@@ -751,8 +760,19 @@ func (h *mheap) sysAlloc(n uintptr, hintList **arenaHint, arenaList *[]arenaIdx)
 		// This behavior is only for the heap.
 		v = h.arena.alloc(n, heapArenaBytes, &gcController.heapReleased, "heap")
 		if v != nil {
-			size = n
-			goto mapped
+			if logosZgcHeapEnabled() && !logosZgcHeapInRange(uintptr(v), n) {
+				// Interior slice of the pre-reserved arena: it cannot
+				// be sysUnreserved (size mismatch), so never publish
+				// it and fall through to the hint loop plus the full
+				// low-window search; exhaustion throws only there.
+				v = nil
+			} else {
+				size = n
+				if logosZgcCommitLedgerDebug {
+					logosZgcCommitLedgerAdd(uintptr(v), n)
+				}
+				goto mapped
+			}
 		}
 	}
 
@@ -773,6 +793,26 @@ func (h *mheap) sysAlloc(n uintptr, hintList **arenaHint, arenaList *[]arenaIdx)
 			v = sysReserve(unsafe.Pointer(p), n, "heap reservation")
 		}
 		if p == uintptr(v) {
+			// Exact hit: the kernel honored the hint address. For the
+			// zgc heap, never publish a grant the heap already owns:
+			// an out-of-window grant breaks the color field, and a
+			// re-grant of the current reservation tail (Reserved but
+			// not yet grown into pageAlloc.inUse, hence invisible to
+			// anything but this check) would reach the page allocator
+			// without its pages committed. Kernel exactness should
+			// already refuse such addresses; this gate makes the
+			// invariant explicit and fails safe (discard, never
+			// publish) if bookkeeping ever disagrees with the kernel.
+			if hintList == &h.arenaHints && logosZgcHeapEnabled() && (!logosZgcHeapInRange(p, n) || logosZgcHeapRangeOwned(p, n)) {
+				sysUnreserve(v, n)
+				v = nil
+				*hintList = hint.next
+				h.arenaHintAlloc.free(unsafe.Pointer(hint))
+				continue
+			}
+			if logosZgcCommitLedgerDebug {
+				logosZgcCommitLedgerAdd(uintptr(v), n)
+			}
 			// Success. Update the hint.
 			if !hint.down {
 				p += n
@@ -795,20 +835,35 @@ func (h *mheap) sysAlloc(n uintptr, hintList **arenaHint, arenaList *[]arenaIdx)
 	}
 
 	if size == 0 {
-		if raceenabled {
-			// The race detector assumes the heap lives in
-			// [0x00c000000000, 0x00e000000000), but we
-			// just ran out of hints in this region. Give
-			// a nice failure.
-			throw("too many address space collisions for -race mode")
-		}
+		if hintList == &h.arenaHints && logosZgcHeapEnabled() {
+			// ZGC low-window fallback runs before the race-only
+			// diagnostic so exact zgc mode always covers the full
+			// aligned domain before reporting exhaustion.
+			v, size = logosZgcHeapSearch(n)
+			if v == nil {
+				throw("logos zgc: low-range exhausted")
+			}
+		} else {
+			if raceenabled {
+				// The race detector assumes the heap lives in
+				// [0x00c000000000, 0x00e000000000), but we
+				// just ran out of hints in this region. Give
+				// a nice failure.
+				throw("too many address space collisions for -race mode")
+			}
 
-		// All of the hints failed, so we'll take any
-		// (sufficiently aligned) address the kernel will give
-		// us.
-		v, size = sysReserveAligned(nil, n, heapArenaBytes, "heap")
-		if v == nil {
-			return nil, 0
+			// All of the hints failed, so we'll take any
+			// (sufficiently aligned) address the kernel will give
+			// us.
+			v, size = sysReserveAligned(nil, n, heapArenaBytes, "heap")
+			if logosZgcCommitLedgerDebug {
+				if v != nil {
+					logosZgcCommitLedgerAdd(uintptr(v), size)
+				}
+			}
+			if v == nil {
+				return nil, 0
+			}
 		}
 
 		// Create new hints for extending this region.
@@ -844,6 +899,9 @@ func (h *mheap) sysAlloc(n uintptr, hintList **arenaHint, arenaList *[]arenaIdx)
 	}
 
 mapped:
+	if logosZgcCommitLedgerDebug {
+		logosZgcCommitLedgerAssertGrant(uintptr(v), size, "sysalloc")
+	}
 	if valgrindenabled {
 		valgrindCreateMempool(v)
 		valgrindMakeMemNoAccess(v, size)
@@ -865,12 +923,30 @@ mapped:
 			if l2 == nil {
 				throw("out of memory allocating heap arena map")
 			}
+			if logosZgcHeapEnabled() {
+				// Record the index array where the zgc low-window
+				// search looks, so a later exact-hit probe never
+				// re-grants an address this reservation owns. Then
+				// verify the fresh grant against the reservation
+				// being published here ([v, v+size) is not in
+				// inUse yet) and against the low window itself;
+				// relocate it high on any overlap.
+				logosZgcRecordIndex(ri.l1(), uintptr(unsafe.Pointer(l2)), unsafe.Sizeof(*l2))
+				if !logosZgcIndexClearOf(ri.l1(), uintptr(v), size) {
+					l2 = logosZgcRelocateIndex(ri.l1(), uintptr(v), size, unsafe.Sizeof(*l2))
+				}
+			}
 			if h.arenasHugePages {
 				sysHugePage(unsafe.Pointer(l2), unsafe.Sizeof(*l2))
 			} else {
 				sysNoHugePage(unsafe.Pointer(l2), unsafe.Sizeof(*l2))
 			}
 			atomic.StorepNoWB(unsafe.Pointer(&h.arenas[ri.l1()]), unsafe.Pointer(l2))
+			// Publish the arena map for early zgc canonicalisation paths:
+			// colors may be armed before the first arena exists, and those
+			// paths must not consult the map until it is live. Set once,
+			// never cleared; ordered after the map publication above.
+			atomic.Storeuintptr(&zgcHeapArenasLive, 1)
 		}
 
 		if l2[ri.l2()] != nil {
@@ -967,6 +1043,18 @@ var zerobase uintptr
 
 // nextFreeFast returns the next free object if one is quickly available.
 // Otherwise it returns 0.
+// nextFreeFastImmix is nextFreeFast for allocation paths that may run on an
+// active immix span. Such spans serve only through the immix helper, so every
+// slot sets plane O; a zero result sends the caller to c.nextFree's bitmap scan,
+// which sets occupancy there. The ordinary path stays in nextFreeFast, which
+// keeps its inlining budget.
+func nextFreeFastImmix(s *mspan) gclinkptr {
+	if goexperiment.LogosGCMoving && s.logosImmixActive {
+		return logosImmixNextFreeFast(s)
+	}
+	return nextFreeFast(s)
+}
+
 func nextFreeFast(s *mspan) gclinkptr {
 	theBit := sys.TrailingZeros64(s.allocCache) // Is there a free object in the allocCache?
 	if theBit < 64 {
@@ -1009,6 +1097,16 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, checkGCTrigger 
 		s = c.alloc[spc]
 
 		freeIndex = s.nextFreeIndex()
+	}
+
+	if goexperiment.LogosGCMoving && freeIndex < s.nelems {
+		// Bitmap-authoritative fallback: nextFreeIndex already counted
+		// the slot via its freeindex advance; record its lines here so
+		// plane O stays the freeindex OR allocBits composite. Guarded:
+		// on the defensive full-span path there is no slot to mark,
+		// and the address past the object area would phantom-occupy
+		// the heap-bits carve line.
+		logosImmixOccupySlot(s, s.base()+uintptr(freeIndex)*s.elemsize)
 	}
 
 	if freeIndex >= s.nelems {
@@ -1281,7 +1379,7 @@ func mallocgcTiny(size uintptr, typ *_type) (unsafe.Pointer, uintptr) {
 	// Allocate a new maxTinySize block.
 	checkGCTrigger := false
 	span := c.alloc[tinySpanClass]
-	v := nextFreeFast(span)
+	v := nextFreeFastImmix(span)
 	if v == 0 {
 		v, span, checkGCTrigger = c.nextFree(tinySpanClass)
 	}
@@ -1399,7 +1497,7 @@ func mallocgcSmallNoscan(size uintptr, typ *_type, needzero bool) (unsafe.Pointe
 		return x, size
 	}
 
-	v := nextFreeFast(span)
+	v := nextFreeFastImmix(span)
 	if v == 0 {
 		v, span, checkGCTrigger = c.nextFree(spc)
 	}
@@ -1466,6 +1564,16 @@ func mallocgcSmallNoscanReuse(c *mcache, span *mspan, spc spanClass, size uintpt
 	v, span := c.nextReusableNoScan(span, spc)
 	x := unsafe.Pointer(v)
 
+	if goexperiment.LogosGCMoving && logosImmixEnabled() {
+		// Reuse bypasses nextFreeFast/c.nextFree: record the slot's
+		// lines idempotently. The reused slot may belong to a span
+		// other than the cached one, so resolve it from the pointer
+		// (spanOf is safe under acquirem; byte-gated when immix is off).
+		if rs := spanOf(uintptr(x)); rs != nil {
+			logosImmixOccupySlot(rs, uintptr(x))
+		}
+	}
+
 	// Compensate for the GC assist credit deducted in mallocgc (before calling us and
 	// after we return) because this is not a newly allocated object. We use the full slot
 	// size (elemsize) here because that's what mallocgc deducts overall. Note we only
@@ -1531,7 +1639,7 @@ func mallocgcSmallScanNoHeader(size uintptr, typ *_type) (unsafe.Pointer, uintpt
 	sizeclass := gc.SizeToSizeClass8[divRoundUp(size, gc.SmallSizeDiv)]
 	spc := makeSpanClass(sizeclass, false)
 	span := c.alloc[spc]
-	v := nextFreeFast(span)
+	v := nextFreeFastImmix(span)
 	if v == 0 {
 		v, span, checkGCTrigger = c.nextFree(spc)
 	}
@@ -1629,7 +1737,7 @@ func mallocgcSmallScanHeader(size uintptr, typ *_type) (unsafe.Pointer, uintptr)
 	size = uintptr(gc.SizeClassToSize[sizeclass])
 	spc := makeSpanClass(sizeclass, false)
 	span := c.alloc[spc]
-	v := nextFreeFast(span)
+	v := nextFreeFastImmix(span)
 	if v == 0 {
 		v, span, checkGCTrigger = c.nextFree(spc)
 	}

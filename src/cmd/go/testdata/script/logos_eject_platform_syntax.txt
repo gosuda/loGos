@@ -1,0 +1,96 @@
+# Eject lowers ignored .lgo platform files with real Option syntax.
+# plat_windows.lgo is inactive on a linux host, so the host build alone
+# cannot prove it: the ejected tree must carry compiler-lowered output
+# for every platform file, with filenames and constraints preserved,
+# and the pure-Go tree must typecheck under both linux and windows.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+cd m
+logos run .
+cp stdout $WORK/native-stdout.txt
+
+logos eject -o out
+exists out/main.go
+exists out/plat_linux.go
+exists out/plat_windows.go
+exists out/plat_windows_arm64.go
+! exists out/main.lgo
+! exists out/plat_linux.lgo
+! exists out/plat_windows.lgo
+! grep '\*User\?' out/main.go
+! grep '\*User\?' out/plat_linux.go
+! grep '\*User\?' out/plat_windows.go
+! grep '\*User\?' out/plat_windows_arm64.go
+! grep '\?\?' out/plat_linux.go
+! grep '\?\?' out/plat_windows.go
+! grep '\?\?' out/plat_windows_arm64.go
+grep '"linux"' out/plat_linux.go
+grep '"windows"' out/plat_windows.go
+grep '"windows-arm64"' out/plat_windows_arm64.go
+
+cd out
+go build ./...
+go vet ./...
+exec $GOROOT/bin/gofmt -l .
+! stdout .
+
+# Both target contexts typecheck with plain upstream go.
+env GOOS=linux
+env GOARCH=amd64
+go build ./...
+env GOOS=windows
+env GOARCH=amd64
+go build ./...
+env GOOS=windows
+env GOARCH=arm64
+go build ./...
+env GOOS=$TESTGO_GOHOSTOS
+env GOARCH=$TESTGO_GOHOSTARCH
+
+# Host behavior matches the native logos run.
+go run .
+cmp stdout $WORK/native-stdout.txt
+cd ..
+
+-- m/go.mod --
+module example.com/plat
+
+go 1.27
+
+-- m/main.lgo --
+package main
+
+import "fmt"
+
+type User struct {
+	Name string
+}
+
+func main() {
+	fmt.Println(Platform())
+}
+
+-- m/plat_linux.lgo --
+package main
+
+func Platform() string {
+	var u *User? = &User{Name: "linux"}
+	return (u?.Name ?? "fallback")
+}
+
+-- m/plat_windows.lgo --
+package main
+
+func Platform() string {
+	var u *User? = &User{Name: "windows"}
+	return (u?.Name ?? "fallback")
+}
+
+-- m/plat_windows_arm64.lgo --
+package main
+
+func PlatformARM64() string {
+	var u *User? = &User{Name: "windows-arm64"}
+	return (u?.Name ?? "fallback")
+}

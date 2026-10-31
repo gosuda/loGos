@@ -65,6 +65,8 @@ Go packages have no language-level array operator syntax and use `simd/archsimd`
 
 ## Diagnostics
 
+These rules apply to both Go and `.lgo` lint targets, and diagnostics report original source positions, never ejected or generated Go.
+
 | Rule | Fix |
 |---|---|
 | `correctness::mixed_package` | Finish the rename: no package holds both `.go` and `.lgo`. |

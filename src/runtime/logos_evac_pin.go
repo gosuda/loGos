@@ -24,9 +24,11 @@ import (
 // the traversal below is otherwise identical.
 
 // pinPtr keeps the granule holding the heap object containing p in place
-// for this cycle. Words that are not heap pointers are ignored.
+// for this cycle. Words that are not heap pointers are ignored. A word on
+// a registered zgc page pins even without a heap span: synthetic test pages
+// map memory directly, and debug-call holders name such pages.
 func (ev *logosEvac) pinPtr(p uintptr) {
-	if v := zgcCanonical(p); spanOfHeap(v) != nil {
+	if v := zgcCanonical(p); spanOfHeap(v) != nil || zgcPageRegisteredNoSplit(v) {
 		ev.pinned.add(v &^ (ev.granule - 1))
 	}
 }
@@ -38,11 +40,27 @@ func (ev *logosEvac) pinRange(lo, hi uintptr) {
 	}
 }
 
+// pinStrings pins every page the slice holds: each granule of the backing
+// array itself (covered even if it spans pages) plus, through the header
+// words the range walk reads, the data of every element. Empty slices walk
+// nothing; empty strings and non-heap words (argslice elements name C argv
+// memory via gostringnocopy) resolve to no span and are ignored by pinPtr.
+// STW only; allocates nothing.
+func (ev *logosEvac) pinStrings(s []string) {
+	h := (*slice)(unsafe.Pointer(&s))
+	lo := uintptr(h.array)
+	hi := lo + uintptr(len(s))*2*goarch.PtrSize
+	for p := lo &^ (ev.granule - 1); p < hi; p += ev.granule {
+		ev.pinPtr(p)
+	}
+	ev.pinRange(lo, hi)
+}
+
 // logosSpanPinned reports whether any object of s feeds an address hash:
 // either the sticky logosPinned flag or a set bit in the span's pinner
 // bits. Shared by the immix block selector and the zgc page selector.
 func logosSpanPinned(s *mspan) bool {
-	if s.logosPinned {
+	if s.logosPinned.Load() {
 		return true
 	}
 	pb := (*gcBits)(unsafe.Pointer(s.getPinnerBits()))
@@ -80,15 +98,54 @@ func (ev *logosEvac) collectPins() bool {
 			ev.pinPtr(w)
 		}
 	}
+	// An exiting M leaves allm for sched.freem before it stops using its
+	// g0 stack (proc.go mexit): freeMWait marks the window where the thread
+	// still runs on that stack and owns its m and g0 through TLS, while
+	// freeMRef and freeMStack mark a dead thread whose stack and reference
+	// the reaper owns. The world is stopped here, so the freem linkage the
+	// exiting M published under sched.lock is stable and only the freeWait
+	// word still moves; retain exactly the still-live entries.
+	for mp := sched.freem; mp != nil; mp = mp.freelink {
+		if mp.freeWait.Load() != freeMWait {
+			continue
+		}
+		ev.pinPtr(uintptr(unsafe.Pointer(mp)))
+		ev.pinPtr(uintptr(unsafe.Pointer(mp.g0)))
+		ev.pinPtr(uintptr(unsafe.Pointer(mp.gsignal)))
+		for _, w := range mp.fastCgoFrame {
+			ev.pinPtr(w)
+		}
+	}
 	for _, pp := range allp {
 		ev.pinP(pp)
 	}
+	// Runtime-owned globals: the environment and argument slices built at
+	// startup (goenvs/goargs via gostring) are ordinary movable heap, so
+	// without this they are selected, evacuated, and released like any
+	// other fragmented page. Their readers (gogetenv/GOROOT during init)
+	// run without a load barrier in binaries built without -lb, and the
+	// pause rewrite skips the running goroutine's stack, so a stale word
+	// kept across the pause reads released memory once the sources go.
+	// Pinning their pages every cycle excludes that memory from evacuation
+	// instead, which keeps every reader safe with or without barriers.
+	ev.pinStrings(envs)
+	ev.pinStrings(argslice)
 	ev.pinItabs()
 	for i := range semtable {
 		ev.pinTreap(semtable[i].root.treap)
 	}
 	ev.pinMarkWorkers()
 	ev.pinArenaChunks()
+	// Signal label closure: every committed profBuf tag root plus the log
+	// and tags array granules, so the lock free signal copy in
+	// profbuf.write stays valid across forwarding. Takes no mutex here
+	// (the helper reads the log identity lock free, see cpuprof.go).
+	// Speciallock and the foreign gate come later in select, preserving
+	// allglock to cpuprof.lock to speciallock to foreign gate order for
+	// the preemptible paths. No STW here.
+	logosPinProfTags(func(l unsafe.Pointer) {
+		ev.pinPtr(uintptr(l))
+	})
 	return true
 }
 
@@ -115,9 +172,17 @@ func (ev *logosEvac) pinGoroutine(gp *g) bool {
 		return true
 	case _Grunnable, _Gsyscall, _Gwaiting, _Gleaked, _Gpreempted:
 	default:
+		// A goroutine that runs while the world is stopped is not a state
+		// the immix evacuation can move around: nothing heals a slot it
+		// misses, and logosWalkStacks skips a running stack. The goroutine
+		// that stopped the world is _Gwaiting here, parked by
+		// gcMarkTermination, so a normal collection never takes this branch;
+		// if one does, nothing moves.
 		return false
 	}
 	ev.pinPtr(uintptr(gp.param))
+	ev.pinPtr(uintptr(gp.sched.ctxt))
+	ev.pinProfLabels(gp)
 	// P8: heap-allocated defer records are read by runtime asm without
 	// barriers; pin their referents until the Z2-asm wrappers land.
 	for d := gp._defer; d != nil; d = d.link {
@@ -125,11 +190,16 @@ func (ev *logosEvac) pinGoroutine(gp *g) bool {
 		// (entry PC plus captured environment), read with the same
 		// representation idiom as heapdump. Pin the funcval so the
 		// closure environment cannot move; the entry PC itself is not
-		// a heap pointer. d.fn is nil for open-coded defers.
+		// a heap pointer. d.fn is nil for open-coded defers. The
+		// record itself stays precisely tracked (the collector rewrites
+		// its slots); only its referents take page pins, so an ordinary
+		// heap record never contributes its own granule to the set.
 		if d.fn != nil {
 			ev.pinPtr(uintptr(unsafe.Pointer(*(**funcval)(unsafe.Pointer(&d.fn)))))
 		}
-		ev.pinPtr(uintptr(unsafe.Pointer(d.link)))
+		if d.head != nil {
+			ev.pinPtr(uintptr(unsafe.Pointer(d.head)))
+		}
 	}
 	for sg := gp.waiting; sg != nil; sg = sg.waitlink {
 		ev.pinPtr(sg.c.uintptr())
@@ -139,6 +209,17 @@ func (ev *logosEvac) pinGoroutine(gp *g) bool {
 		ev.pinStack(gp)
 	}
 	return true
+}
+
+// pinProfLabels pins the signal readable pprof label root of gp. The map
+// object itself stays in place for the cycle so the signal handler copy of
+// the root pointer never tears across forwarding. Interior List and string
+// bytes still move through the precise heap walk and the profiler reader
+// observes the forwarded graph. Nil stays nil. STW only.
+func (ev *logosEvac) pinProfLabels(gp *g) {
+	if l := logosAcquireProfLabel(gp); l != nil {
+		ev.pinPtr(uintptr(l))
+	}
 }
 
 // pinStack pins every object a word of gp's conservative stack may point to.
@@ -151,7 +232,6 @@ func (ev *logosEvac) pinStack(gp *g) {
 		sp = gp.stack.lo
 	}
 	ev.pinRange(sp, gp.stack.hi)
-	ev.pinPtr(uintptr(gp.sched.ctxt))
 	ev.pinXRegs(gp)
 }
 

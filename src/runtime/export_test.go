@@ -2132,3 +2132,7 @@ func MallocGC(size uintptr, typ *abi.Type, needzero bool) unsafe.Pointer {
 func FuncNamePiecesForPrint(name string) (string, string, string, string, string) {
 	return funcNamePiecesForPrint(name)
 }
+
+// LogosForeignGBytes re-exports the g-size floor the size test asserts;
+// the const itself stays unexported so it does not widen the public API.
+const LogosForeignGBytes = logosForeignGBytes

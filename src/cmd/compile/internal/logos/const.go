@@ -10,7 +10,6 @@ import (
 	"cmd/compile/internal/types2"
 	"fmt"
 	"reflect"
-	"strings"
 )
 
 // This file erases M5-S1 const views during lowering (SPEC Sec 2.1,
@@ -35,12 +34,60 @@ import (
 // eraseConstViews rewrites every const view type of one file to its
 // element and bounds the recorded slice expressions. Every const view
 // sits in a type-holding field below, so direct assignment keeps every
-// replacement addressable.
+// replacement addressable. The readonly `const` qualifier of interface
+// methods (Field.Const) is cleared so later lowering passes that print
+// and re-parse types (cloneType/respellType, mode 0) never see the
+// keyword, while the eject text drops the exact five-byte keyword at the
+// field position, preserving following comments and positions; ordinary
+// methods stay unqualified. Cleared fields are recorded by identity for a
+// scoped restore around the lowered recheck only (see
+// LogosRestoreErasedAnonReadonly/LogosClearErasedAnonReadonly), so the
+// recheck still sees the qualified obligation without ever letting the
+// flag leak into printed/cloned types. Property elements
+// (PropertyType.Const) keep their own accessor lowering and are never
+// touched here.
+//
+// erasedAnonReadonly records every interface-method Field whose Const was
+// cleared above, by node identity (never by name), for the recheck-window
+// restore. It lives only from Lower through the lowered rechecks of the
+// same checkFiles invocation.
+var erasedAnonReadonly []*syntax.Field
+
+// LogosRestoreErasedAnonReadonly re-arms every recorded readonly method
+// flag for the lowered recheck. Call after Lower has finished all
+// print/clone passes, before the recheck.
+func LogosRestoreErasedAnonReadonly() {
+	for _, f := range erasedAnonReadonly {
+		if f != nil {
+			f.Const = true
+		}
+	}
+}
+
+// LogosClearErasedAnonReadonly clears every restored flag after the last
+// lowered recheck and drops the record, so later backend prints see plain
+// methods. It is also the discard path when no recheck follows.
+func LogosClearErasedAnonReadonly() {
+	for _, f := range erasedAnonReadonly {
+		if f != nil {
+			f.Const = false
+		}
+	}
+	erasedAnonReadonly = nil
+}
 func (fl *fileLower) eraseConstViews() {
 	syntax.Inspect(fl.file, func(n syntax.Node) bool {
 		switch n := n.(type) {
 		case *syntax.Field:
 			fl.eraseConstIn(&n.Type)
+			if n.Const {
+				if _, ok := n.Type.(*syntax.FuncType); ok {
+					start := fl.off(n.Pos())
+					fl.add(start, start+len("const"), "")
+					erasedAnonReadonly = append(erasedAnonReadonly, n)
+					n.Const = false
+				}
+			}
 		case *syntax.TypeDecl:
 			fl.eraseConstIn(&n.Type)
 		case *syntax.VarDecl:
@@ -274,7 +321,7 @@ type constBoundArg struct {
 	name  string
 	typ   string
 	expr  syntax.Expr
-	arg   string
+	arg   otext
 }
 
 // wrapConstSlice builds the closure call replacing s and records its
@@ -373,18 +420,18 @@ func (fl *fileLower) wrapConstSlice(s *syntax.SliceExpr, m constSliceMeta) synta
 	}
 	bracketText := "[" + idxTexts[0] + ":" + idxTexts[1] + ":" + idxTexts[2] + "]"
 
-	var fused strings.Builder
-	fused.WriteString("func(" + constClosureParam + " " + paramText)
+	var parts []otext
+	parts = append(parts, gen("func("+constClosureParam+" "+paramText))
 	for _, b := range bounds {
-		fused.WriteString(", " + b.name + " " + b.typ)
+		parts = append(parts, gen(", "+b.name+" "+b.typ))
 	}
-	fused.WriteString(") " + resText + " { return " + targetText + bracketText + " }(" + baseText)
+	parts = append(parts, gen(") "+resText+" { return "+targetText+bracketText+" }("), baseText)
 	for _, b := range bounds {
-		fused.WriteString(", " + b.arg)
+		parts = append(parts, gen(", "), b.arg)
 	}
-	fused.WriteString(")")
+	parts = append(parts, gen(")"))
 
-	fl.add(baseStart, rbrack+1, fused.String())
+	fl.addT(baseStart, rbrack+1, cat(parts...))
 	return out
 }
 

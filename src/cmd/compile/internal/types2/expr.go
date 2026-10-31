@@ -1345,9 +1345,16 @@ func (check *Checker) typeAssertion(e syntax.Expr, x *operand, T Type, typeSwitc
 	if check.logosNonMemberAssert(e, x, T) { // logos M2-S2 hook.
 		return
 	}
+	check.logosRecordAssertTarget(e, x, T) // logos T-201 hook: generic assertion effects.
 	var cause string
 	if check.assertableTo(x.typ(), T, &cause) {
 		return // success
+	}
+
+	// logos hook: an interface target is rejected only by a readonly
+	// obligation the source does not carry; report const_view_mutation.
+	if check.logosAssertReadonlyError(e, x, T, typeSwitch, cause) {
+		return
 	}
 
 	if typeSwitch {

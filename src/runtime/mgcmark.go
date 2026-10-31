@@ -75,18 +75,21 @@ func allGsSnapshotSortedForGC() ([]*g, int) {
 	if gs, n, ok := logosCheckmarkStackRoots(); ok {
 		return gs, n
 	}
+	allgsSnap := logosGCCanonicalGs(allgs)
 
 	// Reset the status of leaked goroutines in order to improve
 	// the precision of goroutine leak detection.
-	for _, gp := range allgs {
+	for _, gp := range allgsSnap {
+		gp = logosGCCanonicalG(gp)
 		gp.atomicstatus.CompareAndSwap(_Gleaked, _Gwaiting)
 	}
 
-	allgsSorted := make([]*g, len(allgs))
+	allgsSorted := make([]*g, len(allgsSnap))
 
 	// Indices cutting off runnable and blocked Gs.
 	var currIndex, blockedIndex = 0, len(allgsSorted) - 1
-	for _, gp := range allgs {
+	for _, gp := range allgsSnap {
+		gp = logosGCCanonicalG(gp)
 		// not sure if we need atomic load because we are stopping the world,
 		// but do it just to be safe for now
 		if status := readgstatus(gp); status != _Gwaiting || gp.internalBlocked() {
@@ -193,6 +196,7 @@ func gcMarkRootCheck() {
 	// gcPrepareMarkRoots), no locking is required.
 	i := 0
 	forEachGRace(func(gp *g) {
+		gp = logosGCCanonicalG(gp)
 		if i >= work.nStackRoots {
 			return
 		}
@@ -270,7 +274,7 @@ func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
 			print("runtime: markroot index ", i, " not in stack roots range [", work.baseStacks, ", ", work.baseEnd, ")\n")
 			throw("markroot: bad index")
 		}
-		gp := work.stackRoots[i-work.baseStacks]
+		gp := logosGCMarkrootStackG(work.stackRoots, i-work.baseStacks)
 
 		// remember when we've first observed the G blocked
 		// needed only to output in traceback
@@ -955,6 +959,10 @@ func scanstack(gp *g, gcw *gcWork) int64 {
 
 	var state stackScanState
 	state.stack = gp.stack
+
+	if goexperiment.LogosArena && gp.logosArena != nil {
+		logosArenaScanStack(gp, gcw, &state)
+	}
 
 	if stackTraceDebug {
 		println("stack trace goroutine", gp.goid)

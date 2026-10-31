@@ -4,7 +4,10 @@
 
 package cfg
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 // appendExperiment appends an experiment to a GOEXPERIMENT value. One
 // path handles the empty and non-empty base, so the arena and
@@ -32,5 +35,21 @@ func logosApplyRawExperiment(raw string) {
 		if CmdEnv[i].Name == "GOEXPERIMENT" {
 			CmdEnv[i].Value = RawGOEXPERIMENT
 		}
+	}
+	// Mirror into OrigEnv: main.invoke snapshots OrigEnv before MkEnv
+	// publishes the managed defaults, and user binaries (go test, go run)
+	// execute with OrigEnv, not CmdEnv. Without this, test-spawned child
+	// builds never see the default: the outer test binary compiles with
+	// the default on while an inner plain-go build compiles the fallback.
+	mirrored := false
+	for i := range OrigEnv {
+		if strings.HasPrefix(OrigEnv[i], "GOEXPERIMENT=") {
+			OrigEnv[i] = "GOEXPERIMENT=" + raw
+			mirrored = true
+			break
+		}
+	}
+	if !mirrored {
+		OrigEnv = append(OrigEnv, "GOEXPERIMENT="+raw)
 	}
 }

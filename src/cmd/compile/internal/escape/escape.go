@@ -96,6 +96,8 @@ type batch struct {
 	heapLoc    location
 	mutatorLoc location
 	calleeLoc  location
+	// foreignLoc is the unsafe.Pointer sink. Invariant exact-makes-to-foreign:
+	// only a variable-capacity OMAKESLICE (foreignBacking) outlives it.
 	foreignLoc location
 	blankLoc   location
 
@@ -122,8 +124,10 @@ type escape struct {
 	// curfn. It increments within each "for" loop and at each
 	// label with a corresponding backwards "goto" (i.e.,
 	// unstructured loop).
-	loopDepth         int
-	compilerKeepAlive bool
+	loopDepth          int
+	loopStack          []ir.Node
+	logosArenaCondPost int
+	compilerKeepAlive  bool
 }
 
 func Funcs(all []*ir.Func) {

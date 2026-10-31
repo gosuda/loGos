@@ -51,8 +51,9 @@ func logosGCProgram() string {
 // selectLogosGC returns the collector mode of this build and whether one is
 // selected: the -gc flag, else under logos the [build] gc key of the main
 // module's logos.toml, else the logos default (greentea, or wasm on
-// GOARCH=wasm). Plain go with no flag selects none and keeps the upstream
-// collector and pacing until run.bash passes with a changed default.
+// GOARCH=wasm). Plain go with no flag selects none; its production
+// controller uses elastic pacing by default while collector selection
+// remains unchanged.
 func selectLogosGC(ld *modload.Loader) (mode string, selected bool) {
 	if cfg.BuildGCSet {
 		return cfg.BuildGC, true

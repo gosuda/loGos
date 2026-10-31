@@ -1,0 +1,24 @@
+// errorcheck
+
+package p
+
+// M13-S3 row #121 companion (SPEC T-203.4): in .lgo code *T is non-nil
+// (SPEC T-202), so a nil element inside a []*T literal is rejected with
+// [correctness::nil_to_nonnil]. This pins the negative half of the
+// const_slice_covariance.lgo contract, whose positive half keeps only valid
+// non-nil elements; the typed-nil half lives in the legal Go twin
+// test/logos/run/covariance_typed_nil.go, where plain Go permits it.
+
+type Monster struct{ name string }
+
+func nilElement() {
+	_ = []*Monster{nil} // ERROR "nil_to_nonnil"
+}
+
+func nilElementAmongValid() {
+	_ = []*Monster{{name: "orc"}, nil} // ERROR "nil_to_nonnil"
+}
+
+func validElements() {
+	_ = []*Monster{{name: "orc"}, {name: "imp"}}
+}

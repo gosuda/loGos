@@ -171,6 +171,13 @@ func (g *marshalGen) code(f *jsonField) fieldCode {
 	var c fieldCode
 	switch f.shape.kind {
 	case shapeFallback:
+		if f.quoted {
+			c = g.fallbackQuotedCode(f)
+			// fallbackQuotedCode for plain scalars already applies presence;
+			// Number-quoted and method-wins paths return fallback-style code
+			// that carries its own optional handling.
+			return c
+		}
 		c = g.fallbackCode(f)
 	case shapeScalar:
 		c = g.scalarCode(f)
@@ -210,12 +217,28 @@ func constLine(n int) []string {
 }
 
 // presence spells the condition that optional field f is written.
+// A scalar with omitzero and a signature-checked IsZero consults the
+// runtime OmitZero helper (which honors value- and pointer-receiver
+// IsZero like encoding/json, including addressable copies) instead of
+// the naive zero test; with omitempty also set the naive empty test
+// still applies, so the field is written only when neither test omits
+// it. Pointers consult OmitZero the same way once a pointee IsZero can
+// fire; otherwise nil alone decides, matching encoding/json.
 func (g *marshalGen) presence(f *jsonField) string {
 	x := f.local()
 	switch f.shape.kind {
 	case shapeScalar:
+		if f.omitZero && f.shape.needsIsZero {
+			if f.omitEmpty {
+				return "!(" + f.codec().isZeroCond(x) + ") && !" + jsonAlias + ".OmitZero(" + x + ")"
+			}
+			return "!" + jsonAlias + ".OmitZero(" + x + ")"
+		}
 		return "!(" + f.codec().isZeroCond(x) + ")"
 	case shapePointer:
+		if f.omitZero && f.shape.needsIsZero {
+			return x + " != nil && !" + jsonAlias + ".OmitZero(" + x + ")"
+		}
 		return x + " != nil"
 	case shapeUnion:
 		if f.omitZero {
@@ -350,6 +373,122 @@ func (g *marshalGen) fallbackCode(f *jsonField) fieldCode {
 	c.pre = append(c.pre, ifLines(p, append(inner, check...))...)
 	c.size = ifLines(p, []string{fmt.Sprintf("_logos_n += %d + len(%s)", g.litLen(f, ""), b)})
 	c.emit = ifLines(p, append(g.litStmts(f, ""), fmt.Sprintf("_logos_buf = append(_logos_buf, %s...)", b)))
+	return c
+}
+
+// fallbackQuotedCode spells a fallback field carrying the `string` option.
+// Method types win over the option and ignore it, exactly like the
+// reflective encoders, so a type with marshal-side methods keeps the
+// unquoted fallback. Exact json.Number is the one exception: it quotes the
+// number literal before the method check, matching the reflective walker.
+// Every other fallback scalar without marshal methods encodes as a quoted
+// scalar via its underlying kind.
+func (g *marshalGen) fallbackQuotedCode(f *jsonField) fieldCode {
+	if isExactNumber(f.typ) {
+		return g.fallbackNumberQuotedCode(f)
+	}
+	if hasMarshalMethods(f.typ) {
+		return g.fallbackCode(f)
+	}
+	if kind, ok := fallbackScalarKind(f.typ); ok {
+		return g.fallbackScalarQuotedCode(f, kind)
+	}
+	return g.fallbackCode(f)
+}
+
+// fallbackScalarQuotedCode spells a fallback scalar without marshal methods
+// as a quoted scalar of its underlying kind. Presence (omitempty/omitzero,
+// including IsZero) follows the scalar path via guardPresence.
+func (g *marshalGen) fallbackScalarQuotedCode(f *jsonField, kind scalarKind) fieldCode {
+	u := types2.Unalias(f.typ)
+	if cv, ok := u.(*types2.ConstView); ok {
+		u = types2.Unalias(cv.Elem)
+	}
+	_, isPtr := u.(*types2.Pointer)
+	var elem types2.Type
+	if isPtr {
+		p := u.(*types2.Pointer)
+		elem = types2.Unalias(p.Elem())
+		if cv, ok := elem.(*types2.ConstView); ok {
+			elem = types2.Unalias(cv.Elem)
+		}
+	} else {
+		elem = u
+		if _, ok := elem.(*types2.Option); ok {
+			return g.fallbackCode(f)
+		}
+	}
+	tmp := &jsonField{
+		goName:    f.goName,
+		key:       f.key,
+		omitEmpty: f.omitEmpty,
+		omitZero:  f.omitZero,
+		quoted:    true,
+		pos:       f.pos,
+		required:  f.required,
+		typ:       f.typ,
+	}
+	if isPtr {
+		tmp.shape = jsonShape{kind: shapePointer, scalar: kind, nonNil: f.shape.nonNil, needsIsZero: needsIsZero(elem)}
+		c := g.pointerCode(tmp)
+		if tmp.optional() {
+			c = g.guardPresence(tmp, c)
+		}
+		return c
+	}
+	tmp.shape = jsonShape{kind: shapeScalar, scalar: kind, nonNil: false, needsIsZero: needsIsZero(elem)}
+	c := g.scalarCode(tmp)
+	if tmp.optional() {
+		c = g.guardPresence(tmp, c)
+	}
+	return c
+}
+
+// fallbackNumberQuotedCode spells exact json.Number with `,string`: the
+// number literal from MarshalField wrapped in quotes, matching
+// appendQuotedNumber in the reflective walker. A nil pointer encodes null
+// unquoted; optional fields keep the fallback presence test.
+func (g *marshalGen) fallbackNumberQuotedCode(f *jsonField) fieldCode {
+	field := g.recv + "." + f.goName
+	b := fmt.Sprintf("_logos_b%d", f.pos)
+	e := fmt.Sprintf("_logos_e%d", f.pos)
+	u := types2.Unalias(f.typ)
+	if cv, ok := u.(*types2.ConstView); ok {
+		u = types2.Unalias(cv.Elem)
+	}
+	_, isPtr := u.(*types2.Pointer)
+	call := []string{
+		fmt.Sprintf("%s, %s := %s.MarshalField(%s)", b, e, jsonAlias, field),
+	}
+	check := ifLines(e+" != nil", []string{"return nil, " + e})
+	quotedSize := fmt.Sprintf("_logos_n += %d + len(%s) + 1", g.litLen(f, `"`), b)
+	quotedEmit := append(g.litStmts(f, `"`), fmt.Sprintf("_logos_buf = append(_logos_buf, %s...)", b), `_logos_buf = append(_logos_buf, '"')`)
+	nullSize := fmt.Sprintf("_logos_n += %d + 4", g.litLen(f, ""))
+	nullEmit := append(g.litStmts(f, ""), `_logos_buf = append(_logos_buf, "null"...)`)
+	var c fieldCode
+	if !f.optional() {
+		if !isPtr {
+			c.pre = append(call, check...)
+			c.size = []string{quotedSize}
+			c.emit = quotedEmit
+			return c
+		}
+		c.pre = append(call, check...)
+		c.size = ifElseLines(field+" == nil", []string{nullSize}, []string{quotedSize})
+		c.emit = ifElseLines(field+" == nil", nullEmit, quotedEmit)
+		return c
+	}
+	p := f.presenceName()
+	c.pre = []string{p + " := " + omitCall(f, field), "var " + b + " []byte"}
+	inner := []string{fmt.Sprintf("var %s error", e), fmt.Sprintf("%s, %s = %s.MarshalField(%s)", b, e, jsonAlias, field)}
+	c.pre = append(c.pre, ifLines(p, append(inner, check...))...)
+	if !isPtr {
+		c.size = ifLines(p, []string{quotedSize})
+		c.emit = ifLines(p, quotedEmit)
+		return c
+	}
+	c.size = ifLines(p, ifElseLines(field+" == nil", []string{nullSize}, []string{quotedSize}))
+	c.emit = ifLines(p, ifElseLines(field+" == nil", nullEmit, quotedEmit))
 	return c
 }
 
@@ -948,7 +1087,7 @@ func (fl *fileLower) instHelperModel(core types2.Type) (string, string, *jsonStr
 			typ:       ft,
 		}
 		f.shape = fl.classifyJSONField(ft)
-		f.quoted = info.StringOpt && f.shape.kind != shapeFallback && f.shape.kind != shapeSlice && f.shape.kind != shapeUnion
+		f.quoted = info.StringOpt && isQuotableForString(ft, f.shape)
 		if f.shape.nonNil {
 			f.required = len(js.required)
 			js.required = append(js.required, f.goName)

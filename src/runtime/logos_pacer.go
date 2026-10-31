@@ -17,7 +17,8 @@ type logosFractionalGoal = atomic.Float64
 // greentea collector the background mark utilization follows the PLAN curve
 // of live heap over heap goal instead of the fixed gcBackgroundUtilization.
 // Mark assist, its debt accounting and the CPU limiter are the upstream ones:
-// they stay the backstop when background marking falls behind.
+// they stay the backstop when background marking falls behind. Every other
+// mode, including an empty production-controller mode, keeps upstream pacing.
 
 const (
 	// logosElasticFloor is the background utilization below logosElasticRise.
@@ -92,24 +93,68 @@ func logosElasticRatio(live, goal uint64) float64 {
 	return float64(live) / float64(goal)
 }
 
+// logosElasticThreadBudget is the OS threads the collector may still mint
+// without crowding the program's own parallelism out of sched.maxmcount:
+// the limit minus existing Ms minus one M per P.
+func logosElasticThreadBudget() int64 {
+	budget := int64(sched.maxmcount) - int64(mcount()) - int64(gomaxprocs)
+	if budget < 0 {
+		return 0
+	}
+	return budget
+}
+
 // logosElasticDedicated is the number of whole dedicated workers in total
-// Ps of background utilization.
+// Ps of background utilization. The grant is bounded by the thread budget:
+// a dedicated worker needs an M for the whole cycle, so a user
+// SetMaxThreads cap shrinks the worker count instead of throwing thread
+// exhaustion inside mark enlistment.
 func logosElasticDedicated(total float64) int64 {
-	return int64(total + logosElasticSlack)
+	dedicated := int64(total + logosElasticSlack)
+	if budget := logosElasticThreadBudget(); dedicated > budget {
+		return budget
+	}
+	return dedicated
+}
+
+// logosIdleMarkWorkerMax bounds the idle-worker max for a cycle by the same
+// thread budget: every worker waiting on a P can demand an M when the world
+// restarts. The upstream value procs-dedicated ignores the thread limit.
+func logosIdleMarkWorkerMax(procs int, dedicated int64) int32 {
+	if max := int64(procs) - dedicated; max <= 0 {
+		return 0
+	}
+	if budget := logosElasticThreadBudget(); budget < int64(procs)-dedicated {
+		return int32(budget)
+	}
+	return int32(int64(procs) - dedicated)
 }
 
 // logosElasticFractional is the fractional goal that makes up the part of
 // total that dedicated workers do not cover. A fractional worker runs only on
 // a P without a dedicated worker, so the goal is per such P and the part is
 // shared by procs minus dedicated Ps. The curve never exceeds 0.75 of procs,
-// which keeps at least one such P.
+// which keeps at least one such P. The thread budget scales the whole goal:
+// a claimed worker can demand an M at every world restart, so the plan may
+// claim at most budget non-dedicated Ps.
 func logosElasticFractional(total float64, procs int32) float64 {
 	dedicated := logosElasticDedicated(total)
 	rest := total - float64(dedicated)
 	if rest <= logosElasticSlack {
 		return 0
 	}
-	return rest / float64(int64(procs)-dedicated)
+	nonDedicated := int64(procs) - dedicated
+	if nonDedicated <= 0 {
+		return 0
+	}
+	goal := rest / float64(nonDedicated)
+	if budget := logosElasticThreadBudget() - dedicated; budget < nonDedicated {
+		if budget <= 0 {
+			return 0
+		}
+		goal *= float64(budget) / float64(nonDedicated)
+	}
+	return goal
 }
 
 // logosElasticMode is the collector mode that paces c: the linker's for the
@@ -130,11 +175,14 @@ func (c *gcControllerState) logosElasticTotal(live, goal uint64) float64 {
 // logosElasticStart replaces the worker split of a starting cycle when the
 // collector mode is greentea. dedicated is the upstream split. It returns the
 // number of dedicated workers to start, and sets the fractional goal for the
-// rest. Any other mode, and stop-the-world collection, keep the upstream
-// split. The caller holds worldsema with the world stopped.
+// rest. Plain go keeps the upstream split: an empty production-controller
+// mode, an empty test-controller mode, any other mode, and stop-the-world
+// collection all take the same upstream path. The caller holds worldsema
+// with the world stopped.
 func (c *gcControllerState) logosElasticStart(procs int, dedicated int64) int64 {
 	e := &c.logosElastic
-	e.active = c.logosElasticMode() == "greentea" && debug.gcstoptheworld == 0
+	mode := c.logosElasticMode()
+	e.active = mode == "greentea" && debug.gcstoptheworld == 0
 	if !e.active {
 		return dedicated
 	}
@@ -175,9 +223,10 @@ func (c *gcControllerState) logosElasticRevise(live, goal uint64) {
 //
 // Every successful raise adds exactly the difference of the two dedicated
 // counts it moves between to dedicatedMarkWorkersNeeded, so needed plus
-// running dedicated workers always equals the count of the peak. All shared
-// state is atomic and no lock is taken, as revise itself is lock free:
-// raises that race each other are ordered by the compare-and-swap of peak.
+// running dedicated workers always equals the count of the peak. All
+// shared state is atomic and no lock is taken, as revise itself is lock
+// free: raises that race each other are ordered by the compare-and-swap
+// of peak.
 func (c *gcControllerState) logosElasticRaise(total float64, now int64) {
 	e := &c.logosElastic
 	for {
@@ -253,7 +302,7 @@ func (e *logosElasticState) mean(d int64) float64 {
 // time-weighted mean goal instead; without it the cons/mark estimate would
 // credit the garbage collector with a quarter of the CPU while it ran with up
 // to three quarters of it. The result stays below logosElasticMaxUtilization.
-// Any other mode keeps upstream's value.
+// Any other mode, including an empty test-controller mode, keeps upstream's value.
 func (c *gcControllerState) logosElasticEndUtilization(utilization float64, now int64, procs int) float64 {
 	e := &c.logosElastic
 	if !e.active {

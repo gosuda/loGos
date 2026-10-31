@@ -118,16 +118,16 @@ func (fl *fileLower) lowerPropertyInterface(it *syntax.InterfaceType) {
 			Name: nameOf(pos, "Logos_Get"+name),
 			Type: at(&syntax.FuncType{ResultList: []*syntax.Field{at(&syntax.Field{Type: getResult}, pos)}}, pos),
 		}, pos))
-		text := "Logos_Get" + name + "() " + typeText
+		parts := []otext{gen("Logos_Get" + name + "() "), typeText}
 		if !pt.Const {
 			setParam := cloneType(pt.Type, pos)
 			out = append(out, at(&syntax.Field{
 				Name: nameOf(pos, "Logos_Set"+name),
 				Type: at(&syntax.FuncType{ParamList: []*syntax.Field{at(&syntax.Field{Type: setParam}, pos)}}, pos),
 			}, pos))
-			text += "; Logos_Set" + name + "(" + typeText + ")"
+			parts = append(parts, gen("; Logos_Set"+name+"("), typeText, gen(")"))
 		}
-		fl.add(start, typeSp.end, text)
+		fl.addT(start, typeSp.end, cat(parts...))
 	}
 	if changed {
 		it.MethodList = out
@@ -1063,7 +1063,7 @@ func (fl *fileLower) propStmtSpan(s syntax.Stmt, first syntax.Expr) (span, bool)
 
 // propSpanText returns the lowered text of a value region, draining the
 // splices of earlier passes inside it.
-func (fl *fileLower) propSpanText(sp span) string {
+func (fl *fileLower) propSpanText(sp span) otext {
 	return fl.textOf(sp)
 }
 
@@ -1085,8 +1085,8 @@ func propNeedlesNest(needles []propNeedle) bool {
 // propSubst represents one needle substitution: the needle's lowered
 // text and its replacement.
 type propSubst struct {
-	needle string
-	repl   string
+	needle otext
+	repl   otext
 	len    int
 }
 
@@ -1098,12 +1098,12 @@ func (fl *fileLower) propSubstitutions(needles []propNeedle) []propSubst {
 	subs := make([]propSubst, 0, len(needles))
 	for _, n := range needles {
 		if n.temp != "" {
-			subs = append(subs, propSubst{needle: fl.textOf(span{start: n.start, end: n.end}), repl: n.temp, len: n.end - n.start})
+			subs = append(subs, propSubst{needle: fl.textOf(span{start: n.start, end: n.end}), repl: gen(n.temp), len: n.end - n.start})
 			continue
 		}
 		subs = append(subs, propSubst{
 			needle: fl.textOf(span{start: n.start, end: n.end}),
-			repl:   fl.textOf(n.recv) + ".Logos_Get" + n.name + "()",
+			repl:   cat(fl.textOf(n.recv), gen(".Logos_Get"+n.name+"()")),
 			len:    n.end - n.start,
 		})
 	}
@@ -1111,7 +1111,7 @@ func (fl *fileLower) propSubstitutions(needles []propNeedle) []propSubst {
 		if d := b.len - a.len; d != 0 {
 			return d
 		}
-		return strings.Compare(a.needle, b.needle)
+		return strings.Compare(a.needle.s, b.needle.s)
 	})
 	return subs
 }
@@ -1119,10 +1119,10 @@ func (fl *fileLower) propSubstitutions(needles []propNeedle) []propSubst {
 // propSubstText applies longest-first needle substitution within one
 // piece. Identical needles share one replacement, so ReplaceAll is
 // exact; needles of other pieces never match.
-func propSubstText(text string, subs []propSubst) string {
+func propSubstText(text otext, subs []propSubst) otext {
 	for _, s := range subs {
-		if s.needle != "" {
-			text = strings.ReplaceAll(text, s.needle, s.repl)
+		if s.needle.s != "" {
+			text = substNeedle(text, s.needle, s.repl)
 		}
 	}
 	return text
@@ -1152,11 +1152,11 @@ func (fl *fileLower) lowerPropGeneric(s *syntax.AssignStmt) []syntax.Stmt {
 		fl.emitPropReads(c)
 		return []syntax.Stmt{s}
 	}
-	lhsTexts := make([]string, 0, len(lhs))
+	lhsTexts := make([]otext, 0, len(lhs))
 	for _, lsp := range lhsSpans {
 		lhsTexts = append(lhsTexts, fl.propSpanText(lsp))
 	}
-	rhsText := ""
+	rhsText := otext{}
 	if s.Rhs != nil {
 		rhsText = fl.propSpanText(propMustSpan(fl, s.Rhs))
 	}
@@ -1171,12 +1171,12 @@ func (fl *fileLower) lowerPropGeneric(s *syntax.AssignStmt) []syntax.Stmt {
 	} else if s.Op != 0 {
 		op = s.Op.String()
 	}
-	main := strings.Join(lhsTexts, ", ") + " " + op + " " + rhsText
+	main := cat(joinO(lhsTexts, ", "), gen(" "+op+" "), rhsText)
 	if s.Rhs == nil {
 		// IncDec keeps its postfix spelling.
-		main = strings.Join(lhsTexts, ", ") + op + op
+		main = cat(joinO(lhsTexts, ", "), gen(op+op))
 	}
-	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []string{main})
+	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []otext{main})
 }
 
 // propMustSpan returns the source span of e, stopping the compiler when
@@ -1195,7 +1195,7 @@ func propMustSpan(fl *fileLower, e syntax.Expr) span {
 // tight receiver span ending at the dot before the selector name, never
 // the terminator-bounded platform span, which would swallow the rest of
 // the statement.
-func (fl *fileLower) propRecvText(sel *syntax.SelectorExpr) string {
+func (fl *fileLower) propRecvText(sel *syntax.SelectorExpr) otext {
 	_, recvSp, ok := fl.propSelSpan(sel)
 	if !ok {
 		base.Fatalf("logos: cannot span property selection at %s", sel.Pos().String())
@@ -1230,13 +1230,13 @@ func (fl *fileLower) propLhsSpans(s *syntax.AssignStmt, lhs []syntax.Expr) ([]sp
 // AST statements and their composed texts; hoist pieces render through
 // the syntax printer, whose output the substitution pass already
 // lowered inside the pieces.
-func (fl *fileLower) finishPropReplace(c *propCollect, sp span, mains []syntax.Stmt, mainTexts []string) []syntax.Stmt {
+func (fl *fileLower) finishPropReplace(c *propCollect, sp span, mains []syntax.Stmt, mainTexts []otext) []syntax.Stmt {
 	_ = fl.textOf(sp)
 	subs := fl.propSubstitutions(c.needles)
-	var texts []string
+	var texts []otext
 	var out []syntax.Stmt
 	for _, p := range c.hoist.pres {
-		texts = append(texts, propSubstText(fl.propPieceText(p), subs))
+		texts = append(texts, propSubstText(gen(fl.propPieceText(p)), subs))
 		out = append(out, p.stmt)
 	}
 	for i, m := range mains {
@@ -1244,10 +1244,10 @@ func (fl *fileLower) finishPropReplace(c *propCollect, sp span, mains []syntax.S
 		out = append(out, m)
 	}
 	for _, p := range c.hoist.posts {
-		texts = append(texts, propSubstText(fl.propPieceText(p), subs))
+		texts = append(texts, propSubstText(gen(fl.propPieceText(p)), subs))
 		out = append(out, p.stmt)
 	}
-	fl.add(sp.start, sp.end, strings.Join(texts, "; "))
+	fl.addT(sp.start, sp.end, joinO(texts, "; "))
 	return out
 }
 
@@ -1281,8 +1281,8 @@ func (fl *fileLower) lowerPropWrite(s *syntax.AssignStmt, recv syntax.Expr, pr t
 	rhsText := fl.propSpanText(propMustSpan(fl, s.Rhs))
 	set := exprStmtOf(s.Pos(), callOf(s.Pos(), selOf(s.Pos(), recv, "Logos_Set"+pr.Name), []syntax.Expr{rhs}))
 	subs := fl.propSubstitutions(c.needles)
-	main := propSubstText(recvText, subs) + ".Logos_Set" + pr.Name + "(" + propSubstText(rhsText, subs) + ")"
-	return fl.finishPropReplace(c, sp, []syntax.Stmt{set}, []string{main})
+	main := cat(propSubstText(recvText, subs), gen(".Logos_Set"+pr.Name+"("), propSubstText(rhsText, subs), gen(")"))
+	return fl.finishPropReplace(c, sp, []syntax.Stmt{set}, []otext{main})
 }
 
 // lowerPropCompound rewrites `R.F op= v` to a pinned read-modify-write:
@@ -1314,7 +1314,7 @@ func (fl *fileLower) lowerPropCompound(s *syntax.AssignStmt, recv syntax.Expr, p
 			stmt: defineOf(pos, []syntax.Expr{nameOf(pos, pin)}, []syntax.Expr{recv}),
 		})
 	}
-	valueText := "1"
+	valueText := gen("1")
 	if rhs != nil {
 		valueText = fl.propSpanText(propMustSpan(fl, rhs))
 	}
@@ -1337,12 +1337,11 @@ func (fl *fileLower) lowerPropCompound(s *syntax.AssignStmt, recv syntax.Expr, p
 		[]syntax.Expr{at(&syntax.Operation{Op: s.Op, X: callOf(pos, selOf(pos, getBase, "Logos_Get"+pr.Name), nil), Y: valueNode}, pos)}))
 	ref := recvText
 	if pin != "" {
-		ref = pin
+		ref = gen(pin)
 	}
 	subs := fl.propSubstitutions(c.needles)
-	main := propSubstText(ref, subs) + ".Logos_Set" + pr.Name + "(" +
-		propSubstText(ref, subs) + ".Logos_Get" + pr.Name + "() " + bop + " " + propSubstText(valueText, subs) + ")"
-	return fl.finishPropReplace(c, sp, []syntax.Stmt{set}, []string{main})
+	main := cat(propSubstText(ref, subs), gen(".Logos_Set"+pr.Name+"("), propSubstText(ref, subs), gen(".Logos_Get"+pr.Name+"() "+bop+" "), propSubstText(valueText, subs), gen(")"))
+	return fl.finishPropReplace(c, sp, []syntax.Stmt{set}, []otext{main})
 }
 
 // mustPropSel returns the root property selector of e, stopping the
@@ -1393,7 +1392,7 @@ func (fl *fileLower) lowerPropMulti(s *syntax.AssignStmt, lhs []syntax.Expr, roo
 		fl.emitPropReads(c)
 		return []syntax.Stmt{s}
 	}
-	lhsTexts := make([]string, len(lhs))
+	lhsTexts := make([]otext, len(lhs))
 	for _, i := range roots {
 		l := lhs[i]
 		recv, pr, sel, ok := fl.propSelOf(l)
@@ -1433,7 +1432,7 @@ func (fl *fileLower) lowerPropMulti(s *syntax.AssignStmt, lhs []syntax.Expr, roo
 			stmt: exprStmtOf(pos, callOf(pos, selOf(pos, setBase, "Logos_Set"+pr.Name), []syntax.Expr{nameOf(pos, temp)})),
 		})
 		fl.propRetarget(s, i, temp)
-		lhsTexts[i] = temp
+		lhsTexts[i] = gen(temp)
 	}
 	for i := range lhs {
 		if slices.Contains(roots, i) {
@@ -1446,8 +1445,8 @@ func (fl *fileLower) lowerPropMulti(s *syntax.AssignStmt, lhs []syntax.Expr, roo
 	for i := range lhsTexts {
 		lhsTexts[i] = propSubstText(lhsTexts[i], subs)
 	}
-	main := strings.Join(lhsTexts, ", ") + " = " + propSubstText(rhsText, subs)
-	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []string{main})
+	main := cat(joinO(lhsTexts, ", "), gen(" = "), propSubstText(rhsText, subs))
+	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []otext{main})
 }
 
 // propRetarget replaces the i-th assignment target with a temporary
@@ -1504,7 +1503,7 @@ func (fl *fileLower) lowerPropExprStmt(s *syntax.ExprStmt) []syntax.Stmt {
 		return []syntax.Stmt{s}
 	}
 	sp := sps
-	args := make([]string, 0, len(call.ArgList))
+	args := make([]otext, 0, len(call.ArgList))
 	for _, a := range call.ArgList {
 		// A trailing `...` scans as part of the last argument, so
 		// variadic spreads ride along without a special case.
@@ -1514,8 +1513,8 @@ func (fl *fileLower) lowerPropExprStmt(s *syntax.ExprStmt) []syntax.Stmt {
 	for i := range args {
 		args[i] = propSubstText(args[i], subs)
 	}
-	main := temp + "." + sel.Sel.Value + "(" + strings.Join(args, ", ") + ")"
-	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []string{main})
+	main := cat(gen(temp+"."+sel.Sel.Value+"("), joinO(args, ", "), gen(")"))
+	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []otext{main})
 }
 
 // lowerPropCallArgs collects hoists through a call that keeps its shape,
@@ -1535,7 +1534,7 @@ func (fl *fileLower) lowerPropCallArgs(s *syntax.ExprStmt, call *syntax.CallExpr
 	sp := sps
 	main := fl.propSpanText(sp)
 	subs := fl.propSubstitutions(c.needles)
-	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []string{propSubstText(main, subs)})
+	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []otext{propSubstText(main, subs)})
 }
 
 // lowerPropDeclStmt rewrites a block-level variable declaration,
@@ -1564,7 +1563,7 @@ func (fl *fileLower) lowerPropDeclStmt(s *syntax.DeclStmt) []syntax.Stmt {
 	sp := sps
 	main := fl.propSpanText(sp)
 	subs := fl.propSubstitutions(c.needles)
-	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []string{propSubstText(main, subs)})
+	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []otext{propSubstText(main, subs)})
 }
 
 // propDeclValue returns the first value expression of a declaration
@@ -1596,5 +1595,5 @@ func (fl *fileLower) lowerPropSend(s *syntax.SendStmt) []syntax.Stmt {
 	sp := sps
 	main := fl.propSpanText(sp)
 	subs := fl.propSubstitutions(c.needles)
-	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []string{propSubstText(main, subs)})
+	return fl.finishPropReplace(c, sp, []syntax.Stmt{s}, []otext{propSubstText(main, subs)})
 }

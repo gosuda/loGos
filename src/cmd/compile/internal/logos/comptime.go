@@ -55,6 +55,12 @@ type cfRecord struct {
 	foreign bool
 	imports []cfImport
 	source  string
+	// sourceO carries the origin of source for a record built in this
+	// package: every byte the marker substitutions did not touch maps
+	// back to the definition. A record parsed from export data has no
+	// origin (the definition lives in another file), so sourceO is
+	// empty and its copy is generated text.
+	sourceO otext
 }
 
 // text serializes a record for __.LOGOS: header lines, then the source.
@@ -176,7 +182,8 @@ func newCfExpander(shared *packageLower, files []*syntax.File, src map[*syntax.F
 		if !ok {
 			continue
 		}
-		fl := &fileLower{pkg: shared, file: file, src: data, orig: len(data), start: lineStarts(data)}
+		fl := &fileLower{pkg: shared, file: file, src: data, origSrc: data, orig: len(data), start: lineStarts(data)}
+		fl.srcMap = origBuf(data)
 		f = fl.registerComptime(exp, f)
 	}
 	if f != nil {
@@ -314,7 +321,7 @@ func (fl *fileLower) cfRecordText(def *cfGenericDef, qualifier string) *cfRecord
 	syntax.Inspect(def.decl, b.visit)
 	start := cfFuncStart(fl.src, fl.off(syntax.StartPos(def.decl)))
 	end := fl.off(syntax.EndPos(def.decl)) + 1
-	out, err := applySplices(fl.src[start:end], shiftSplices(b.subs, -start))
+	out, err := applyChunks(fl.srcMap.sliceO(start, end), shiftSplices(b.subs, -start))
 	if err != nil {
 		base.Fatalf("logos: overlapping comptime record at %s", def.decl.Pos().String())
 	}
@@ -323,7 +330,8 @@ func (fl *fileLower) cfRecordText(def *cfGenericDef, qualifier string) *cfRecord
 		tparams: len(def.decl.TParamList),
 		foreign: qualifier != "",
 		imports: b.imports,
-		source:  string(out),
+		source:  out.s,
+		sourceO: out,
 	}
 }
 
@@ -406,7 +414,7 @@ func cfFuncStart(src []byte, off int) int {
 func shiftSplices(subs []splice, off int) []splice {
 	out := make([]splice, 0, len(subs))
 	for _, s := range subs {
-		out = append(out, splice{start: s.start + off, end: s.end + off, text: s.text, owner: s.owner})
+		out = append(out, splice{start: s.start + off, end: s.end + off, text: s.text, chunks: s.chunks, owner: s.owner})
 	}
 	return out
 }
@@ -676,7 +684,7 @@ func (fl *fileLower) cfRecordFor(obj *types2.Func) (*cfRecord, bool) {
 // expandSite rewrites one instantiation call to name its copy.
 func (fl *fileLower) expandSite(site *cfSite) {
 	name := fl.cfCopyFor(site)
-	ctx := cfCtx{src: fl.src, starts: fl.start}
+	ctx := cfCtx{buf: fl.srcMap, starts: fl.start}
 	fl.add(offAt(fl.start, syntax.StartPos(site.fun)), cfExactEnd(ctx, site.fun), name)
 	site.call.Fun = nameOf(syntax.StartPos(site.fun), name)
 	fl.changed = true
@@ -728,55 +736,61 @@ func cfChainText(frames []cfFrame, label string) string {
 	return strings.Join(append(parts, label), " -> ")
 }
 
-// cfStripTParams removes the type-parameter clause of a record head:
-// `func Name[T any](...)` becomes `func Name(...)`.
-func cfStripTParams(src, name string) (string, bool) {
+// cfStripTParamsO removes the type-parameter clause of a record head:
+// `func Name[T any](...)` becomes `func Name(...)`. It works on origin
+// text, so the kept bytes keep their source mapping.
+func cfStripTParamsO(src otext, name string) (otext, bool) {
 	head := "func " + name
-	if !strings.HasPrefix(src, head+"[") {
-		return "", false
+	if !strings.HasPrefix(src.s, head+"[") {
+		return otext{}, false
 	}
 	depth := 0
-	for i := len(head); i < len(src); i++ {
-		switch src[i] {
+	for i := len(head); i < len(src.s); i++ {
+		switch src.s[i] {
 		case '[':
 			depth++
 		case ']':
 			depth--
 			if depth == 0 {
-				return head + src[i+1:], true
+				return cat(src.slice(0, len(head)), src.slice(i+1, len(src.s))), true
 			}
 		}
 	}
-	return "", false
+	return otext{}, false
 }
 
 // cfBuildCopy builds the plain-Go text of one instantiation: type
 // parameters, imports, and package markers spelled out, const for
 // statements unrolled, nested comptime generic calls pointed at their
 // own copies. It reports false after a diagnostic.
-func (fl *fileLower) cfBuildCopy(site *cfSite, rec *cfRecord, copyName string) (string, bool) {
-	body, ok := cfStripTParams(rec.source, rec.name)
+func (fl *fileLower) cfBuildCopy(site *cfSite, rec *cfRecord, copyName string) (otext, bool) {
+	srcO := rec.sourceO
+	if srcO.s == "" {
+		srcO = gen(rec.source)
+	}
+	body, ok := cfStripTParamsO(srcO, rec.name)
 	if !ok {
 		fl.cfError(site.pos, "[comptime::generic_targ] malformed comptime source of %s", rec.name)
-		return "", false
+		return otext{}, false
 	}
 	sites, ok := fl.cfCopySites(site, rec)
 	if !ok {
-		return "", false
+		return otext{}, false
 	}
 	const prefix = "package cfcopy\n"
-	src := []byte(prefix + body)
-	file, errs := cfParseSource(string(src))
+	buf := cat(gen(prefix), body)
+	src := []byte(buf.s)
+	file, errs := cfParseSource(buf.s)
 	fn := cfFirstFunc(file)
 	if len(errs) > 0 || fn == nil {
 		base.Fatalf("logos: cannot parse comptime source of %s: %v", rec.name, errs)
 	}
-	run := &cfRun{ctx: cfCtx{src: src, starts: lineStarts(src), stamp: site.pos}, fieldsOf: fl.cfFieldsResolver(sites), sites: sites}
-	out, err := applySplices(src, fl.cfCopySplices(fn, copyName, run))
+	run := &cfRun{ctx: cfCtx{buf: srcBuf{b: src, chunks: buf.chunks}, starts: lineStarts(src), stamp: site.pos}, fieldsOf: fl.cfFieldsResolver(sites), sites: sites}
+	out, err := applyChunks(buf, fl.cfCopySplices(fn, copyName, run))
 	if err != nil {
 		base.Fatalf("logos: overlapping comptime copy %s: %v", copyName, err)
 	}
-	return string(out[len(prefix):]), true
+	return out.slice(len(prefix), len(out.s)), true
 }
 
 // cfCopySplices collects the splices that turn one record function into
@@ -792,7 +806,7 @@ func (fl *fileLower) cfCopySplices(fn *syntax.FuncDecl, copyName string, run *cf
 		e := offAt(ctx.starts, syntax.EndPos(cf)) + 1
 		stmts, text := fl.unrollConstForFields(cf, run.fieldsOf(cf, nil), run)
 		fl.cfCountNodes(stmts, run.sites.at(cf.Pos()))
-		subs = append(subs, splice{start: s, end: e, text: text})
+		subs = append(subs, splice{start: s, end: e, text: text.s, chunks: text.chunks})
 		covered = append(covered, cfSpan{s, e})
 	}
 	for _, sub := range fl.cfLeafSubs(fn, nil, covered, run) {
@@ -997,8 +1011,8 @@ func (fl *fileLower) cfNestedSite(call *syntax.CallExpr, active cfChain, run *cf
 // finished region at the end of the file. A copy the check rejects
 // reports its diagnostics at the instantiation and never joins the tree:
 // its nodes lack the facts the lowering passes read.
-func (fl *fileLower) cfEmitCopy(text string, site *cfSite) {
-	file, errs := cfParseSource("package cfcopy\n" + text)
+func (fl *fileLower) cfEmitCopy(text otext, site *cfSite) {
+	file, errs := cfParseSource("package cfcopy\n" + text.s)
 	fn := cfFirstFunc(file)
 	if len(errs) > 0 || fn == nil {
 		base.Fatalf("logos: cannot parse comptime copy at %s: %v", site.pos.String(), errs)

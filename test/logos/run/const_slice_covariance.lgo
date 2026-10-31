@@ -1,0 +1,106 @@
+// run -O=1
+
+package main
+
+import "fmt"
+
+// M13-S3 row #121 (SPEC T-203.4), the checker and copy side. In a call, a
+// []C whose elements implement Creature passes to a `const []Creature`
+// parameter. Go has no such slice conversion, so every call converts the
+// argument through rt.CovSlice, a real element-wise copy; at -O=1 nothing
+// specializes it away. The copy keeps a nil slice nil and gives an empty
+// slice an empty result, evaluates the argument expression once, shares
+// the pointed-to elements with the source, and owns its backing array, so
+// replacing a source slot afterwards does not reach a view the callee
+// returned. A slice that already has the parameter's element type is not
+// converted and stays shared. There is no Go twin: const views are loGo/s
+// syntax. The rejected shapes live in
+// src/internal/types/testdata/logos/const_slice_cov.lgo.
+
+type Creature interface {
+	const Name() string
+}
+
+type Named interface {
+	Creature
+	const Weight() int
+}
+
+type Monster struct{ name string }
+
+func (m *Monster) Name() string {
+	if m == nil {
+		return "<nil>"
+	}
+	return m.name
+}
+
+type Rock struct{ name string }
+
+func (r Rock) Name() string { return "rock:" + r.name }
+
+type Troll struct{ name string }
+
+func (t Troll) Name() string { return "troll:" + t.name }
+func (t Troll) Weight() int  { return len(t.name) }
+
+type Monsters []*Monster
+
+func Names(cs const []Creature) string {
+	out := ""
+	for i, c := range cs {
+		if i > 0 {
+			out += ","
+		}
+		out += c.Name()
+	}
+	return out
+}
+
+func Weights(ns const []Named) int {
+	total := 0
+	for _, n := range ns {
+		total += n.Weight()
+	}
+	return total
+}
+
+func View(cs const []Creature) const []Creature { return cs }
+
+var evals int
+
+func monsters() []*Monster {
+	evals++
+	return []*Monster{{name: "orc"}, {name: "imp"}}
+}
+
+func main() {
+	ms := []*Monster{{name: "orc"}, {name: "troll"}, {name: "goblin"}, {name: "imp"}}
+	fmt.Println(Names(ms))
+	fmt.Println(Names([]Rock{{name: "a"}, {name: "b"}}))
+
+	trolls := []Troll{{name: "grok"}, {name: "ug"}}
+	fmt.Println(Names(trolls), Weights(trolls))
+
+	ns := []Named{Troll{name: "grok"}, Troll{name: "ug"}}
+	fmt.Println(Names(ns))
+	fmt.Println(Names(Monsters{{name: "gnoll"}}))
+
+	var none []*Monster
+	fmt.Println(len(Names(none)), len(Names([]*Monster{})), len(Names(nil)))
+
+	s := Names(monsters())
+	fmt.Println(s, evals)
+
+	kept := View(ms)
+	ms[0] = &Monster{name: "ogre"}
+	fmt.Println(Names(kept))
+	ms[1].name = "TROLL"
+	fmt.Println(Names(kept))
+	fmt.Println(Names(ms))
+
+	cs := []Creature{&Monster{name: "elf"}}
+	shared := View(cs)
+	cs[0] = &Monster{name: "dwarf"}
+	fmt.Println(Names(shared))
+}

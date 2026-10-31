@@ -16,11 +16,12 @@
 // Wire format (record lines sorted byte-wise; comptime bodies
 // length-delimited):
 //
-//	logos-facts 1
+//	logos-facts 3
 //	fingerprint <hex of the __.PKGDEF linker fingerprint>
 //	opt <object> <path>
 //	const <object> <path>
 //	fn <object> <flag>[,<flag>...]
+//	readonly <object> <path>
 //	prop <interface> <accessor-function-prefix>
 //	conforms <struct> <interface-package-path> <interface>
 //	comptime <object> <byte length>
@@ -33,9 +34,31 @@
 // <object> is Name, Type.Field, (*Type).Method, or Type.Method; <path> is
 // dot-separated steps R<i> result, P<i> parameter, F<name> field, E element,
 // D dereference of one pointer or channel container, K map key, M<name>
-// interface method, T<i> tuple element. Flags:
-// ReturnsNonNil, AlwaysNilError, PureConst, ReceiverMutated,
+// interface method, T<i> tuple element, G<i> type-parameter constraint,
+// H<i> receiver type-parameter constraint. Flags:
+// ReturnsNonNil, AlwaysNilError, PureConst, ReceiverMutated, Readonly,
+// AssertTP=<hex mask>, AssertRTP=<hex mask>,
 // ParamMutated=<hex mask>, MayYield=0|1.
+// A fn Readonly record carries a readonly requirement (interface I.M
+// obligation) or a proven readonly capability (concrete T.M / (*T).M).
+// Owner-qualified keys are stable: I.M for interfaces, methodObject-style
+// T.M / (*T).M for concrete methods. A readonly record carries the same
+// obligation for a nested or generic-constrained method addressed by
+// object-root structural path. Version 2 added the Readonly fn flag
+// for semantic method obligations; version 3 is a clean cutover adding
+// the AssertTP and AssertRTP fn flags for generic assertion effects;
+// version and fingerprint checks reject mismatched members with no
+// compat shim.
+// AssertTP records which function type parameters feed a type-assertion
+// or type-switch target of the declaration; AssertRTP records the same
+// for receiver type parameters. Each mask is an arbitrary-arity
+// big-endian bit number in canonical lowercase hex (bit i set = type
+// parameter i flows into an assertion target); there is no 64-bit
+// limit. Known semantics: flag present = analyzed, flag absent =
+// unknown, and consumers fail closed on unknown. AssertTP=0,AssertRTP=0
+// means analyzed with proven absence of such flows. Assert flags say
+// nothing about mutation: an assertion-only record must never certify
+// mutation purity (ParamMutated stays absent = unknown mutation).
 package facts
 
 import (
@@ -45,6 +68,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"slices"
 	"strconv"
@@ -57,7 +81,7 @@ import (
 
 const (
 	// Version is the facts format version written by Encode.
-	Version = 1
+	Version = 3
 	// MemberName is the archive member carrying facts, beside __.PKGDEF.
 	MemberName = "__.LOGOS"
 
@@ -74,8 +98,20 @@ var versionLine = "logos-facts " + strconv.Itoa(Version)
 // option or const fact, and the dot-separated path to it. Each step
 // descends one position: R<i> result, P<i> parameter, F<name> field, E
 // option or view element (the ? qualifier), K map key, D one pointer or
-// channel container, M<name> interface method, T<i> tuple element.
+// channel container, M<name> interface method, T<i> tuple element,
+// G<i> type-parameter constraint, H<i> receiver type-parameter constraint.
 type PathFact struct {
+	Object string
+	Path   string
+}
+
+// ReadonlyFact is one readonly record: the exported root object and the
+// structural path to a nested or generic-constrained interface method
+// carrying the readonly obligation. Object uses the same grammar as opt
+// and const records; Path uses the same steps extended with G<i> and H<i>
+// for type-parameter constraints. At least one M<name> step selects the
+// target method; G<i>/H<i> selects a type-parameter constraint.
+type ReadonlyFact struct {
 	Object string
 	Path   string
 }
@@ -87,17 +123,30 @@ type FnFact struct {
 	AlwaysNilError  bool
 	PureConst       bool
 	ReceiverMutated bool
+	Readonly        bool
+	// AssertTP is the normalized lowercase hex mask of function type
+	// parameters feeding an assertion/type-switch target; "" when absent.
+	AssertTP string
+	// AssertRTP is the normalized lowercase hex mask of receiver type
+	// parameters feeding an assertion/type-switch target; "" when absent.
+	AssertRTP string
+	// HasAssert is the Known bit: true when the assertion effects were
+	// analyzed (flags present on the wire, "0" when proven-zero).
+	HasAssert bool
 	// ParamMutated is the normalized lowercase hex mutation mask; "" is absent.
 	ParamMutated string
 	MayYield     bool
 	HasMayYield  bool
 }
 
-// MayYieldOnly reports whether MayYield is the only fact of fn. Such a
-// record says nothing about mutation, nilability, or purity of values, so a
-// consumer of those facts must treat the function as unanalyzed.
+// MayYieldOnly reports whether MayYield is the only mutation-relevant fact
+// of fn. Assertion-effect flags (AssertTP/AssertRTP) are not mutation
+// facts, so a record carrying only assert flags plus MayYield still
+// reports true. Such a record says nothing about mutation, nilability,
+// or purity of values, so a consumer of those facts must treat the
+// function as unanalyzed.
 func (fn FnFact) MayYieldOnly() bool {
-	return fn.HasMayYield && !fn.ReturnsNonNil && !fn.AlwaysNilError && !fn.PureConst && !fn.ReceiverMutated && fn.ParamMutated == ""
+	return fn.HasMayYield && !fn.ReturnsNonNil && !fn.AlwaysNilError && !fn.PureConst && !fn.ReceiverMutated && !fn.Readonly && fn.ParamMutated == ""
 }
 
 // PropFact is one prop record: an interface and its accessor-function prefix.
@@ -138,6 +187,7 @@ type Facts struct {
 	Opts        []PathFact
 	Consts      []PathFact
 	Fns         []FnFact
+	Readonlys   []ReadonlyFact
 	Props       []PropFact
 	Conforms    []ConformsFact
 	Comptimes   []ComptimeFact
@@ -183,6 +233,11 @@ func Encode(fp goobj.FingerprintType, f *Facts) []byte {
 		for _, fn := range f.Fns {
 			if fl := fn.flags(); fn.Object != "" && fl != "" {
 				recs = append(recs, record{line: "fn " + fn.Object + " " + fl})
+			}
+		}
+		for _, r := range f.Readonlys {
+			if r.Object != "" && r.Path != "" {
+				recs = append(recs, record{line: "readonly " + r.Object + " " + r.Path})
 			}
 		}
 		for _, p := range f.Props {
@@ -250,6 +305,17 @@ func (fn FnFact) flags() string {
 	if fn.ReceiverMutated {
 		add("ReceiverMutated")
 	}
+	if fn.Readonly {
+		add("Readonly")
+	}
+	// Both masks or neither: a producer defect that sets HasAssert with a
+	// missing mask must not manufacture a complete "0" pair through
+	// normHex's empty-to-"0" mapping; the record stays unknown instead
+	// and Decode rejects genuinely partial pairs on the wire.
+	if fn.HasAssert && fn.AssertTP != "" && fn.AssertRTP != "" {
+		add("AssertTP=" + normHex(fn.AssertTP))
+		add("AssertRTP=" + normHex(fn.AssertRTP))
+	}
 	if fn.ParamMutated != "" {
 		add("ParamMutated=" + normHex(fn.ParamMutated))
 	}
@@ -274,12 +340,30 @@ func (fn *FnFact) parseFlag(flag string) error {
 		fn.PureConst = true
 	case "ReceiverMutated":
 		fn.ReceiverMutated = true
+	case "Readonly":
+		fn.Readonly = true
 	default:
 		if rest, ok := strings.CutPrefix(flag, "ParamMutated="); ok {
 			if !isHexMask(rest) {
 				return fmt.Errorf("bad ParamMutated flag %q (want hex mask)", flag)
 			}
 			fn.ParamMutated = normHex(rest)
+			return nil
+		}
+		if rest, ok := strings.CutPrefix(flag, "AssertTP="); ok {
+			if !isHexMask(rest) {
+				return fmt.Errorf("bad AssertTP flag %q (want hex mask)", flag)
+			}
+			fn.AssertTP = normHex(rest)
+			fn.HasAssert = true
+			return nil
+		}
+		if rest, ok := strings.CutPrefix(flag, "AssertRTP="); ok {
+			if !isHexMask(rest) {
+				return fmt.Errorf("bad AssertRTP flag %q (want hex mask)", flag)
+			}
+			fn.AssertRTP = normHex(rest)
+			fn.HasAssert = true
 			return nil
 		}
 		if rest, ok := strings.CutPrefix(flag, "MayYield="); ok {
@@ -293,6 +377,32 @@ func (fn *FnFact) parseFlag(flag string) error {
 		return fmt.Errorf("unknown fn flag %q", flag)
 	}
 	return nil
+}
+
+// HighestAssertBit returns the index of the highest set bit of a hex
+// mask string and whether s is a valid mask. Consumers reject summaries
+// whose highest bit lies outside the declaration's real parameter arity
+// instead of silently ignoring the excess bits.
+func HighestAssertBit(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	if strings.Trim(s, "0123456789abcdef") != "" {
+		return 0, false
+	}
+	trimmed := strings.TrimLeft(s, "0")
+	if trimmed == "" {
+		return -1, true // proven zero: no bit set
+	}
+	top := 4*(len(trimmed)-1) + bits.Len8(uint8(nibbleValue(trimmed[0]))) - 1
+	return top, true
+}
+
+func nibbleValue(c byte) int {
+	if c > '9' {
+		return int(c - 'a' + 10)
+	}
+	return int(c - '0')
 }
 
 // isHexMask reports whether s is a non-empty run of hex digits. A mask
@@ -375,7 +485,7 @@ func Decode(data []byte) (*Facts, error) {
 		prev = line
 		fields := strings.Fields(line)
 		switch {
-		case strings.HasPrefix(line, "opt ") || strings.HasPrefix(line, "const "):
+		case strings.HasPrefix(line, "opt ") || strings.HasPrefix(line, "const ") || strings.HasPrefix(line, "readonly "):
 			if len(fields) != 3 {
 				return nil, fmt.Errorf("logos facts line %d: bad %s record %q (want %q)", ln, fields[0], line, fields[0]+" <object> <path>")
 			}
@@ -385,10 +495,13 @@ func Decode(data []byte) (*Facts, error) {
 			if !validPath(fields[2]) {
 				return nil, fmt.Errorf("logos facts line %d: bad path %q", ln, fields[2])
 			}
-			if fields[0] == "opt" {
+			switch fields[0] {
+			case "opt":
 				f.Opts = append(f.Opts, PathFact{Object: fields[1], Path: fields[2]})
-			} else {
+			case "const":
 				f.Consts = append(f.Consts, PathFact{Object: fields[1], Path: fields[2]})
+			default:
+				f.Readonlys = append(f.Readonlys, ReadonlyFact{Object: fields[1], Path: fields[2]})
 			}
 		case line == "lang go":
 			f.GoPackage = true
@@ -405,6 +518,12 @@ func Decode(data []byte) (*Facts, error) {
 				if ferr := fn.parseFlag(flag); ferr != nil {
 					return nil, fmt.Errorf("logos facts line %d: %v", ln, ferr)
 				}
+			}
+			// Trust boundary: an assertion-effect record carries both
+			// masks or neither. A partial pair must not certify the
+			// missing side as proven zero; neither flag stays unknown.
+			if (fn.AssertTP == "") != (fn.AssertRTP == "") {
+				return nil, fmt.Errorf("logos facts line %d: incomplete assertion-effect pair on %q (want both AssertTP and AssertRTP or neither)", ln, fn.Object)
 			}
 			f.Fns = append(f.Fns, fn)
 		case strings.HasPrefix(line, "prop "):
@@ -544,11 +663,9 @@ func isIdent(s string) bool {
 // Decode accepts, so a producer can skip names it cannot spell.
 func ValidObject(s string) bool { return validObject(s) }
 
-// validObject reports whether s is Name, Type.Field, Type.Method, or
-// (*Type).Method.
 func validObject(s string) bool {
-	recv := s
-	if before, after, ok := strings.CutLast(s, "."); ok {
+	recv, _, _ := strings.Cut(s, "@")
+	if before, after, ok := strings.CutLast(recv, "."); ok {
 		if !isIdent(after) {
 			return false
 		}
@@ -580,13 +697,13 @@ func isDigits(s string) bool {
 }
 
 // validStep reports whether s is one path step: R<i>, P<i>, F<name>, E, D,
-// K, M<name>, or T<i>.
+// K, M<name>, T<i>, G<i>, or H<i>.
 func validStep(s string) bool {
 	if s == "" {
 		return false
 	}
 	switch s[0] {
-	case 'R', 'P', 'T':
+	case 'R', 'P', 'T', 'G', 'H':
 		return isDigits(s[1:])
 	case 'F', 'M':
 		return isIdent(s[1:])

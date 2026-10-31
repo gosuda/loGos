@@ -35,7 +35,8 @@ func (ev *logosEvac) candidate(i uintptr) *mspan {
 }
 
 // logosEvacuate runs one evacuation. The world must be stopped and marking
-// complete.
+// complete. Its only caller, gcMarkTermination, has parked the goroutine that
+// stopped the world in _Gwaiting, so no goroutine is _Grunning.
 func logosEvacuate() {
 	assertWorldStopped()
 	if !goexperiment.LogosGCMoving {
@@ -89,6 +90,7 @@ func (ev *logosEvac) finish() {
 	for i := uintptr(0); i < ev.cand.n; i++ {
 		ev.candidate(i).logosFwd = 0
 	}
+
 	if ev.fwd != 0 {
 		sysFree(unsafe.Pointer(ev.fwd), ev.fwdBytes, &memstats.other_sys)
 	}
@@ -136,11 +138,14 @@ func logosBlockSpans(ha *heapArena, bb uintptr, out *[logosPagesPerBlock]*mspan)
 // logosSpanMovable reports whether the objects of s may move out of the
 // block at bb. A span that holds a finalizer or cleanup special now or ever,
 // a span with pinned objects, and a span that extends beyond the block stay
-// in place (#159, #160, #175). So does a span in an mcache: it counts its
+// in place (#159, #160, #175). Size classes 0-2 stay classic per M19-S8
+// (large, and tiny, whose slots the mcache subdivides under its own
+// accounting), matching the allocator eligibility in logosImmixSpanClass.
+// So does a span in an mcache: it counts its
 // allocations in MemStats only when it leaves the cache, as the difference of
 // allocCount and allocCountBeforeCache, and moveObject lowers allocCount.
 func logosSpanMovable(s *mspan, bb uintptr) bool {
-	if s.spanclass.sizeclass() == 0 || s.isUserArenaChunk || s.sweepgen != mheap_.sweepgen {
+	if s.spanclass.sizeclass() < 3 || s.isUserArenaChunk || s.sweepgen != mheap_.sweepgen {
 		return false
 	}
 	if s.logosNoReloc || s.specials != nil || logosSpanPinned(s) {
@@ -203,7 +208,22 @@ func (ev *logosEvac) evalBlock(ha *heapArena, bb uintptr) {
 	}
 	blk := &logosEvScratch
 	blk.base = bb
-	if logosBlockLines(blk, spans[:n]) == 0 || blk.freeLines() <= logosImmixLines/2 {
+	live := logosBlockLines(blk, spans[:n])
+	// Merge rule (STW snapshot isolation): occupied = mark-bit coverage
+	// (authoritative liveness, recomputed above) UNION active dirty plane.
+	// Captured pre-flip epoch; world stopped so no flip is in flight.
+	// Dirty can only clear free lines (over-pin, underselect only) — it
+	// can never free a live line, so evacuation never frees live objects.
+	// Overlap-based large/special/Pinner exclusions above are preserved.
+	if dirtyBlk := logosImmixBlockLookup(bb); dirtyBlk != nil {
+		active := &dirtyBlk.dirty[logosImmixDirtyEpoch&1]
+		for i := range active {
+			if active[i] != 0 {
+				blk.lines[i] = 1
+			}
+		}
+	}
+	if live == 0 || blk.freeLines() <= logosImmixLines/2 {
 		ev.denseBlks++
 		return
 	}
@@ -246,13 +266,16 @@ func (ev *logosEvac) assignForwarding() {
 }
 
 // logosDestEligible reports whether free slots of s may receive evacuated
-// objects. A span with specials is excluded because an unmarked slot of it
-// may hold an object that the sweep resurrects for its finalizer.
+// objects. A span with specials is eligible, but only its special-free slots
+// are claimable (spanSlotSpecial): sweep resurrects an unmarked object that
+// carries a special for its finalizer, so that slot must keep its occupant.
+// Size classes 0-2 stay classic per M19-S8, the destination side of the same
+// eligibility relation as logosSpanMovable.
 func logosDestEligible(s *mspan) bool {
-	if s.state.get() != mSpanInUse || s.logosFwd != 0 || s.spanclass.sizeclass() == 0 || s.isUserArenaChunk {
+	if s.state.get() != mSpanInUse || s.logosFwd != 0 || s.spanclass.sizeclass() < 3 || s.isUserArenaChunk {
 		return false
 	}
-	return s.sweepgen == mheap_.sweepgen && s.specials == nil && !s.logosNoReloc
+	return s.sweepgen == mheap_.sweepgen && !s.logosNoReloc
 }
 
 // buildPool groups the destination spans by span class.
@@ -293,7 +316,7 @@ func (ev *logosEvac) allocDest(spc spanClass) (ds *mspan, di uintptr, ok bool) {
 		for c.budget > 0 && c.obj < uintptr(ds.nelems) {
 			di = c.obj
 			c.obj++
-			if !ds.markBitsForIndex(di).isMarked() {
+			if !ds.markBitsForIndex(di).isMarked() && !spanSlotSpecial(ds, di) {
 				c.budget--
 				return ds, di, true
 			}
@@ -304,22 +327,6 @@ func (ev *logosEvac) allocDest(spc spanClass) (ds *mspan, di uintptr, ok bool) {
 	return nil, 0, false
 }
 
-// logosSpareSlots returns how many unmarked slots of ds the evacuation may
-// claim. It leaves one: a span the central lists hold as partial must still
-// have a free slot after the next sweep.
-func logosSpareSlots(ds *mspan) uintptr {
-	free := uintptr(0)
-	for i := uintptr(0); i < uintptr(ds.nelems); i++ {
-		if !ds.markBitsForIndex(i).isMarked() {
-			free++
-		}
-	}
-	if free == 0 {
-		return 0
-	}
-	return free - 1
-}
-
 // evacuateSpan moves the marked objects of s while destination slots last.
 func (ev *logosEvac) evacuateSpan(s *mspan) {
 	for i := uintptr(0); i < uintptr(s.nelems); i++ {
@@ -328,6 +335,7 @@ func (ev *logosEvac) evacuateSpan(s *mspan) {
 		}
 		ds, di, ok := ev.allocDest(s.spanclass)
 		if !ok {
+			logosEvacNoteShortfall(s, i)
 			return
 		}
 		ev.moveObject(s, i, ds, di)
@@ -393,10 +401,30 @@ func (ev *logosEvac) claimSlot(ds *mspan, di uintptr) (fresh bool) {
 	if goexperiment.GreenTeaGC && gcUsesSpanInlineMarkBits(ds.elemsize) {
 		ds.scannedBitsForIndex(di).setMarkedNonAtomic()
 	}
-	if di >= uintptr(ds.freeindex) && !ds.allocBitsForIndex(di).isMarked() {
+	// Occupancy (STW, exclusive): destination slot is now allocated, so its
+	// line must be in plane O or later hole reuse could double-allocate a
+	// live destination. Idempotent; owner API no-ops for non-immix spans.
+	// Causal handoff: STW claim precedes sweep rebuild that reads occupy.
+	logosImmixOccupySlot(ds, ds.base()+di*ds.elemsize)
+	// A clear alloc bit means the slot is uncounted, wherever it sits.
+	// The comment above requires exactly that case to raise allocCount so
+	// the caller can lower the source's by one. Restricting this to slots
+	// at or above freeindex left a destination mark with no allocation in
+	// every swept hole below the watermark, which is the state the sweep's
+	// zombie check reports as a pointer to a free object.
+	if !ds.allocBitsForIndex(di).isMarked() {
 		ds.allocBitsForIndex(di).setMarkedNonAtomic()
 		ds.allocCount++
 		fresh = true
+	}
+	// The owning mcache reads allocCache directly, so a slot claimed inside the
+	// cached window must leave that word too, or the next allocation from ds
+	// hands the same slot out again and overwrites the copy. refillAllocCache
+	// loads eight bytes of alloc bits on every platform, so the window is 64
+	// slots wide even where a pointer is 32 bits.
+	const allocCacheWindow = 64
+	if free := uintptr(ds.freeindex); di >= free && di < free+allocCacheWindow {
+		ds.allocCache &^= 1 << (di - free)
 	}
 	arena, pageIdx, pageMask := pageIndexOf(ds.base())
 	if arena.pageMarks[pageIdx]&pageMask == 0 {

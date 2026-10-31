@@ -1,0 +1,165 @@
+// run -goexperiment logosarena
+
+package main
+
+// M18 caller-region attack (SPEC Sec 8.3): a noinline producer returning a
+// runtime-sized noscan slice must allocate in the caller's region when the
+// caller keeps the result locally (Local consent, always) or returns it
+// through a static chain (Chain consent). This fixture is intentionally RED
+// until walk lowers LogosArenaRetMake with the RetSet/RetTake token: escape
+// records retSites/live/candidate/consent, but walk/arena_logos.go lowers
+// only ConstMake/Make (EscNone), so every returned make still takes the
+// heap path. Allocation attacks below expect 0 for caller-owned cases
+// (currently 1, retain 2) and 1 for false-consent/global-escape controls.
+// Correctness checksums are separate lines so the red is alloc-driven, not
+// value-driven. Defer/panic preservation is correctness-only: a user defer
+// vetoes placement per LogosArenaPlaceable, so it stays heap by rule.
+
+import (
+	"fmt"
+	"testing"
+)
+
+var callSize = 64
+
+var sinkInt int
+
+var globalSink []byte
+
+var produceFn func(int) []byte = produce
+
+func sumBytes(b []byte) int {
+	s := 0
+	for _, v := range b {
+		s += int(v)
+	}
+	return s
+}
+
+//go:noinline
+func produce(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = 3
+	}
+	return b
+}
+
+//go:noinline
+func produceB(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = 7
+	}
+	return b
+}
+
+//go:noinline
+func middle(n int) []byte {
+	return produce(n)
+}
+
+//go:noinline
+func outerMiddle(n int) []byte {
+	return middle(n)
+}
+
+//go:noinline
+func consumeLocal(n int) int {
+	b := produce(n)
+	return sumBytes(b)
+}
+
+//go:noinline
+func consumeChain(n int) int {
+	b := middle(n)
+	return sumBytes(b)
+}
+
+//go:noinline
+func consumeNested(n int) int {
+	b := outerMiddle(n)
+	return sumBytes(b)
+}
+
+//go:noinline
+func retainOverwrite(n int) (int, int) {
+	a := produce(n)
+	_ = sumBytes(a)
+	b := produceB(n)
+	// Re-sum a after b: a premature callee restore would let b reuse a's
+	// region and clobber a from 3s to 7s, turning 192 into 448.
+	sa := sumBytes(a)
+	sb := sumBytes(b)
+	return sa, sb
+}
+
+//go:noinline
+func retainTotal(n int) int {
+	a, b := retainOverwrite(n)
+	return a + b
+}
+
+//go:noinline
+func callViaValue(n int) int {
+	b := produceFn(n)
+	return sumBytes(b)
+}
+
+//go:noinline
+func consumeLeak(n int) int {
+	b := produce(n)
+	globalSink = b
+	return sumBytes(b)
+}
+
+//go:noinline
+func unrelatedBetween(n int) int {
+	x := make([]byte, n)
+	for i := range x {
+		x[i] = 11
+	}
+	s1 := sumBytes(x)
+	v := callViaValue(n)
+	y := make([]byte, n)
+	for i := range y {
+		y[i] = 13
+	}
+	s2 := sumBytes(y)
+	return s1 + v + s2
+}
+
+//go:noinline
+func deferRecover(n int) (sum int, rec any) {
+	defer func() {
+		rec = recover()
+	}()
+	b := produce(n)
+	sum = sumBytes(b)
+	if n == callSize {
+		panic("boom")
+	}
+	return sum, nil
+}
+
+func main() {
+	fmt.Println("local-sum:", consumeLocal(callSize))
+	fmt.Println("chain-sum:", consumeChain(callSize))
+	fmt.Println("nested-sum:", consumeNested(callSize))
+	aSum, bSum := retainOverwrite(callSize)
+	fmt.Println("retain:", aSum, bSum)
+	fmt.Println("viavalue-sum:", callViaValue(callSize))
+	fmt.Println("leak-sum:", consumeLeak(callSize))
+	fmt.Println("leak-global-sum:", sumBytes(globalSink))
+	fmt.Println("unrelated-sum:", unrelatedBetween(callSize))
+	dSum, dRec := deferRecover(callSize)
+	fmt.Println("defer-sum:", dSum, dRec)
+	fmt.Println("alloc-local:", testing.AllocsPerRun(100, func() { sinkInt = consumeLocal(callSize) }))
+	fmt.Println("alloc-chain:", testing.AllocsPerRun(100, func() { sinkInt = consumeChain(callSize) }))
+	fmt.Println("alloc-nested:", testing.AllocsPerRun(100, func() { sinkInt = consumeNested(callSize) }))
+	fmt.Println("alloc-retain:", testing.AllocsPerRun(100, func() { sinkInt = retainTotal(callSize) }))
+	fmt.Println("alloc-leak:", testing.AllocsPerRun(100, func() { sinkInt = consumeLeak(callSize) }))
+	fmt.Println("alloc-viavalue:", testing.AllocsPerRun(100, func() { sinkInt = callViaValue(callSize) }))
+	fmt.Println("alloc-unrelated:", testing.AllocsPerRun(100, func() { sinkInt = unrelatedBetween(callSize) }))
+	_ = sinkInt
+}

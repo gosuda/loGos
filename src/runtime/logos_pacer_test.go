@@ -17,10 +17,10 @@ import (
 	"testing"
 )
 
-// M19-S2 attacks (SPEC Sec 19, T-301.2, #161). Under greentea the
+// M19-S2 attacks (SPEC Sec 19, T-301.2, #161). Under the greentea mode the
 // background utilization goal follows the PLAN curve of live heap over
 // heap goal, mark assist stays as backstop, endCycle credits the cycle
-// with the goal it ran with, and a build without a collector mode keeps the
+// with the goal it ran with, and an empty test-controller mode keeps the
 // upstream pacing.
 
 const (
@@ -323,6 +323,9 @@ func logosUpstreamSplit(procs int) (int64, float64) {
 	return dedicated, 0
 }
 
+// TestLogosEmptyModeKeepsUpstreamPacing: an empty mode keeps the upstream
+// pacing in the test controller; the built-program test covers the
+// production path.
 func TestLogosEmptyModeKeepsUpstreamPacing(t *testing.T) {
 	if runtime.LogosGCModeIsSTW() {
 		t.Skipf("stop-the-world GC mode (batch or epsilon): elastic pacing is off and every collection stops the world, so there is no concurrent pacing to assert")
@@ -332,7 +335,7 @@ func TestLogosEmptyModeKeepsUpstreamPacing(t *testing.T) {
 		c := newLogosController()
 		c.LogosStartCycleAt("", 0.5, procs)
 		if c.LogosElasticActive() {
-			t.Fatalf("procs=%d: elastic pacing is active with an empty mode", procs)
+			t.Fatalf("procs=%d: elastic pacing is active with an empty test-controller mode", procs)
 		}
 		for _, u := range []float64{0.5, 0.8, 0.9, 0.95, 0.99, 1.1} {
 			c.LogosReviseAt(u)
@@ -564,10 +567,11 @@ func logosAllocBurst(workers, perWorker int) {
 
 // BenchmarkLogosAssistShare reports the share of CPU time spent in mark
 // assist, from /cpu/classes/gc/mark/assist:cpu-seconds over
-// /cpu/classes/total:cpu-seconds, for the upstream pacing and for greentea.
+// /cpu/classes/total:cpu-seconds, for the upstream (wasm) pacing and for greentea.
+// The upstream arm uses wasm because wasm is an upstream-pacing mode.
 // The target for greentea is a lower share; it is recorded, not asserted.
 func BenchmarkLogosAssistShare(b *testing.B) {
-	for _, mode := range []struct{ name, gc string }{{"upstream", ""}, {"greentea", "greentea"}} {
+	for _, mode := range []struct{ name, gc string }{{"upstream", "wasm"}, {"greentea", "greentea"}} {
 		b.Run(mode.name, func(b *testing.B) {
 			old := runtime.LogosPacerSetMode(mode.gc)
 			b.Cleanup(func() { runtime.LogosPacerSetMode(old) })

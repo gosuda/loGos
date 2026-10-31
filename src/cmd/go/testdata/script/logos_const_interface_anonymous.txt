@@ -1,0 +1,497 @@
+# T-201, R-U2: anonymous readonly interface methods `interface{ const Get() int }`.
+# The contract package exports Use(x interface{ const Get() int }) int (P0.MGet
+# shape), Holder with Inner Namer (named FInner indirection via existing I.M)
+# and Anon interface{ const Get() int } (FAnon.MGet shape), NewNamer() Namer
+# (R0 named via existing I.M) and NewAnon() interface{ const Get() int }
+# (R0.MGet shape), Alias = Namer and AnonAlias = interface{ const Get() int }
+# (alias RHS transparent, same paths as underlying), and AllNamed[T Namer]
+# generic with a named qualified constraint (expressible today; roots skip
+# emission like existing generics but constraints enter the affected closure
+# via subst, so the bound iface still rebuilds readonly). An
+# anonymous-constraint generic All[T interface{ const Get() int }] would be
+# the G0.MGet shape (type G[T] same G0; generic method recv params via H)
+# but is documented optional only: the parser may not accept const in
+# constraint position, so the core P0/R0/F shapes never block on it.
+# Every implementer must be provably readonly (independent runtime truth):
+# pure value getters are accepted and run to anon-ok / go-anon-ok; an
+# other-package mutating value getter (slice write through the receiver) is
+# rejected with the approved call-site code const_view_mutation, and an
+# ordinary Go importer mutator is likewise rejected. No satisfaction or
+# fingerprint wire text is pinned here (facts owner owns it); only the
+# const_view_mutation code is asserted. Modules stay homogeneous: w/l is
+# all-.lgo, w/g is all-.go via go.work, neg is all-.lgo, gneg is all-.go
+# with a replace to w/l. Case 1 builds and runs first so a later red is a
+# semantic proof, never a syntax failure.
+env GOPROXY=off
+env GOTOOLCHAIN=local
+mkdir $WORK/bin
+
+# Case 1: syntax works and pure getters are accepted through every shape.
+# Independent runtime truth: Run returns anon-ok / go-anon-ok only when
+# each qualified call observes the expected pure value.
+cd w
+logos build ./...
+logos build -o $WORK/bin/anon$GOEXE ./l/cmd
+exec $WORK/bin/anon$GOEXE
+stdout '^anon-ok$'
+logos build -o $WORK/bin/goanon$GOEXE ./g/cmd
+exec $WORK/bin/goanon$GOEXE
+stdout '^go-anon-ok$'
+cd ..
+
+# Case 2: other-package (other than c) mutating value getters rejected.
+# Each attack package defines its Mut locally so the deferred package-end
+# proof reports with the approved code; only the code is pinned.
+cd neg
+! logos build ./anon
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./holder
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./retanon
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./alias
+stderr '\[correctness::const_view_mutation\]'
+! logos build ./generic
+stderr '\[correctness::const_view_mutation\]'
+cd ..
+
+# Case 3: ordinary Go importer mutator rejected through the anonymous shape.
+cd gneg
+! logos build ./...
+stderr '\[correctness::const_view_mutation\]'
+cd ..
+
+-- w/go.work --
+go 1.27
+
+use (
+	./l
+	./g
+)
+
+-- w/l/go.mod --
+module example.com/l
+
+go 1.27
+
+-- w/l/c/c.lgo --
+package c
+
+type Namer interface {
+	const Get() int
+}
+
+func Use(x interface{ const Get() int }) int {
+	return x.Get()
+}
+
+type Holder struct {
+	Inner Namer
+	Anon  interface{ const Get() int }
+}
+
+func NewNamer(n Namer) Namer {
+	return n
+}
+
+func NewAnon(n interface{ const Get() int }) interface{ const Get() int } {
+	return n
+}
+
+type Alias = Namer
+
+type AnonAlias = interface{ const Get() int }
+
+func AllNamed[T Namer](x T) int {
+	return x.Get()
+}
+
+// Optional G0.MGet shape if the parser accepts const in constraint
+// position (guarded, never blocking the core P0/R0/F shapes):
+// func All[T interface{ const Get() int }](x T) int {
+// 	return x.Get()
+// }
+
+-- w/l/p/p.lgo --
+package p
+
+import "example.com/l/c"
+
+type Pure struct {
+	V int
+}
+
+func (p Pure) Get() int {
+	return p.V
+}
+
+func MakePure(v int) Pure {
+	return Pure{V: v}
+}
+
+func MakePureNamer(v int) c.Namer {
+	return MakePure(v)
+}
+
+func MakePureAnon(v int) c.AnonAlias {
+	return MakePure(v)
+}
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Get() int {
+	m.S[0] = 1
+	return m.S[0]
+}
+
+func MakeMut(v int) Mut {
+	return Mut{S: []int{v}}
+}
+
+-- w/l/q/q.lgo --
+package q
+
+import (
+	"example.com/l/c"
+	"example.com/l/p"
+)
+
+func ViaAnon(x interface{ const Get() int }) int {
+	return x.Get()
+}
+
+func ViaHolder(h c.Holder) int {
+	return h.Inner.Get() + h.Anon.Get()
+}
+
+func ViaReturnNamer(n c.Namer) int {
+	return c.NewNamer(n).Get()
+}
+
+func ViaReturnAnon(x interface{ const Get() int }) int {
+	return c.NewAnon(x).Get()
+}
+
+func ViaAlias(a c.Alias) int {
+	return a.Get()
+}
+
+func ViaAnonAlias(a c.AnonAlias) int {
+	return a.Get()
+}
+
+func ViaGeneric[T c.Namer](x T) int {
+	return x.Get()
+}
+
+func ViaAllNamed(x p.Pure) int {
+	return c.AllNamed(x)
+}
+
+func Run() string {
+	pure := p.MakePure(7)
+	if c.Use(pure) != 7 {
+		return "bad-use"
+	}
+	if ViaAnon(pure) != 7 {
+		return "bad-viaanon"
+	}
+	h := c.Holder{Inner: pure, Anon: pure}
+	if ViaHolder(h) != 14 {
+		return "bad-holder"
+	}
+	if ViaReturnNamer(pure) != 7 {
+		return "bad-retnamer"
+	}
+	if ViaReturnAnon(pure) != 7 {
+		return "bad-retanon"
+	}
+	if c.NewNamer(pure).Get() != 7 {
+		return "bad-newnamer"
+	}
+	if c.NewAnon(pure).Get() != 7 {
+		return "bad-newanon"
+	}
+	var a c.Alias = pure
+	if ViaAlias(a) != 7 {
+		return "bad-alias"
+	}
+	var aa c.AnonAlias = pure
+	if ViaAnonAlias(aa) != 7 {
+		return "bad-anonalias"
+	}
+	if p.MakePureNamer(7).Get() != 7 {
+		return "bad-makenamer"
+	}
+	if p.MakePureAnon(7).Get() != 7 {
+		return "bad-makeanon"
+	}
+	if ViaGeneric(pure) != 7 {
+		return "bad-generic"
+	}
+	if ViaAllNamed(pure) != 7 {
+		return "bad-allnamed"
+	}
+	if c.AllNamed(pure) != 7 {
+		return "bad-allnamed-direct"
+	}
+	return "anon-ok"
+}
+
+-- w/l/cmd/main.lgo --
+package main
+
+import (
+	"fmt"
+
+	"example.com/l/q"
+)
+
+func main() {
+	fmt.Println(q.Run())
+}
+
+-- w/g/go.mod --
+module example.com/g
+
+go 1.27
+
+-- w/g/qq/qq.go --
+package qq
+
+import (
+	"example.com/l/c"
+	"example.com/l/p"
+)
+
+type G int
+
+func (g G) Get() int { return int(g) }
+
+func Run() string {
+	pure := p.MakePure(7)
+	var plain interface{ Get() int } = pure
+	if plain.Get() != 7 {
+		return "bad-plain"
+	}
+	var n c.Namer = pure
+	if n.Get() != 7 {
+		return "bad-namer"
+	}
+	if c.NewNamer(pure).Get() != 7 {
+		return "bad-newnamer"
+	}
+	if c.Use(pure) != 7 {
+		return "bad-use"
+	}
+	if c.Use(G(7)) != 7 {
+		return "bad-g"
+	}
+	var m c.Namer = G(7)
+	if m.Get() != 7 {
+		return "bad-gnamer"
+	}
+	if c.NewNamer(G(7)).Get() != 7 {
+		return "bad-gnew"
+	}
+	h := c.Holder{Inner: pure, Anon: pure}
+	if h.Inner.Get()+h.Anon.Get() != 14 {
+		return "bad-holder"
+	}
+	hg := c.Holder{Inner: G(7), Anon: G(7)}
+	if hg.Inner.Get()+hg.Anon.Get() != 14 {
+		return "bad-gholder"
+	}
+	var a c.Alias = pure
+	if a.Get() != 7 {
+		return "bad-alias"
+	}
+	var ag c.Alias = G(7)
+	if ag.Get() != 7 {
+		return "bad-galias"
+	}
+	return "go-anon-ok"
+}
+
+-- w/g/cmd/main.go --
+package main
+
+import (
+	"fmt"
+
+	"example.com/g/qq"
+)
+
+func main() { fmt.Println(qq.Run()) }
+
+-- neg/go.mod --
+module example.com/neg
+
+go 1.27
+
+-- neg/c/c.lgo --
+package c
+
+type Namer interface {
+	const Get() int
+}
+
+func Use(x interface{ const Get() int }) int {
+	return x.Get()
+}
+
+type Holder struct {
+	Inner Namer
+	Anon  interface{ const Get() int }
+}
+
+func NewNamer(n Namer) Namer {
+	return n
+}
+
+func NewAnon(n interface{ const Get() int }) interface{ const Get() int } {
+	return n
+}
+
+type Alias = Namer
+
+type AnonAlias = interface{ const Get() int }
+
+func AllNamed[T Namer](x T) int {
+	return x.Get()
+}
+
+// Optional G0.MGet shape if the parser accepts const in constraint
+// position (guarded, never blocking the core P0/R0/F shapes):
+// func All[T interface{ const Get() int }](x T) int {
+// 	return x.Get()
+// }
+
+-- neg/anon/anon.lgo --
+package anon
+
+import "example.com/neg/c"
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Get() int {
+	m.S[0] = 1
+	return m.S[0]
+}
+
+func Attack() int {
+	return c.Use(Mut{S: []int{1}})
+}
+
+-- neg/holder/holder.lgo --
+package holder
+
+import "example.com/neg/c"
+
+type Pure struct {
+	V int
+}
+
+func (p Pure) Get() int {
+	return p.V
+}
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Get() int {
+	m.S[0] = 1
+	return m.S[0]
+}
+
+func Attack() int {
+	h := c.Holder{Inner: Pure{V: 1}, Anon: Mut{S: []int{1}}}
+	return h.Inner.Get() + h.Anon.Get()
+}
+
+-- neg/retanon/retanon.lgo --
+package retanon
+
+import "example.com/neg/c"
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Get() int {
+	m.S[0] = 1
+	return m.S[0]
+}
+
+func Attack() int {
+	return c.NewAnon(Mut{S: []int{1}}).Get()
+}
+
+-- neg/alias/alias.lgo --
+package alias
+
+import "example.com/neg/c"
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Get() int {
+	m.S[0] = 1
+	return m.S[0]
+}
+
+func Attack() int {
+	var a c.AnonAlias = Mut{S: []int{1}}
+	return a.Get()
+}
+
+-- neg/generic/generic.lgo --
+package generic
+
+import "example.com/neg/c"
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Get() int {
+	m.S[0] = 1
+	return m.S[0]
+}
+
+func Attack() int {
+	return c.AllNamed(Mut{S: []int{1}})
+}
+
+-- gneg/go.mod --
+module example.com/gneg
+
+go 1.27
+
+require example.com/l v0.0.0
+
+replace example.com/l => ../w/l
+
+-- gneg/main.go --
+package main
+
+import "example.com/l/c"
+
+type Mut struct {
+	S []int
+}
+
+func (m Mut) Get() int {
+	m.S[0] = 1
+	return m.S[0]
+}
+
+func main() {
+	println(c.Use(Mut{S: []int{1}}))
+}

@@ -169,11 +169,23 @@ func main() {
 				return false
 			}
 			// Inside pkg/tool/$GOOS_$GOARCH, keep only tools needed for build actions.
-			switch strings.TrimSuffix(path.Base(name), ".exe") {
+			// The logos-nogo helper and its digest sidecar ride along for
+			// distributed installs; they are built by installLogosNogo in
+			// cmd/dist, not by goInstall, so keeping them here never
+			// invents a nonexistent cmd/logos-nogo package.
+			if base := path.Base(name); base == "logos-nogo.digest" || base == "logos-nogo.exe.digest" {
+				return true
+			}
+			tool := path.Base(name)
+			if stripped, ok := strings.CutSuffix(tool, ".exe"); ok {
+				tool = stripped
+			}
+			switch tool {
 			default:
 				return false
 			// Keep in sync with toolsIncludedInDistpack in cmd/dist/build.go.
-			case "asm", "cgo", "compile", "cover", "fix", "link", "preprofile", "vet":
+			// logos-nogo is installed by installLogosNogo, not goInstall.
+			case "asm", "cgo", "compile", "cover", "fix", "link", "preprofile", "vet", "logos-nogo":
 			}
 		}
 		return true

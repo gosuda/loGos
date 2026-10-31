@@ -131,6 +131,7 @@ func (check *Checker) funcInst(T *target, pos syntax.Pos, x *operand, inst *synt
 func (check *Checker) instantiateSignature(pos syntax.Pos, expr syntax.Expr, typ *Signature, targs []Type, xlist []syntax.Expr) (res *Signature) {
 	assert(check != nil)
 	assert(len(targs) == typ.TypeParams().Len())
+	check.logosRecordFuncInst(pos, expr, typ, targs) // logos T-201 hook: instantiation assertion effects.
 
 	if check.conf.Trace {
 		check.trace(pos, "-- instantiating signature %s with %s", typ, targs)
@@ -333,6 +334,7 @@ func (check *Checker) callExpr(x *operand, call *syntax.CallExpr) exprKind {
 	check.logosLambdaCallArgs(call, sig)     // logos M6-S6 hook: lambdas against parameter types.
 	args, atargs := check.genericExprList(call.ArgList)
 	sig = check.arguments(call, sig, targs, xlist, args, atargs)
+	check.logosRecordRecvMethodCall(call)
 
 	if wasGeneric && sig.TypeParams().Len() == 0 {
 		// update the recorded type of call.Fun to its instantiated type

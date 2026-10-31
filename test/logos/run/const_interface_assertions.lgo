@@ -1,0 +1,100 @@
+// run
+
+package main
+
+import "fmt"
+
+// Runtime companion to
+// test/logos/compile/const_interface_assertions.lgo. Only the allowed
+// half runs here: every assertion below has a qualified source that
+// already proves the readonly obligation, or targets a concrete type
+// whose body proof is direct. Ordinary additional methods in the target
+// are runtime-checked with comma-ok. No `any` or ordinary source is
+// ever asserted to a qualified interface; that half stays rejected in
+// the compile test because the erased runtime cannot check purity.
+// Each printed line is a hand-computed literal.
+
+type Qualified interface {
+	const Name() string
+}
+
+type QPlus interface {
+	const Name() string
+	Extra() int
+}
+
+type Good struct {
+	name  string
+	extra int
+}
+
+func (g Good) Name() string { return g.name }
+func (g Good) Extra() int  { return g.extra }
+
+type Small struct {
+	name string
+}
+
+func (s Small) Name() string { return s.name }
+
+// Concrete escape hatch: `any` to Good is runtime-checkable, then the
+// ordinary assignment to Qualified is proved by the Good body scan.
+func ViaConcrete(v any) string {
+	g := v.(Good)
+	var q Qualified = g
+	return q.Name()
+}
+
+// Qualified source already proves Name; narrowing to the readonly
+// subset needs no further check.
+func Narrow(q QPlus) Qualified {
+	return q.(Qualified)
+}
+
+func DescribeQualified(q Qualified) string {
+	switch x := q.(type) {
+	case QPlus:
+		return "plus:" + x.Name()
+	case Qualified:
+		return "qualified:" + x.Name()
+	default:
+		return "other"
+	}
+}
+
+func DescribePlus(q QPlus) string {
+	switch x := q.(type) {
+	case Good:
+		return "good:" + x.Name()
+	case Qualified:
+		return "qualified:" + x.Name()
+	default:
+		return "other"
+	}
+}
+
+func main() {
+	var v any = Good{name: "a", extra: 7}
+	fmt.Println(ViaConcrete(v))
+
+	var qp QPlus = Good{name: "b", extra: 3}
+	fmt.Println(Narrow(qp).Name())
+
+	var qw Qualified = Good{name: "c", extra: 9}
+	if got, ok := qw.(QPlus); ok {
+		fmt.Println(got.Name(), got.Extra())
+	} else {
+		fmt.Println("unexpected")
+	}
+
+	var qs Qualified = Small{name: "s"}
+	if _, ok := qs.(QPlus); ok {
+		fmt.Println("unexpected")
+	} else {
+		fmt.Println("no extra")
+	}
+
+	fmt.Println(DescribeQualified(qp))
+	fmt.Println(DescribeQualified(qs))
+	fmt.Println(DescribePlus(qp))
+}

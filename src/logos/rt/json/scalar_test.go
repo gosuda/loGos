@@ -286,19 +286,34 @@ func quotedStdProblem[T any](c quotedCase, data string, s *Scanner) string {
 	return ""
 }
 
+func quotedLiveProblem[T any](data string, s *Scanner, got quoted[T]) string {
+	var want quoted[T]
+	wantErr := stdjson.Unmarshal([]byte(data), &want)
+	if dump(got.A) != dump(want.A) {
+		return fmt.Sprintf("value = %s, encoding/json = %s", dump(got.A), dump(want.A))
+	}
+	if !sameError(s.End(), wantErr) {
+		return fmt.Sprintf("End() = %v, encoding/json = %v", s.End(), wantErr)
+	}
+	return ""
+}
+
 func checkQuoted[T any](t *testing.T, cases []quotedCase, read func(*Scanner, *T)) {
 	t.Helper()
 	for _, c := range cases {
 		data := `{"A":` + c.in + `}`
 		got, s := decodeQuoted(data, read)
+		if stdIsV2 {
+			if msg := quotedLiveProblem(data, s, got); msg != "" {
+				t.Errorf("%T %s: %s", got.A, data, msg)
+			}
+			continue
+		}
 		if dump(got.A) != c.want {
 			t.Errorf("%T %s: value = %s, want %s", got.A, data, dump(got.A), c.want)
 		}
 		if msg := quotedStateProblem(c, s); msg != "" {
 			t.Errorf("%T %s: %s", got.A, data, msg)
-		}
-		if stdIsV2 {
-			continue
 		}
 		if msg := quotedStdProblem[T](c, data, s); msg != "" {
 			t.Errorf("%T %s: %s", got.A, data, msg)
@@ -426,6 +441,34 @@ func TestStringQ(t *testing.T) {
 		{in: `["a"]`, want: `""`, saved: unquotedMsg("string")},
 	}
 	checkQuoted(t, cases, StringQ[string])
+}
+
+func TestStringQEncodingBoundary(t *testing.T) {
+	prefix := `{"A":`
+	complete := [][]byte{
+		{'"', '\\', '"', 'a', 0xff, 'b', '\\', '"', '"'},
+		{'"', '\\', '"', 'a', 0xc3, '\\', '"', '"'},
+		{'"', '\\', '"', 'a', 0xc3, '\\', '\\', 'n', '\\', '"', '"'},
+		{'"', '\\', '"', '\\', '\\', 'u', 'd', '8', '0', '0', '\\', '"', '"'},
+	}
+	for _, outer := range complete {
+		data := prefix + string(outer) + `}`
+		got, s := decodeQuoted(data, StringQ[string])
+		if msg := quotedLiveProblem(data, s, got); msg != "" {
+			t.Errorf("StringQ %q: %s", data, msg)
+		}
+	}
+	truncated := [][]byte{
+		{'"', 'a', 0xc3},
+		{'"', '\\', '"', 'a', 'b'},
+	}
+	for _, outer := range truncated {
+		data := prefix + string(outer)
+		got, s := decodeQuoted(data, StringQ[string])
+		if msg := quotedLiveProblem(data, s, got); msg != "" {
+			t.Errorf("StringQ trunc %q: %s", data, msg)
+		}
+	}
 }
 
 func TestQuotedParityOnSuccess(t *testing.T) {

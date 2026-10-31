@@ -15,20 +15,63 @@ import (
 func TestLogosCapSinks(t *testing.T) {
 	for _, sink := range []string{
 		"reflect.ValueOf", "reflect.TypeOf", "reflect.New",
-		"syscall.Exec", "syscall.ForkExec",
+		"syscall.Exec", "syscall.ForkExec", "syscall.StartProcess",
 		"os.StartProcess", "os.startProcess",
-		"net.sysSocket",
+		"net.sysSocket", "syscall.Socket", "syscall.Connect",
 		"runtime.cgocall", "runtime.logosCgocallFast",
 	} {
 		if _, ok := capabilitySinks[sink]; !ok {
 			t.Errorf("capabilitySinks missing %q", sink)
 		}
 	}
-	if capabilitySinks["os.StartProcess"] != CapExec || capabilitySinks["os.startProcess"] != CapExec {
-		t.Error("exec sinks must map to CapExec")
+	for _, sink := range []string{
+		"syscall.Exec", "syscall.ForkExec", "syscall.StartProcess",
+		"os.StartProcess", "os.startProcess",
+	} {
+		if capabilitySinks[sink] != CapExec {
+			t.Errorf("process sink %q must map to CapExec", sink)
+		}
+	}
+	if capabilitySinks["syscall.Socket"] != CapNet || capabilitySinks["syscall.Connect"] != CapNet {
+		t.Error("net sinks must map to CapNet")
 	}
 	if capabilitySinks["runtime.cgocall"] != CapCgo {
 		t.Error("runtime.cgocall must map to CapCgo")
+	}
+}
+
+// TestLogosCapDenyDecision pins the denial decision behind the Va8U/s-G8
+// sinks without invoking emit: under a deny policy, an unallowlisted
+// third-party dep reaching syscall.Connect (CapNet) or
+// syscall.StartProcess (CapExec) is neither exempt nor allowlisted and the
+// rule verdict is deny. judge's emit call is the only remaining step,
+// shared by every sink.
+func TestLogosCapDenyDecision(t *testing.T) {
+	a := &logosCapAuditor{
+		policy: &logosCapPolicy{
+			TransitiveReflect: "warn",
+			TransitiveExec:    "deny",
+			TransitiveNet:     "deny",
+			MainModules:       []string{"example.com/main"},
+		},
+	}
+	for sink, wantID := range map[string]string{
+		"syscall.Connect":      "unauthorized_net",
+		"syscall.StartProcess": "unauthorized_exec",
+	} {
+		kind, ok := capabilitySinks[sink]
+		if !ok {
+			t.Fatalf("capabilitySinks missing %q", sink)
+		}
+		rule := a.ruleFor(kind)
+		if rule.sev != logosDeny || rule.id != wantID {
+			t.Errorf("ruleFor(%v) = %+v, want deny %q", kind, rule, wantID)
+		}
+		if dep := "example.com/ndep"; a.exemptPkg(dep) {
+			t.Errorf("exemptPkg(%q) = true, want false", dep)
+		} else if capAllowlisted(rule.allow, dep) {
+			t.Errorf("capAllowlisted(%q) = true, want false", dep)
+		}
 	}
 }
 
@@ -77,11 +120,38 @@ func TestLogosCapSinkName(t *testing.T) {
 		{"runtime.cgocall.abi0", "runtime.cgocall"},
 		{"os.StartProcess", "os.StartProcess"},
 		{"example.com/dep.Init", "example.com/dep.Init"},
+		// Cloned sinks are the same sink as their base (SPEC T-203.4,
+		// T-205, red-team #9): a specialization, a middle-dot comptime
+		// expansion, or a source-level comptime copy must not evade the
+		// audit, in any link mode.
+		{"syscall.Connect·logosspec1", "syscall.Connect"},
+		{"syscall.Connect·logosct12", "syscall.Connect"},
+		{"syscall.Connect·logosspec1.abi0", "syscall.Connect"},
+		{"example.com/dep.Foo_logosct1", "example.com/dep.Foo"},
+		{"example.com/dep.Bar_logosct1·logosspec2", "example.com/dep.Bar"},
+		{"example.com/dep.Bar·logosspec12_logosct3", "example.com/dep.Bar"},
+		{"reflect.Value.Method·logosspec1", "reflect.Value.Method"},
 	}
 	for _, tc := range tests {
 		if got := capSinkName(tc.sym); got != tc.want {
 			t.Errorf("capSinkName(%q) = %q, want %q", tc.sym, got, tc.want)
 		}
+	}
+}
+
+func TestLogosCapReflectLookupClone(t *testing.T) {
+	for _, sym := range []string{
+		"reflect.Value.Method",
+		"reflect.Value.Method·logosspec1",
+		"reflect.Value.MethodByName·logosct2",
+		"reflect.Type.Method.abi0",
+	} {
+		if !capIsReflectLookupName(sym) {
+			t.Errorf("capIsReflectLookupName(%q) = false, want true", sym)
+		}
+	}
+	if capIsReflectLookupName("example.com/dep.Foo·logosspec1") {
+		t.Error("capIsReflectLookupName(dep clone) = true, want false")
 	}
 }
 
@@ -119,6 +189,90 @@ func TestLogosCapExemptPkg(t *testing.T) {
 		if a.exemptPkg(pkg) {
 			t.Errorf("exemptPkg(%q) = true, want false", pkg)
 		}
+	}
+}
+
+// TestLogosCapExemptPkgNestedModule pins the s-HG rule: a nested module
+// (its own go.mod) under a main module path is a dependency, not
+// first-party code, so its packages stay blamed while ordinary
+// subpackages of the main module stay exempt. Ownership is longest prefix
+// wins over the module graph: a nested path that is itself a main module
+// (workspace builds), or that sits under one, stays exempt. Dep modules
+// arrive parsed from the runtime.modinfo blob, mirroring logosCapAudit.
+func TestLogosCapExemptPkgNestedModule(t *testing.T) {
+	const blob = "path\tcommand-line-arguments\n" +
+		"mod\texample.com/app\tv0.0.0\n" +
+		"dep\texample.com/app/nested\tv1.2.3\th1:abc=\n"
+	a := &logosCapAuditor{
+		policy: &logosCapPolicy{
+			MainModules: []string{"example.com/app"},
+		},
+		deps: parseLogosModinfoDeps(blob),
+	}
+	for _, pkg := range []string{
+		"example.com/app",
+		"example.com/app/internal/util",
+	} {
+		if !a.exemptPkg(pkg) {
+			t.Errorf("exemptPkg(%q) = false, want true (ordinary subpackage stays exempt)", pkg)
+		}
+	}
+	for _, pkg := range []string{
+		"example.com/app/nested",
+		"example.com/app/nested/sub",
+	} {
+		if a.exemptPkg(pkg) {
+			t.Errorf("exemptPkg(%q) = true, want false (nested module is a dependency)", pkg)
+		}
+	}
+	w := &logosCapAuditor{
+		policy: &logosCapPolicy{
+			MainModules: []string{"example.com/app", "example.com/app/nested"},
+		},
+		deps: parseLogosModinfoDeps(blob),
+	}
+	if !w.exemptPkg("example.com/app/nested") {
+		t.Error(`exemptPkg("example.com/app/nested") = false, want true (nested main module stays exempt)`)
+	}
+	s := &logosCapAuditor{
+		policy: &logosCapPolicy{
+			MainModules: []string{"example.com/app", "example.com/app/nested/deep"},
+		},
+		deps: parseLogosModinfoDeps(blob),
+	}
+	if !s.exemptPkg("example.com/app/nested/deep") {
+		t.Error(`exemptPkg("example.com/app/nested/deep") = false, want true (longer main prefix wins)`)
+	}
+	if s.exemptPkg("example.com/app/nested/other") {
+		t.Error(`exemptPkg("example.com/app/nested/other") = true, want false (nested module is a dependency)`)
+	}
+}
+
+// TestLogosCapModinfoDeps pins the s-HG live signal: dep module paths
+// come from the runtime.modinfo blob cmd/go ships in importcfg, so no
+// producer change is needed for the rule to fire. Only dep lines
+// contribute: mod, =>, path, build and marker bytes never do.
+func TestLogosCapModinfoDeps(t *testing.T) {
+	blob := "\x30\x77\xaf\x0c\x92\x74\x08\x02\x41\xe1\xc1\x07\xe6\xd6\x18\xe6" +
+		"path\tcommand-line-arguments\n" +
+		"mod\texample.com/app\tv0.0.0\n" +
+		"dep\texample.com/app/nested\tv1.2.3\th1:abc=\n" +
+		"dep\tgithub.com/other/lib\tv0.9.0\n" +
+		"=>\tgithub.com/other/lib\tv0.9.1\n" +
+		"build\tbuildmode=exe\n" +
+		"\xf9\x32\x43\x31\x86\x18\x20\x72\x00\x82\x42\x10\x41\x16\xd8\xf2"
+	got := parseLogosModinfoDeps(blob)
+	want := []string{"example.com/app/nested", "github.com/other/lib"}
+	if len(got) != len(want) {
+		t.Fatalf("parseLogosModinfoDeps = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("parseLogosModinfoDeps()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if len(parseLogosModinfoDeps("")) != 0 {
+		t.Error("empty blob must yield no dep modules")
 	}
 }
 

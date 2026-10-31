@@ -1,0 +1,118 @@
+// errorcheck
+
+package p
+
+// Readonly interface methods: `interface { const Name() string }`
+// declares a readonly method. The `const` prefix is parallel to the
+// existing `const Name T` property prefix and appears inside interface
+// braces only. A value-receiver implementation satisfies the readonly
+// method only when its body is provably readonly under the existing
+// const-view receiver rule (no mutation or leak of receiver-reachable
+// references); a plain pointer receiver never satisfies it. An
+// ordinary interface value of unknown dynamic type never satisfies a
+// qualified interface. Weakening (qualified to ordinary) stays allowed;
+// widening (ordinary to qualified) is rejected. Ordinary Go calls are
+// unchanged: mutating types still satisfy ordinary interfaces.
+//
+// Obligation note: all rejections below reuse the existing
+// [correctness::const_view_mutation] diagnostic for unsafe methods. No
+// new obligation diagnostic is invented here; if a dedicated
+// satisfaction code is decided later, the `var _ Q = ...` lines below
+// are the ones to re-pin. Flagged to parent as open.
+
+type Qualified interface {
+	const Name() string
+}
+
+type Ordinary interface {
+	Name() string
+}
+
+type Pure struct {
+	name string
+}
+
+func (p Pure) Name() string { return p.name }
+
+type MutSlice struct {
+	S []int
+}
+
+func (m MutSlice) Name() string {
+	m.S[0] = 1
+	return "mut"
+}
+
+type MutMap struct {
+	M map[string]int
+}
+
+func (m MutMap) Name() string {
+	m.M["k"] = 1
+	return "mut"
+}
+
+var ptrSrc = 7
+
+type MutPtr struct {
+	P *int
+}
+
+func (m MutPtr) Name() string {
+	*m.P = 1
+	return "mut"
+}
+
+// Pure satisfies both the qualified and the ordinary interface.
+var _ Qualified = Pure{}
+var _ Ordinary = Pure{}
+
+// Mutating value receivers satisfy the ordinary interface (ordinary Go
+// behavior is unchanged) but must not satisfy the qualified one.
+var _ Ordinary = MutSlice{S: []int{1}}
+var _ Ordinary = MutMap{M: map[string]int{"k": 1}}
+var _ Ordinary = MutPtr{P: &ptrSrc}
+
+var _ Qualified = MutSlice{S: []int{1}}                // ERROR "const_view_mutation"
+var _ Qualified = MutMap{M: map[string]int{"k": 1}}    // ERROR "const_view_mutation"
+var _ Qualified = MutPtr{P: &ptrSrc}                   // ERROR "const_view_mutation"
+
+func takesQualified(q Qualified) string { return q.Name() }
+
+func takesOrdinary(o Ordinary) string { return o.Name() }
+
+// Unknown dynamic ordinary interface values cannot satisfy a qualified
+// parameter; the dynamic type might mutate.
+func attackDynamic(o Ordinary, q Qualified) {
+	takesQualified(o) // ERROR "const_view_mutation"
+	takesQualified(q)
+}
+
+// Weakening (qualified to ordinary) stays allowed; widening is
+// rejected above. Ordinary calls accept both pure and mutating types.
+func attackWeakening(q Qualified, p Pure, m MutSlice) {
+	takesOrdinary(q)
+	takesOrdinary(p)
+	takesOrdinary(m)
+}
+
+// Direct const-view call control: the existing receiver rule already
+// rejects a mutating value receiver through a const view with the same
+// diagnostic, independent of the interface qualification.
+func attackCall(m const *MutSlice) {
+	m.Name() // ERROR "const_view_mutation"
+}
+
+func attackCallMap(m const *MutMap) {
+	m.Name() // ERROR "const_view_mutation"
+}
+
+func attackCallPtr(m const *MutPtr) {
+	m.Name() // ERROR "const_view_mutation"
+}
+
+// Positive control: a pure value receiver remains callable through a
+// const view.
+func pureCallControl(p const *Pure) string {
+	return p.Name()
+}

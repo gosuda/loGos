@@ -218,9 +218,6 @@ func tracebackFunc(t *testing.T) uintptr {
 //
 // This is a regression test for issue 44971.
 func TestFunctionAlignmentTraceback(t *testing.T) {
-	if logosOptFunctionAlignmentTraceback(t) {
-		return
-	}
 	pc := tracebackFunc(t)
 
 	// Double-check we got the right PC.
@@ -230,8 +227,16 @@ func TestFunctionAlignmentTraceback(t *testing.T) {
 	}
 
 	// Iterate forward until we find a different function. Back up one
-	// instruction is (hopefully) an alignment instruction.
-	for runtime.FuncForPC(pc) == f {
+	// instruction is (hopefully) an alignment instruction. The comparison is
+	// by entry, not by pointer: FuncForPC returns a fresh *funcinl for a PC
+	// inside an inlined frame, so two calls on the same function need not
+	// return the same pointer. A function's range is [entry, next entry).
+	entry := f.Entry()
+	for {
+		g := runtime.FuncForPC(pc)
+		if g == nil || g.Entry() != entry {
+			break
+		}
 		pc++
 	}
 	pc--

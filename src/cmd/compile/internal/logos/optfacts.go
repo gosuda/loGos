@@ -315,8 +315,412 @@ type qualPath struct {
 
 // CloneWithOverlay restores option facts using the package graph overlay.
 // The original package remains the lowered Go-facing view.
+func copyFuncReadonly(dst, src *types2.Func) {
+	if dst == nil || src == nil {
+		return
+	}
+	if src.LogosReadonly() {
+		dst.SetLogosReadonly(true)
+	}
+}
+
+func readonlyObjects(fns []facts.FnFact) map[string]bool {
+	var out map[string]bool
+	for _, fn := range fns {
+		if !fn.Readonly || fn.Object == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]bool)
+		}
+		out[fn.Object] = true
+	}
+	return out
+}
+
+// assertObjects indexes the generic assertion-effect records of fns by
+// object. Only HasAssert records qualify; anything else leaves the clone
+// unknown so the consumer fails closed.
+func assertObjects(fns []facts.FnFact) map[string]facts.FnFact {
+	var out map[string]facts.FnFact
+	for _, fn := range fns {
+		if !fn.HasAssert || fn.Object == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]facts.FnFact)
+		}
+		out[fn.Object] = fn
+	}
+	return out
+}
+
+// copyFuncAssert copies generic assertion effects onto a cloned Func from
+// the record keyed by one of objects: the package-func name for plain
+// functions, the methodObject form for concrete methods. Records without
+// HasAssert never apply, and unparseable masks leave the clone unknown
+// (fail closed) instead of fabricating a known-empty record.
+func copyFuncAssert(dst *types2.Func, assert map[string]facts.FnFact, objects ...string) {
+	if dst == nil || len(assert) == 0 {
+		return
+	}
+	for _, o := range objects {
+		rec, ok := assert[o]
+		if !ok || !rec.HasAssert {
+			continue
+		}
+		tp, ok1 := types2.LogosAssertMaskParse(rec.AssertTP)
+		rtp, ok2 := types2.LogosAssertMaskParse(rec.AssertRTP)
+		if !ok1 || !ok2 {
+			continue
+		}
+		dst.SetLogosAssertEffects(tp, rtp, true)
+		return
+	}
+}
+
+// ApplyFuncFacts validates the same fingerprint-verified import record
+// against canonical declarations before publishing immutable metadata.
+// It never rewrites signatures or nominal types.
+func ApplyFuncFacts(pkg *types2.Package, fns []facts.FnFact) error {
+	if pkg == nil || pkg.Scope() == nil {
+		return nil
+	}
+	objects := reachableFuncFactObjects(pkg)
+	type annotation struct {
+		fn              *types2.Func
+		tp, rtp         []byte
+		known, readonly bool
+	}
+	var pending []annotation
+	for _, rec := range fns {
+		fn := objects[rec.Object]
+		if fn == nil || (!rec.HasAssert && !rec.Readonly) {
+			continue
+		}
+		entry := annotation{fn: fn, readonly: rec.Readonly}
+		if rec.HasAssert {
+			sig := fn.Signature()
+			tp, err := checkedAssertMask(rec.AssertTP, sig.TypeParams().Len())
+			if err != nil {
+				return fmt.Errorf("logos: assertion facts for %s.%s: AssertTP: %w", pkg.Path(), rec.Object, err)
+			}
+			rtp, err := checkedAssertMask(rec.AssertRTP, sig.RecvTypeParams().Len())
+			if err != nil {
+				return fmt.Errorf("logos: assertion facts for %s.%s: AssertRTP: %w", pkg.Path(), rec.Object, err)
+			}
+			entry.tp, entry.rtp, entry.known = tp, rtp, true
+		}
+		pending = append(pending, entry)
+	}
+	for _, entry := range pending {
+		if entry.known {
+			entry.fn.SetLogosAssertEffects(entry.tp, entry.rtp, true)
+		}
+		if entry.readonly {
+			entry.fn.SetLogosReadonly(true)
+		}
+	}
+	return nil
+}
+
+// ApplyReadonlyFactsInPlace stamps structural readonly obligations directly
+// on the canonical decoded objects: no package clone, no packages
+// replacement, so every importer shares one nominal identity. Go importers
+// keep lowered Option/ConstView semantics; only the readonly bit is
+// published. The caller passes the same fingerprint-verified record that
+// produced this decode, preserving per-decode binding.
+func ApplyReadonlyFactsInPlace(pkg *types2.Package, readonlys []facts.ReadonlyFact) error {
+	if pkg == nil || pkg.Scope() == nil {
+		return nil
+	}
+	funcObjs := reachableFuncFactObjects(pkg)
+	for _, r := range readonlys {
+		if !readonlyPathHasMethod(r.Path) {
+			return fmt.Errorf("logos: bad readonly path %q (want at least one M<name> step)", r.Path)
+		}
+		var base types2.Type
+		if obj := pkg.Scope().Lookup(r.Object); obj != nil {
+			switch o := obj.(type) {
+			case *types2.TypeName:
+				base = o.Type()
+			case *types2.Func:
+				if sig, ok := o.Type().(*types2.Signature); ok {
+					base = sig
+				}
+			}
+		}
+		if base == nil {
+			if fn := funcObjs[r.Object]; fn != nil {
+				if sig, ok := fn.Type().(*types2.Signature); ok {
+					base = sig
+				}
+			}
+		}
+		if base == nil {
+			continue
+		}
+		target, err := readonlyResolveTarget(base, strings.Split(r.Path, "."), make(map[types2.Type]bool))
+		if err != nil {
+			return fmt.Errorf("logos: readonly %s: %w", r.Object, err)
+		}
+		if target == nil {
+			continue
+		}
+		if target.Pkg() != pkg {
+			continue
+		}
+		target.SetLogosReadonly(true)
+	}
+	return nil
+}
+
+func checkedAssertMask(mask string, arity int) ([]byte, error) {
+	top, ok := facts.HighestAssertBit(mask)
+	if !ok {
+		return nil, fmt.Errorf("invalid mask %q", mask)
+	}
+	if top >= arity {
+		return nil, fmt.Errorf("mask %q exceeds declaration arity %d", mask, arity)
+	}
+	parsed, ok := types2.LogosAssertMaskParse(mask)
+	if !ok {
+		return nil, fmt.Errorf("invalid mask %q", mask)
+	}
+	return parsed, nil
+}
+
+// Imported private types may only occur in exported signatures, fields,
+// bounds, aliases, or embedded types, without entries in pkg.Scope.
+// Unified export also exposes generic-method keys ("T.M", "(*T).M")
+// in the lazy scope. Those are not package declarations: Lookup would
+// choose ObjFunc decoding, which explicitly rejects generic methods.
+// Methods are loaded only through their canonical Named origin below.
+// Reuse the structural-reference walk without allocating overlay shells.
+func reachableFuncFactObjects(pkg *types2.Package) map[string]*types2.Func {
+	objects := make(map[string]*types2.Func)
+	graph := &overlayGraph{orig: pkg, nodes: make(map[types2.Type]bool)}
+	refs := make(map[types2.Type]bool)
+	seen := make(map[types2.Type]bool)
+	visit := func(t types2.Type) { graph.references(t, refs, seen) }
+	for _, name := range pkg.Scope().Names() {
+		if strings.Contains(name, ".") {
+			continue
+		}
+		obj := pkg.Scope().Lookup(name)
+		if fn, ok := obj.(*types2.Func); ok {
+			objects[name] = fn.Origin()
+		}
+		visit(obj.Type())
+	}
+	visited := make(map[types2.Type]bool)
+	for {
+		progress := false
+		for node := range graph.nodes {
+			if visited[node] {
+				continue
+			}
+			visited[node], progress = true, true
+			switch n := node.(type) {
+			case *types2.Named:
+				collectNamedFuncFacts(n, objects, visit)
+			case *types2.Alias:
+				visit(n.Rhs())
+				for i := range n.TypeParams().Len() {
+					visit(n.TypeParams().At(i).Constraint())
+				}
+			}
+		}
+		if !progress {
+			return objects
+		}
+	}
+}
+
+func collectNamedFuncFacts(n *types2.Named, objects map[string]*types2.Func, visit func(types2.Type)) {
+	n = n.Origin()
+	visit(n.Underlying())
+	for i := range n.TypeParams().Len() {
+		visit(n.TypeParams().At(i).Constraint())
+	}
+	for i := range n.NumMethods() {
+		m := n.Method(i).Origin()
+		objects[methodObject(n.Obj().Name(), m.Signature().Recv(), m.Name())] = m
+		visit(m.Type())
+	}
+	if iface, ok := n.Underlying().(*types2.Interface); ok {
+		for i := range iface.NumExplicitMethods() {
+			m := iface.ExplicitMethod(i).Origin()
+			objects[n.Obj().Name()+"."+m.Name()] = m
+			visit(m.Type())
+		}
+	}
+}
+
 func CloneWithOverlay(orig *types2.Package, opts []facts.PathFact) *types2.Package {
 	return CloneWithOverlays(orig, opts, nil)
+}
+
+func CloneWithOverlaysAndReadonly(orig *types2.Package, opts, consts []facts.PathFact, fns []facts.FnFact, readonlys []facts.ReadonlyFact) (*types2.Package, error) {
+	if err := ApplyFuncFacts(orig, fns); err != nil {
+		return nil, err
+	}
+	readonly := readonlyObjects(fns)
+	assert := assertObjects(fns)
+	if len(opts) == 0 && len(consts) == 0 {
+		if err := ApplyReadonlyFactsInPlace(orig, readonlys); err != nil {
+			return nil, err
+		}
+		return orig, nil
+	}
+	if orig == nil {
+		return orig, nil
+	}
+	byObj := make(map[string][]qualPath)
+	add := func(f facts.PathFact, q qualKind) {
+		if f.Object != "" && f.Path != "" {
+			byObj[f.Object] = append(byObj[f.Object], qualPath{path: f.Path, qual: q})
+		}
+	}
+	for _, o := range opts {
+		add(o, qualOption)
+	}
+	for _, c := range consts {
+		add(c, qualConst)
+	}
+	byReadonly := make(map[string][]string)
+	for _, r := range readonlys {
+		if r.Object != "" && r.Path != "" {
+			byReadonly[r.Object] = append(byReadonly[r.Object], r.Path)
+		}
+	}
+	if len(byObj) == 0 && len(readonly) == 0 && len(byReadonly) == 0 && len(assert) == 0 {
+		return orig, nil
+	}
+	return clonePackageWithOverlays(orig, byObj, readonly, byReadonly, assert)
+}
+
+func applyReadonlyToUnderlying(pkg *types2.Package, owner string, u types2.Type, readonly map[string]bool) types2.Type {
+	if len(readonly) == 0 {
+		return u
+	}
+	iface, ok := u.(*types2.Interface)
+	if !ok {
+		return u
+	}
+	need := false
+	for i := range iface.NumExplicitMethods() {
+		m := iface.ExplicitMethod(i)
+		if m == nil {
+			continue
+		}
+		if readonly[owner+"."+m.Name()] && !m.LogosReadonly() {
+			need = true
+			break
+		}
+	}
+	if !need {
+		return u
+	}
+	methods := make([]*types2.Func, iface.NumExplicitMethods())
+	for i := range iface.NumExplicitMethods() {
+		m := iface.ExplicitMethod(i)
+		methods[i] = m
+		if m == nil {
+			continue
+		}
+		if !readonly[owner+"."+m.Name()] {
+			continue
+		}
+		if m.LogosReadonly() {
+			continue
+		}
+		sig, ok := m.Type().(*types2.Signature)
+		if !ok {
+			continue
+		}
+		nf := types2.NewFunc(m.Pos(), pkg, m.Name(), sig)
+		copyFuncReadonly(nf, m)
+		nf.SetLogosReadonly(true)
+		methods[i] = nf
+	}
+	embeddeds := make([]types2.Type, iface.NumEmbeddeds())
+	for i := range iface.NumEmbeddeds() {
+		embeddeds[i] = iface.EmbeddedType(i)
+	}
+	return types2.NewInterfaceType(methods, embeddeds)
+}
+
+func markReadonlyOwnersAffected(g *overlayGraph) {
+	if len(g.readonly) == 0 {
+		return
+	}
+	owners := make(map[string]bool, len(g.readonly))
+	for key := range g.readonly {
+		owners[ownerBase(key)] = true
+	}
+	for node := range g.nodes {
+		var name string
+		switch n := node.(type) {
+		case *types2.Named:
+			name = n.Obj().Name()
+		case *types2.Alias:
+			name = n.Obj().Name()
+		default:
+			continue
+		}
+		if owners[name] {
+			g.affected[node] = true
+		}
+	}
+}
+
+// markAssertOwnersAffected marks the nominals owning assert-recorded
+// methods affected so an assert-only member still rebuilds their shells
+// and methods. Package-level function records name no nominal and need no
+// marking; insertOverlayFunc clones those directly.
+func markAssertOwnersAffected(g *overlayGraph) {
+	if len(g.assert) == 0 {
+		return
+	}
+	owners := make(map[string]bool, len(g.assert))
+	for key := range g.assert {
+		owners[ownerBase(key)] = true
+	}
+	for node := range g.nodes {
+		var name string
+		switch n := node.(type) {
+		case *types2.Named:
+			name = n.Obj().Name()
+		case *types2.Alias:
+			name = n.Obj().Name()
+		default:
+			continue
+		}
+		if owners[name] {
+			g.affected[node] = true
+		}
+	}
+}
+
+func ownerBase(object string) string {
+	base := object
+	if before, _, ok := strings.CutLast(base, "."); ok {
+		base = before
+	}
+	if rest, ok := strings.CutPrefix(base, "("); ok {
+		base = rest
+	}
+	if rest, ok := strings.CutPrefix(base, "*"); ok {
+		base = rest
+	}
+	if rest, ok := strings.CutSuffix(base, ")"); ok {
+		base = rest
+	}
+	if rest, ok := strings.CutPrefix(base, "*"); ok {
+		base = rest
+	}
+	return base
 }
 
 // CloneWithOverlays rebuilds the exported declarations named by opts as
@@ -333,24 +737,29 @@ func CloneWithOverlay(orig *types2.Package, opts []facts.PathFact) *types2.Packa
 // const views are plain (ConstMap false): the facts carry no const-map
 // mark, so none is invented.
 func CloneWithOverlays(orig *types2.Package, opts, consts []facts.PathFact) *types2.Package {
-	if orig == nil || (len(opts) == 0 && len(consts) == 0) {
-		return orig
+	cloned, err := clonePackageWithOverlays(orig, qualByObj(opts, consts), nil, nil, nil)
+	if err != nil {
+		panic("overlay qual-only rebuild invariant violated: " + err.Error())
 	}
+	return cloned
+}
+
+func qualByObj(opts, consts []facts.PathFact) map[string][]qualPath {
 	byObj := make(map[string][]qualPath)
-	add := func(f facts.PathFact, q qualKind) {
-		if f.Object != "" && f.Path != "" {
-			byObj[f.Object] = append(byObj[f.Object], qualPath{path: f.Path, qual: q})
+	for _, o := range opts {
+		if o.Object != "" && o.Path != "" {
+			byObj[o.Object] = append(byObj[o.Object], qualPath{path: o.Path, qual: qualOption})
 		}
 	}
-	for _, o := range opts {
-		add(o, qualOption)
-	}
 	for _, c := range consts {
-		add(c, qualConst)
+		if c.Object != "" && c.Path != "" {
+			byObj[c.Object] = append(byObj[c.Object], qualPath{path: c.Path, qual: qualConst})
+		}
 	}
-	if len(byObj) == 0 {
-		return orig
-	}
+	return byObj
+}
+
+func clonePackageWithOverlays(orig *types2.Package, byObj map[string][]qualPath, readonly map[string]bool, byReadonly map[string][]string, assert map[string]facts.FnFact) (*types2.Package, error) {
 	for obj := range byObj {
 		paths := byObj[obj]
 		slices.SortStableFunc(paths, func(a, b qualPath) int {
@@ -363,59 +772,137 @@ func CloneWithOverlays(orig *types2.Package, opts, consts []facts.PathFact) *typ
 			return int(a.qual) - int(b.qual)
 		})
 	}
+	for obj := range byReadonly {
+		slices.Sort(byReadonly[obj])
+	}
 	out := types2.NewPackage(orig.Path(), orig.Name())
 	out.SetImports(orig.Imports())
 	graph := newOverlayGraph(orig, out, byObj)
-	graph.prepare()
+	graph.readonly = readonly
+	graph.assert = assert
+	for obj, paths := range byReadonly {
+		graph.readonlyPaths[obj] = slices.Clone(paths)
+	}
+	if err := graph.prepare(); err != nil {
+		return nil, err
+	}
 	for _, name := range orig.Scope().Names() {
-		obj := orig.Scope().Lookup(name)
-		switch obj := obj.(type) {
-		case *types2.TypeName:
-			t := substType(graph.sub, obj.Type())
-			if t != obj.Type() {
-				switch t := t.(type) {
-				case *types2.Named:
-					out.Scope().Insert(t.Obj())
-				case *types2.Alias:
-					out.Scope().Insert(t.Obj())
-				default:
-					out.Scope().Insert(types2.NewTypeName(obj.Pos(), out, obj.Name(), t))
-				}
-			} else {
-				out.Scope().Insert(obj)
-			}
-		case *types2.Func:
-			sig := substSignature(graph.sub, obj.Type().(*types2.Signature))
-			for _, p := range byObj[name] {
-				sig = wrapAtQual(out, sig, strings.Split(p.path, "."), p.qual).(*types2.Signature)
-			}
-			if sig == obj.Type() {
-				out.Scope().Insert(obj)
-			} else {
-				out.Scope().Insert(types2.NewFunc(obj.Pos(), out, obj.Name(), sig))
-			}
-		case *types2.Const:
-			t := substType(graph.sub, obj.Type())
-			if t == obj.Type() {
-				out.Scope().Insert(obj)
-			} else {
-				out.Scope().Insert(types2.NewConst(obj.Pos(), out, obj.Name(), t, obj.Val()))
-			}
-		case *types2.Var:
-			t := substType(graph.sub, obj.Type())
-			if t == obj.Type() {
-				out.Scope().Insert(obj)
-			} else {
-				v := types2.NewVar(obj.Pos(), out, obj.Name(), t)
-				v.SetKind(obj.Kind())
-				out.Scope().Insert(v)
-			}
-		default:
-			out.Scope().Insert(obj)
+		if strings.Contains(name, ".") {
+			continue
+		}
+		if err := insertOverlayDecl(out, graph, byObj, readonly, assert, name); err != nil {
+			return nil, err
 		}
 	}
 	out.MarkComplete()
-	return out
+	return out, nil
+}
+
+func insertOverlayDecl(out *types2.Package, graph *overlayGraph, byObj map[string][]qualPath, readonly map[string]bool, assert map[string]facts.FnFact, name string) error {
+	obj := graph.orig.Scope().Lookup(name)
+	switch obj := obj.(type) {
+	case *types2.TypeName:
+		return insertOverlayTypeName(out, graph, obj, name)
+	case *types2.Func:
+		return insertOverlayFunc(out, graph, byObj, readonly, assert, obj, name)
+	case *types2.Const:
+		t := substType(graph.sub, obj.Type())
+		if t == obj.Type() {
+			out.Scope().Insert(obj)
+			return nil
+		}
+		out.Scope().Insert(types2.NewConst(obj.Pos(), out, obj.Name(), t, obj.Val()))
+		return nil
+	case *types2.Var:
+		t := substType(graph.sub, obj.Type())
+		if t == obj.Type() {
+			out.Scope().Insert(obj)
+			return nil
+		}
+		v := types2.NewVar(obj.Pos(), out, obj.Name(), t)
+		v.SetKind(obj.Kind())
+		out.Scope().Insert(v)
+		return nil
+	default:
+		out.Scope().Insert(obj)
+		return nil
+	}
+}
+
+func insertOverlayTypeName(out *types2.Package, graph *overlayGraph, obj *types2.TypeName, name string) error {
+	t := substType(graph.sub, obj.Type())
+	if paths := graph.readonlyPaths[name]; len(paths) != 0 {
+		var err error
+		t, err = applyReadonlyPaths(graph.sub.pkg, graph.orig, t, paths)
+		if err != nil {
+			return fmt.Errorf("logos: readonly %s: %w", name, err)
+		}
+	}
+	if t == obj.Type() {
+		out.Scope().Insert(obj)
+		return nil
+	}
+	switch t := t.(type) {
+	case *types2.Named:
+		out.Scope().Insert(t.Obj())
+	case *types2.Alias:
+		out.Scope().Insert(t.Obj())
+	default:
+		out.Scope().Insert(types2.NewTypeName(obj.Pos(), out, obj.Name(), t))
+	}
+	return nil
+}
+
+func insertOverlayFunc(out *types2.Package, graph *overlayGraph, byObj map[string][]qualPath, readonly map[string]bool, assert map[string]facts.FnFact, obj *types2.Func, name string) error {
+	sig, ok := obj.Type().(*types2.Signature)
+	if !ok {
+		out.Scope().Insert(obj)
+		return nil
+	}
+	sig = substSignature(graph.sub, sig)
+	for _, p := range byObj[name] {
+		sig = wrapAtQual(out, sig, strings.Split(p.path, "."), p.qual).(*types2.Signature)
+	}
+	if paths := graph.readonlyPaths[name]; len(paths) != 0 {
+		cur, err := applyReadonlyPaths(graph.sub.pkg, graph.orig, sig, paths)
+		if err != nil {
+			return fmt.Errorf("logos: readonly %s: %w", name, err)
+		}
+		nsig, ok := cur.(*types2.Signature)
+		if !ok {
+			return fmt.Errorf("logos: readonly %s: path does not select signature", name)
+		}
+		sig = nsig
+	}
+	needReadonly := readonly[name] && !obj.LogosReadonly()
+	_, needAssert := assert[name]
+	if sig == obj.Type().(*types2.Signature) && !needReadonly && !needAssert {
+		out.Scope().Insert(obj)
+		return nil
+	}
+	nf := types2.NewFunc(obj.Pos(), out, obj.Name(), sig)
+	copyFuncReadonly(nf, obj)
+	copyFuncAssert(nf, assert, name)
+	if readonly[name] {
+		nf.SetLogosReadonly(true)
+	}
+	out.Scope().Insert(nf)
+	return nil
+}
+
+func applyReadonlyPaths(pkg *types2.Package, orig *types2.Package, t types2.Type, paths []string) (types2.Type, error) {
+	cur := t
+	for _, p := range paths {
+		if !readonlyPathHasMethod(p) {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want at least one M<name> step)", p)
+		}
+		var err error
+		cur, err = markReadonlyAtPath(pkg, orig, cur, strings.Split(p, "."))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return cur, nil
 }
 
 // overlayGraph owns the nominal closure for one imported package view.
@@ -423,19 +910,23 @@ func CloneWithOverlays(orig *types2.Package, opts, consts []facts.PathFact) *typ
 // rebuilt. Thus recursive and mutually recursive references always resolve
 // to the same nominal, including references from declarations without facts.
 type overlayGraph struct {
-	orig     *types2.Package
-	sub      *typeSubst
-	paths    map[string][]qualPath
-	nodes    map[types2.Type]bool
-	deps     map[types2.Type]map[types2.Type]bool
-	affected map[types2.Type]bool
+	orig          *types2.Package
+	sub           *typeSubst
+	paths         map[string][]qualPath
+	readonly      map[string]bool
+	assert        map[string]facts.FnFact
+	readonlyPaths map[string][]string
+	nodes         map[types2.Type]bool
+	deps          map[types2.Type]map[types2.Type]bool
+	affected      map[types2.Type]bool
 }
 
 func newOverlayGraph(orig, pkg *types2.Package, paths map[string][]qualPath) *overlayGraph {
 	return &overlayGraph{
 		orig: orig, paths: paths,
-		sub:   &typeSubst{pkg: pkg, named: make(map[*types2.Named]*types2.Named), aliases: make(map[*types2.Alias]*types2.Alias), tparams: make(map[*types2.TypeParam]*types2.TypeParam)},
-		nodes: make(map[types2.Type]bool), deps: make(map[types2.Type]map[types2.Type]bool), affected: make(map[types2.Type]bool),
+		readonlyPaths: make(map[string][]string),
+		sub:           &typeSubst{pkg: pkg, named: make(map[*types2.Named]*types2.Named), aliases: make(map[*types2.Alias]*types2.Alias), tparams: make(map[*types2.TypeParam]*types2.TypeParam)},
+		nodes:         make(map[types2.Type]bool), deps: make(map[types2.Type]map[types2.Type]bool), affected: make(map[types2.Type]bool),
 	}
 }
 
@@ -633,18 +1124,902 @@ func (g *overlayGraph) routeObject(object string, t types2.Type) {
 	}
 }
 
-func (g *overlayGraph) prepare() {
+func (g *overlayGraph) routeReadonly(t types2.Type, steps []string, seen map[types2.Type]bool) {
+	if t == nil || len(steps) == 0 || seen[t] {
+		return
+	}
+	if _, ok := t.(*types2.Named); ok {
+		seen[t] = true
+		defer delete(seen, t)
+	}
+	if _, ok := t.(*types2.Alias); ok {
+		seen[t] = true
+		defer delete(seen, t)
+	}
+	if _, ok := t.(*types2.Interface); ok {
+		seen[t] = true
+		defer delete(seen, t)
+	}
+	if n, ok := t.(*types2.Named); ok {
+		if n.Obj().Pkg() != g.orig {
+			return
+		}
+		name := n.Origin().Obj().Name()
+		p := joinPath(steps)
+		if !slices.Contains(g.readonlyPaths[name], p) {
+			g.readonlyPaths[name] = append(g.readonlyPaths[name], p)
+		}
+		if len(steps[0]) > 1 && steps[0][0] == 'G' {
+			idx, ok := parsePathIndex(steps[0][1:])
+			if !ok {
+				return
+			}
+			tp := n.TypeParams()
+			if tp == nil || idx < 0 || idx >= tp.Len() {
+				return
+			}
+			g.routeReadonly(tp.At(idx).Constraint(), steps[1:], seen)
+			return
+		}
+		g.routeReadonly(n.Underlying(), steps, seen)
+		return
+	}
+	if a, ok := t.(*types2.Alias); ok {
+		if len(steps[0]) > 1 && steps[0][0] == 'G' {
+			idx, ok := parsePathIndex(steps[0][1:])
+			if !ok {
+				return
+			}
+			tp := a.TypeParams()
+			if tp == nil || idx < 0 || idx >= tp.Len() {
+				return
+			}
+			g.routeReadonly(tp.At(idx).Constraint(), steps[1:], seen)
+			return
+		}
+		g.routeReadonly(a.Rhs(), steps, seen)
+		return
+	}
+	if p, ok := t.(*types2.TypeParam); ok {
+		g.routeReadonly(p.Constraint(), steps, seen)
+		return
+	}
+	head, rest := steps[0], steps[1:]
+	if o := optAsOption(t); o != nil {
+		if head == "E" {
+			g.routeReadonly(o.Elem, rest, seen)
+		}
+		return
+	}
+	if c := constAsView(t); c != nil {
+		if head == "E" {
+			g.routeReadonly(c.Elem, rest, seen)
+		}
+		return
+	}
+	switch u := types2.Unalias(t).(type) {
+	case *types2.Pointer:
+		if head == "D" {
+			g.routeReadonly(u.Elem(), rest, seen)
+		}
+	case *types2.Chan:
+		if head == "D" {
+			g.routeReadonly(u.Elem(), rest, seen)
+		}
+	case *types2.Slice:
+		if head == "E" {
+			g.routeReadonly(u.Elem(), rest, seen)
+		}
+	case *types2.Array:
+		if head == "E" {
+			g.routeReadonly(u.Elem(), rest, seen)
+		}
+	case *types2.Map:
+		if head == "K" {
+			g.routeReadonly(u.Key(), rest, seen)
+		}
+		if head == "E" {
+			g.routeReadonly(u.Elem(), rest, seen)
+		}
+	case *types2.Struct:
+		if len(head) < 2 || head[0] != 'F' {
+			return
+		}
+		for i := range u.NumFields() {
+			if f := u.Field(i); f.Name() == head[1:] {
+				g.routeReadonly(f.Type(), rest, seen)
+				return
+			}
+		}
+	case *types2.Interface:
+		if len(head) >= 2 && head[0] == 'M' {
+			for i := range u.NumExplicitMethods() {
+				if m := u.ExplicitMethod(i); m.Name() == head[1:] {
+					g.routeReadonly(m.Type(), rest, seen)
+					return
+				}
+			}
+			for i := range u.NumEmbeddeds() {
+				g.routeReadonly(u.EmbeddedType(i), steps, seen)
+			}
+			return
+		}
+		if head == "E" {
+			return
+		}
+	case *types2.Signature:
+		if len(head) >= 2 {
+			switch head[0] {
+			case 'P', 'R':
+				idx, ok := parsePathIndex(head[1:])
+				if !ok {
+					return
+				}
+				var tup *types2.Tuple
+				if head[0] == 'P' {
+					tup = u.Params()
+				} else {
+					tup = u.Results()
+				}
+				if tup != nil && idx >= 0 && idx < tup.Len() {
+					g.routeReadonly(tup.At(idx).Type(), rest, seen)
+				}
+				return
+			case 'G', 'H':
+				idx, ok := parsePathIndex(head[1:])
+				if !ok {
+					return
+				}
+				var list *types2.TypeParamList
+				if head[0] == 'G' {
+					list = u.TypeParams()
+				} else {
+					list = u.RecvTypeParams()
+				}
+				if list != nil && idx >= 0 && idx < list.Len() {
+					g.routeReadonly(list.At(idx).Constraint(), rest, seen)
+				}
+				return
+			}
+		}
+	case *types2.Tuple:
+		idx, ok := parsePathIndex(head[1:])
+		if !ok || len(head) < 2 || head[0] != 'T' {
+			return
+		}
+		if idx >= 0 && idx < u.Len() {
+			g.routeReadonly(u.At(idx).Type(), rest, seen)
+		}
+	case *types2.Union:
+		for i := range u.Len() {
+			g.routeReadonly(u.Term(i).Type(), steps, seen)
+		}
+	}
+}
+
+func (g *overlayGraph) routeReadonlyObject(object string, t types2.Type) {
+	for _, p := range slices.Clone(g.readonlyPaths[object]) {
+		g.routeReadonly(t, strings.Split(p, "."), make(map[types2.Type]bool))
+	}
+}
+
+func parsePathIndex(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	v := 0
+	for i := range s {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		v = v*10 + int(s[i]-'0')
+	}
+	return v, true
+}
+
+func readonlyPathHasMethod(path string) bool {
+	for step := range strings.SplitSeq(path, ".") {
+		if len(step) > 1 && step[0] == 'M' {
+			return true
+		}
+	}
+	return false
+}
+
+func checkNominalDefer(pkg *types2.Package, orig *types2.Package, t types2.Type, steps []string) (types2.Type, error) {
+	if _, ok := t.(*types2.Alias); ok {
+		return checkNominalTarget(pkg, orig, t, steps)
+	}
+	if n, ok := t.(*types2.Named); ok {
+		if n.Obj().Pkg() == pkg {
+			return t, nil
+		}
+		return checkNominalTarget(pkg, orig, t, steps)
+	}
+	return t, nil
+}
+
+func checkNominalTarget(pkg *types2.Package, orig *types2.Package, t types2.Type, steps []string) (types2.Type, error) {
+	target, err := readonlyResolveTarget(t, steps, make(map[types2.Type]bool))
+	if err != nil {
+		return nil, err
+	}
+	if target == nil {
+		return nil, fmt.Errorf("logos: bad readonly path %q (unknown method)", joinPath(steps))
+	}
+	if target.LogosReadonly() {
+		return t, nil
+	}
+	if isLocalNominal(t, orig, pkg) {
+		return t, nil
+	}
+	return nil, fmt.Errorf("logos: bad readonly path %q (foreign method without readonly obligation)", joinPath(steps))
+}
+
+func isLocalNominal(t types2.Type, orig *types2.Package, pkg *types2.Package) bool {
+	var objPkg *types2.Package
+	switch n := t.(type) {
+	case *types2.Named:
+		if n.Obj() == nil {
+			return false
+		}
+		objPkg = n.Obj().Pkg()
+	case *types2.Alias:
+		if n.Obj() == nil {
+			return false
+		}
+		objPkg = n.Obj().Pkg()
+	default:
+		return false
+	}
+	return objPkg == orig || objPkg == pkg
+}
+
+func readonlyResolveTarget(t types2.Type, steps []string, seen map[types2.Type]bool) (*types2.Func, error) {
+	if t == nil || len(steps) == 0 || seen[t] {
+		return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+	}
+	seen[t] = true
+	defer delete(seen, t)
+	if a, ok := t.(*types2.Alias); ok {
+		if len(steps[0]) > 1 && steps[0][0] == 'G' {
+			idx, ok := parsePathIndex(steps[0][1:])
+			if !ok {
+				return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+			}
+			tp := a.TypeParams()
+			if tp == nil || idx < 0 || idx >= tp.Len() {
+				return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+			}
+			return readonlyResolveTarget(tp.At(idx).Constraint(), steps[1:], seen)
+		}
+		return readonlyResolveTarget(a.Rhs(), steps, seen)
+	}
+	if n, ok := t.(*types2.Named); ok {
+		if len(steps[0]) > 1 && steps[0][0] == 'G' {
+			idx, ok := parsePathIndex(steps[0][1:])
+			if !ok {
+				return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+			}
+			if tp := n.TypeParams(); tp != nil && idx >= 0 && idx < tp.Len() {
+				return readonlyResolveTarget(tp.At(idx).Constraint(), steps[1:], seen)
+			}
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		return readonlyResolveTarget(n.Underlying(), steps, seen)
+	}
+	if o := optAsOption(t); o != nil {
+		if steps[0] != "E" {
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		return readonlyResolveTarget(o.Elem, steps[1:], seen)
+	}
+	if c := constAsView(t); c != nil {
+		if steps[0] != "E" {
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		return readonlyResolveTarget(c.Elem, steps[1:], seen)
+	}
+	if p, ok := t.(*types2.TypeParam); ok {
+		return readonlyResolveTarget(p.Constraint(), steps, seen)
+	}
+	u := types2.Unalias(t)
+	switch u := u.(type) {
+	case *types2.Pointer:
+		if steps[0] != "D" {
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		return readonlyResolveTarget(u.Elem(), steps[1:], seen)
+	case *types2.Chan:
+		if steps[0] != "D" {
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		return readonlyResolveTarget(u.Elem(), steps[1:], seen)
+	case *types2.Slice:
+		if steps[0] != "E" {
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		return readonlyResolveTarget(u.Elem(), steps[1:], seen)
+	case *types2.Array:
+		if steps[0] != "E" {
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		return readonlyResolveTarget(u.Elem(), steps[1:], seen)
+	case *types2.Map:
+		if steps[0] == "K" {
+			return readonlyResolveTarget(u.Key(), steps[1:], seen)
+		}
+		if steps[0] == "E" {
+			return readonlyResolveTarget(u.Elem(), steps[1:], seen)
+		}
+		return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+	case *types2.Struct:
+		if len(steps[0]) < 2 || steps[0][0] != 'F' {
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		for i := range u.NumFields() {
+			if f := u.Field(i); f != nil && f.Name() == steps[0][1:] {
+				return readonlyResolveTarget(f.Type(), steps[1:], seen)
+			}
+		}
+		return nil, fmt.Errorf("logos: bad readonly path %q (unknown field)", joinPath(steps))
+	case *types2.Signature:
+		if len(steps[0]) < 2 {
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		switch steps[0][0] {
+		case 'P', 'R':
+			idx, ok := parsePathIndex(steps[0][1:])
+			if !ok {
+				return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+			}
+			var tup *types2.Tuple
+			if steps[0][0] == 'P' {
+				tup = u.Params()
+			} else {
+				tup = u.Results()
+			}
+			if tup == nil || idx < 0 || idx >= tup.Len() {
+				return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+			}
+			return readonlyResolveTarget(tup.At(idx).Type(), steps[1:], seen)
+		case 'G', 'H':
+			idx, ok := parsePathIndex(steps[0][1:])
+			if !ok {
+				return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+			}
+			var list *types2.TypeParamList
+			if steps[0][0] == 'G' {
+				list = u.TypeParams()
+			} else {
+				list = u.RecvTypeParams()
+			}
+			if list == nil || idx < 0 || idx >= list.Len() {
+				return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+			}
+			return readonlyResolveTarget(list.At(idx).Constraint(), steps[1:], seen)
+		default:
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+	case *types2.Interface:
+		if len(steps[0]) < 2 || steps[0][0] != 'M' {
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		name := steps[0][1:]
+		for i := range u.NumExplicitMethods() {
+			if m := u.ExplicitMethod(i); m != nil && m.Name() == name {
+				if len(steps) == 1 {
+					return m, nil
+				}
+				return readonlyResolveTarget(m.Type(), steps[1:], seen)
+			}
+		}
+		for i := range u.NumEmbeddeds() {
+			if m, err := readonlyResolveTarget(u.EmbeddedType(i), steps, seen); err == nil && m != nil {
+				return m, nil
+			}
+		}
+		return nil, fmt.Errorf("logos: bad readonly path %q (unknown method)", joinPath(steps))
+	default:
+		if n, ok := t.(*types2.Named); ok && len(steps) > 0 && len(steps[0]) > 1 && steps[0][0] == 'G' {
+			idx, ok := parsePathIndex(steps[0][1:])
+			if !ok {
+				return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+			}
+			if tp := n.TypeParams(); tp != nil && idx >= 0 && idx < tp.Len() {
+				return readonlyResolveTarget(tp.At(idx).Constraint(), steps[1:], seen)
+			}
+			return nil, fmt.Errorf("logos: bad readonly path %q", joinPath(steps))
+		}
+		return nil, fmt.Errorf("logos: bad readonly path %q (cannot descend into %T)", joinPath(steps), t)
+	}
+}
+
+func markReadonlyAtPath(pkg *types2.Package, orig *types2.Package, t types2.Type, steps []string) (types2.Type, error) {
+	if len(steps) == 0 {
+		return nil, fmt.Errorf("logos: bad readonly path (empty steps)")
+	}
+	if t == nil {
+		return nil, fmt.Errorf("logos: bad readonly path %q (nil type)", joinPath(steps))
+	}
+	if _, ok := t.(*types2.Alias); ok {
+		return checkNominalDefer(pkg, orig, t, steps)
+	}
+	if _, ok := t.(*types2.Named); ok {
+		return checkNominalDefer(pkg, orig, t, steps)
+	}
+	if o := optAsOption(t); o != nil {
+		if steps[0] != "E" {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want E through option)", joinPath(steps))
+		}
+		elem, err := markReadonlyAtPath(pkg, orig, o.Elem, steps[1:])
+		if err != nil {
+			return nil, err
+		}
+		if elem == o.Elem {
+			return t, nil
+		}
+		return &types2.Option{Elem: elem}, nil
+	}
+	if c := constAsView(t); c != nil {
+		if steps[0] != "E" {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want E through const view)", joinPath(steps))
+		}
+		elem, err := markReadonlyAtPath(pkg, orig, c.Elem, steps[1:])
+		if err != nil {
+			return nil, err
+		}
+		if elem == c.Elem {
+			return t, nil
+		}
+		return &types2.ConstView{Elem: elem, ConstMap: c.ConstMap}, nil
+	}
+	u := types2.Unalias(t)
+	switch u := u.(type) {
+	case *types2.Pointer:
+		if steps[0] != "D" {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want D through pointer)", joinPath(steps))
+		}
+		elem, err := markReadonlyAtPath(pkg, orig, u.Elem(), steps[1:])
+		if err != nil {
+			return nil, err
+		}
+		if elem == u.Elem() {
+			return t, nil
+		}
+		return types2.NewPointer(elem), nil
+	case *types2.Chan:
+		if steps[0] != "D" {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want D through channel)", joinPath(steps))
+		}
+		elem, err := markReadonlyAtPath(pkg, orig, u.Elem(), steps[1:])
+		if err != nil {
+			return nil, err
+		}
+		if elem == u.Elem() {
+			return t, nil
+		}
+		return types2.NewChan(u.Dir(), elem), nil
+	case *types2.Slice:
+		if steps[0] != "E" {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want E through slice)", joinPath(steps))
+		}
+		elem, err := markReadonlyAtPath(pkg, orig, u.Elem(), steps[1:])
+		if err != nil {
+			return nil, err
+		}
+		if elem == u.Elem() {
+			return t, nil
+		}
+		return types2.NewSlice(elem), nil
+	case *types2.Array:
+		if steps[0] != "E" {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want E through array)", joinPath(steps))
+		}
+		elem, err := markReadonlyAtPath(pkg, orig, u.Elem(), steps[1:])
+		if err != nil {
+			return nil, err
+		}
+		if elem == u.Elem() {
+			return t, nil
+		}
+		return types2.NewArray(elem, u.Len()), nil
+	case *types2.Map:
+		if steps[0] != "K" && steps[0] != "E" {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want K or E through map)", joinPath(steps))
+		}
+		if steps[0] == "K" {
+			k, err := markReadonlyAtPath(pkg, orig, u.Key(), steps[1:])
+			if err != nil {
+				return nil, err
+			}
+			if k == u.Key() {
+				return t, nil
+			}
+			return types2.NewMap(k, u.Elem()), nil
+		}
+		e, err := markReadonlyAtPath(pkg, orig, u.Elem(), steps[1:])
+		if err != nil {
+			return nil, err
+		}
+		if e == u.Elem() {
+			return t, nil
+		}
+		return types2.NewMap(u.Key(), e), nil
+	case *types2.Struct:
+		if len(steps[0]) < 2 || steps[0][0] != 'F' {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want F<name> through struct)", joinPath(steps))
+		}
+		return markReadonlyStructField(pkg, orig, u, steps[0][1:], steps[1:])
+	case *types2.Signature:
+		return markReadonlySig(pkg, orig, u, steps)
+	case *types2.Interface:
+		return markReadonlyInterface(pkg, orig, u, steps)
+	case *types2.Tuple:
+		if len(steps[0]) < 2 || steps[0][0] != 'T' {
+			return nil, fmt.Errorf("logos: bad readonly path %q (want T<i> through tuple)", joinPath(steps))
+		}
+		idx, ok := parsePathIndex(steps[0][1:])
+		if !ok || idx < 0 || idx >= u.Len() {
+			return nil, fmt.Errorf("logos: bad readonly path %q (bad tuple index)", joinPath(steps))
+		}
+		vars := make([]*types2.Var, u.Len())
+		for i := range u.Len() {
+			vars[i] = u.At(i)
+		}
+		nt, err := markReadonlyAtPath(pkg, orig, vars[idx].Type(), steps[1:])
+		if err != nil {
+			return nil, err
+		}
+		if nt == vars[idx].Type() {
+			return t, nil
+		}
+		nv := types2.NewVar(vars[idx].Pos(), pkg, vars[idx].Name(), nt)
+		nv.SetKind(vars[idx].Kind())
+		vars[idx] = nv
+		return types2.NewTuple(vars...), nil
+	case *types2.Union:
+		var terms []*types2.Term
+		changed := false
+		var firstErr error
+		deferred := false
+		for i := range u.Len() {
+			tm := u.Term(i)
+			nt, err := markReadonlyAtPath(pkg, orig, tm.Type(), steps)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			if nt != tm.Type() {
+				if terms == nil {
+					terms = make([]*types2.Term, u.Len())
+					for j := range u.Len() {
+						terms[j] = u.Term(j)
+					}
+				}
+				terms[i] = types2.NewTerm(tm.Tilde(), nt)
+				changed = true
+			} else {
+				if _, ok := types2.Unalias(tm.Type()).(*types2.Named); ok {
+					deferred = true
+				}
+				if _, ok := tm.Type().(*types2.Alias); ok {
+					deferred = true
+				}
+			}
+		}
+		if changed {
+			return types2.NewUnion(terms), nil
+		}
+		if deferred {
+			return t, nil
+		}
+		if firstErr != nil {
+			return nil, firstErr
+		}
+		return nil, fmt.Errorf("logos: bad readonly path %q (no union term matches)", joinPath(steps))
+	default:
+		return nil, fmt.Errorf("logos: bad readonly path %q (cannot descend into %T)", joinPath(steps), t)
+	}
+}
+
+func markReadonlyStructField(pkg *types2.Package, orig *types2.Package, u *types2.Struct, name string, rest []string) (types2.Type, error) {
+	idx := -1
+	for i := range u.NumFields() {
+		if f := u.Field(i); f != nil && f.Name() == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("logos: bad readonly path (unknown field %q)", name)
+	}
+	nt, err := markReadonlyAtPath(pkg, orig, u.Field(idx).Type(), rest)
+	if err != nil {
+		return nil, err
+	}
+	if nt == u.Field(idx).Type() {
+		return u, nil
+	}
+	fields := make([]*types2.Var, u.NumFields())
+	tags := make([]string, u.NumFields())
+	for i := range u.NumFields() {
+		f := u.Field(i)
+		tags[i] = u.Tag(i)
+		if i != idx {
+			fields[i] = f
+			continue
+		}
+		nf := types2.NewField(f.Pos(), pkg, f.Name(), nt, f.Embedded())
+		fields[i] = nf
+	}
+	return types2.NewStruct(fields, tags), nil
+}
+
+func markReadonlySig(pkg *types2.Package, orig *types2.Package, sig *types2.Signature, steps []string) (*types2.Signature, error) {
+	if len(steps) == 0 {
+		return nil, fmt.Errorf("logos: bad readonly path (empty signature steps)")
+	}
+	head, rest := steps[0], steps[1:]
+	if len(head) >= 2 && (head[0] == 'G' || head[0] == 'H') {
+		idx, ok := parsePathIndex(head[1:])
+		if !ok {
+			return nil, fmt.Errorf("logos: bad readonly path %q (bad type parameter index)", joinPath(steps))
+		}
+		var list *types2.TypeParamList
+		if head[0] == 'G' {
+			list = sig.TypeParams()
+		} else {
+			list = sig.RecvTypeParams()
+		}
+		if list == nil || idx < 0 || idx >= list.Len() {
+			return nil, fmt.Errorf("logos: bad readonly path %q (type parameter index out of range)", joinPath(steps))
+		}
+		inner, newT, newR := freshSigTypeParams(pkg, sig)
+		var target *types2.TypeParam
+		if head[0] == 'G' {
+			if newT == nil {
+				return nil, fmt.Errorf("logos: bad readonly path %q (no type parameters)", joinPath(steps))
+			}
+			target = newT[idx]
+		} else {
+			if newR == nil {
+				return nil, fmt.Errorf("logos: bad readonly path %q (no receiver type parameters)", joinPath(steps))
+			}
+			target = newR[idx]
+		}
+		nt, err := markReadonlyAtPath(pkg, orig, target.Constraint(), rest)
+		if err != nil {
+			return nil, err
+		}
+		if nt != target.Constraint() {
+			target.SetConstraint(nt)
+		}
+		_ = inner
+		return rebuildSigWithFresh(pkg, sig, newT, newR, inner), nil
+	}
+	if len(head) < 2 || (head[0] != 'P' && head[0] != 'R') {
+		return nil, fmt.Errorf("logos: bad readonly path %q (want P<i>, R<i>, G<i> or H<i> through signature)", joinPath(steps))
+	}
+	idx, ok := parsePathIndex(head[1:])
+	if !ok {
+		return nil, fmt.Errorf("logos: bad readonly path %q (bad signature index)", joinPath(steps))
+	}
+	inner, newT, newR := freshSigTypeParams(pkg, sig)
+	var tup *types2.Tuple
+	if head[0] == 'P' {
+		tup = substTupleFresh(inner, sig.Params())
+	} else {
+		tup = substTupleFresh(inner, sig.Results())
+	}
+	_ = newT
+	_ = newR
+	if tup == nil || idx < 0 || idx >= tup.Len() {
+		return nil, fmt.Errorf("logos: bad readonly path %q (signature index out of range)", joinPath(steps))
+	}
+	nt, err := markReadonlyAtPath(pkg, orig, tup.At(idx).Type(), rest)
+	if err != nil {
+		return nil, err
+	}
+	if nt == tup.At(idx).Type() {
+		return rebuildSigWithFresh(pkg, sig, newT, newR, inner), nil
+	}
+	vars := make([]*types2.Var, tup.Len())
+	for i := range tup.Len() {
+		vars[i] = tup.At(i)
+	}
+	nv := types2.NewVar(vars[idx].Pos(), pkg, vars[idx].Name(), nt)
+	nv.SetKind(vars[idx].Kind())
+	vars[idx] = nv
+	ntup := types2.NewTuple(vars...)
+	var params, results *types2.Tuple
+	if head[0] == 'P' {
+		params, results = ntup, substTupleFresh(inner, sig.Results())
+	} else {
+		params, results = substTupleFresh(inner, sig.Params()), ntup
+	}
+	return types2.NewSignatureType(sig.Recv(), newR, newT, params, results, sig.Variadic()), nil
+}
+
+func freshSigTypeParams(pkg *types2.Package, sig *types2.Signature) (*typeSubst, []*types2.TypeParam, []*types2.TypeParam) {
+	base := &typeSubst{pkg: pkg}
+	inner, newT := freshOwnTypeParams(base, sig.TypeParams())
+	inner, newR := freshOwnTypeParams(inner, sig.RecvTypeParams())
+	return inner, newT, newR
+}
+
+func substTupleFresh(sub *typeSubst, tup *types2.Tuple) *types2.Tuple {
+	if tup == nil {
+		return nil
+	}
+	vars := make([]*types2.Var, tup.Len())
+	for i := range tup.Len() {
+		v := tup.At(i)
+		e := substType(sub, v.Type())
+		if e == v.Type() {
+			vars[i] = v
+			continue
+		}
+		nv := types2.NewVar(v.Pos(), sub.pkg, v.Name(), e)
+		nv.SetKind(v.Kind())
+		vars[i] = nv
+	}
+	return types2.NewTuple(vars...)
+}
+
+func rebuildSigWithFresh(pkg *types2.Package, sig *types2.Signature, newT, newR []*types2.TypeParam, inner *typeSubst) *types2.Signature {
+	params := substTupleFresh(inner, sig.Params())
+	results := substTupleFresh(inner, sig.Results())
+	var nrecv *types2.Var
+	if r := sig.Recv(); r != nil {
+		rt := substType(inner, r.Type())
+		nrecv = types2.NewVar(r.Pos(), pkg, r.Name(), rt)
+		nrecv.SetKind(r.Kind())
+	}
+	if newT == nil && newR == nil && params == sig.Params() && results == sig.Results() && (sig.Recv() == nil || nrecv.Type() == sig.Recv().Type()) {
+		return sig
+	}
+	return types2.NewSignatureType(nrecv, newR, newT, params, results, sig.Variadic())
+}
+
+func markReadonlyInterface(pkg *types2.Package, orig *types2.Package, iface *types2.Interface, steps []string) (types2.Type, error) {
+	if len(steps) == 0 {
+		return nil, fmt.Errorf("logos: bad readonly path (empty interface steps)")
+	}
+	head, rest := steps[0], steps[1:]
+	if len(head) < 2 || head[0] != 'M' {
+		return nil, fmt.Errorf("logos: bad readonly path %q (want M<name> through interface)", joinPath(steps))
+	}
+	name := head[1:]
+	for i := range iface.NumExplicitMethods() {
+		m := iface.ExplicitMethod(i)
+		if m == nil || m.Name() != name {
+			continue
+		}
+		sig, ok := m.Type().(*types2.Signature)
+		if !ok {
+			return nil, fmt.Errorf("logos: bad readonly path %q (method %q not a signature)", joinPath(steps), name)
+		}
+		methods := make([]*types2.Func, iface.NumExplicitMethods())
+		for j := range iface.NumExplicitMethods() {
+			methods[j] = iface.ExplicitMethod(j)
+		}
+		if len(rest) == 0 {
+			if m.LogosReadonly() {
+				return iface, nil
+			}
+			nf := types2.NewFunc(m.Pos(), pkg, m.Name(), sig)
+			copyFuncReadonly(nf, m)
+			nf.SetLogosReadonly(true)
+			methods[i] = nf
+			embeddeds := make([]types2.Type, iface.NumEmbeddeds())
+			for j := range iface.NumEmbeddeds() {
+				embeddeds[j] = iface.EmbeddedType(j)
+			}
+			return types2.NewInterfaceType(methods, embeddeds), nil
+		}
+		nsig, err := markReadonlySig(pkg, orig, sig, rest)
+		if err != nil {
+			return nil, err
+		}
+		if nsig == sig {
+			return iface, nil
+		}
+		nf := types2.NewFunc(m.Pos(), pkg, m.Name(), nsig)
+		copyFuncReadonly(nf, m)
+		methods[i] = nf
+		embeddeds := make([]types2.Type, iface.NumEmbeddeds())
+		for j := range iface.NumEmbeddeds() {
+			embeddeds[j] = iface.EmbeddedType(j)
+		}
+		return types2.NewInterfaceType(methods, embeddeds), nil
+	}
+	for i := range iface.NumEmbeddeds() {
+		emb := iface.EmbeddedType(i)
+		if ifaceHasMethod(emb, name, make(map[types2.Type]bool)) {
+			nt, err := markReadonlyAtPath(pkg, orig, emb, steps)
+			if err != nil {
+				return nil, err
+			}
+			if nt == emb {
+				return iface, nil
+			}
+			embeddeds := make([]types2.Type, iface.NumEmbeddeds())
+			for j := range iface.NumEmbeddeds() {
+				if j == i {
+					embeddeds[j] = nt
+				} else {
+					embeddeds[j] = iface.EmbeddedType(j)
+				}
+			}
+			methods := make([]*types2.Func, iface.NumExplicitMethods())
+			for j := range iface.NumExplicitMethods() {
+				methods[j] = iface.ExplicitMethod(j)
+			}
+			return types2.NewInterfaceType(methods, embeddeds), nil
+		}
+	}
+	return nil, fmt.Errorf("logos: bad readonly path %q (unknown method %q)", joinPath(steps), name)
+}
+
+func ifaceHasMethod(t types2.Type, name string, seen map[types2.Type]bool) bool {
+	if t == nil || seen[t] {
+		return false
+	}
+	seen[t] = true
+	if a, ok := t.(*types2.Alias); ok {
+		return ifaceHasMethod(a.Rhs(), name, seen)
+	}
+	if n, ok := t.(*types2.Named); ok {
+		if u, ok := n.Underlying().(*types2.Interface); ok {
+			return ifaceHasMethod(u, name, seen)
+		}
+		return false
+	}
+	u, ok := types2.Unalias(t).(*types2.Interface)
+	if !ok {
+		return false
+	}
+	for i := range u.NumExplicitMethods() {
+		if m := u.ExplicitMethod(i); m != nil && m.Name() == name {
+			return true
+		}
+	}
+	for i := range u.NumEmbeddeds() {
+		if ifaceHasMethod(u.EmbeddedType(i), name, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *overlayGraph) prepare() error {
 	for _, name := range g.orig.Scope().Names() {
+		if strings.Contains(name, ".") {
+			continue
+		}
 		obj := g.orig.Scope().Lookup(name)
 		g.routeObject(name, obj.Type())
+		g.routeReadonlyObject(name, obj.Type())
 		if n, ok := obj.Type().(*types2.Named); ok {
 			for i := range n.NumMethods() {
 				m := n.Method(i)
-				g.routeObject(methodObject(name, m.Type().(*types2.Signature).Recv(), m.Name()), m.Type())
+				key := methodObject(name, m.Type().(*types2.Signature).Recv(), m.Name())
+				g.routeObject(key, m.Type())
+				g.routeReadonlyObject(key, m.Type())
 			}
 		}
 	}
+	for name, paths := range g.readonlyPaths {
+		slices.Sort(paths)
+		g.readonlyPaths[name] = paths
+	}
 	for _, name := range g.orig.Scope().Names() {
+		if strings.Contains(name, ".") {
+			continue
+		}
 		g.references(g.orig.Scope().Lookup(name).Type(), make(map[types2.Type]bool), make(map[types2.Type]bool))
 	}
 	for {
@@ -665,7 +2040,8 @@ func (g *overlayGraph) prepare() {
 				for i := range n.NumMethods() {
 					m := n.Method(i)
 					g.references(m.Type(), refs, seen)
-					if len(g.paths[methodObject(name, m.Type().(*types2.Signature).Recv(), m.Name())]) != 0 {
+					key := methodObject(name, m.Type().(*types2.Signature).Recv(), m.Name())
+					if len(g.paths[key]) != 0 || g.readonly[key] || len(g.readonlyPaths[key]) != 0 {
 						g.affected[node] = true
 					}
 				}
@@ -679,7 +2055,7 @@ func (g *overlayGraph) prepare() {
 					g.references(n.TypeParams().At(i).Constraint(), refs, seen)
 				}
 			}
-			if len(g.paths[name]) != 0 {
+			if len(g.paths[name]) != 0 || g.readonly[name] || len(g.readonlyPaths[name]) != 0 {
 				g.affected[node] = true
 			}
 		}
@@ -687,6 +2063,9 @@ func (g *overlayGraph) prepare() {
 			break
 		}
 	}
+	markReadonlyOwnersAffected(g)
+	markReadonlyPathsAffected(g)
+	markAssertOwnersAffected(g)
 	for {
 		changed := false
 		for node, refs := range g.deps {
@@ -714,6 +2093,24 @@ func (g *overlayGraph) prepare() {
 		})
 		g.paths[name] = paths
 	}
+	for name, paths := range g.readonlyPaths {
+		slices.Sort(paths)
+		g.readonlyPaths[name] = paths
+	}
+	for node := range g.nodes {
+		var name string
+		switch n := node.(type) {
+		case *types2.Named:
+			name = n.Obj().Name()
+		case *types2.Alias:
+			name = n.Obj().Name()
+		default:
+			continue
+		}
+		if len(g.readonlyPaths[name]) != 0 {
+			g.affected[node] = true
+		}
+	}
 	// Phase one: all defined-type shells and all their parameter identities.
 	for node := range g.affected {
 		if n, ok := node.(*types2.Named); ok {
@@ -731,8 +2128,6 @@ func (g *overlayGraph) prepare() {
 		shell.SetTypeParams(news)
 	}
 	g.sub.graph = g
-	// Aliases are acyclic RHS expressions; lazy construction resolves their
-	// dependency order while references through defined types use the shells.
 	for node := range g.affected {
 		if a, ok := node.(*types2.Alias); ok {
 			g.alias(a)
@@ -744,24 +2139,142 @@ func (g *overlayGraph) prepare() {
 			g.sub.tparams[p].SetConstraint(substType(g.sub, p.Constraint()))
 		}
 	}
-	// Phase two: fill every shell before publishing any package objects.
-	for old, shell := range g.sub.named {
-		u := substType(g.sub, old.Underlying())
-		for _, p := range g.paths[old.Obj().Name()] {
-			u = wrapAtQual(g.sub.pkg, u, strings.Split(p.path, "."), p.qual)
+	for node := range g.affected {
+		if a, ok := node.(*types2.Alias); ok {
+			if err := g.applyAliasReadonly(a); err != nil {
+				return err
+			}
 		}
-		shell.SetUnderlying(u)
+	}
+	for old, shell := range g.sub.named {
+		if err := g.fillNamedShell(old, shell); err != nil {
+			return err
+		}
 	}
 	for old, shell := range g.sub.named {
 		for i := range old.NumMethods() {
-			m := old.Method(i)
-			sig := substSignature(g.sub, m.Type().(*types2.Signature))
-			for _, p := range g.paths[methodObject(old.Obj().Name(), m.Type().(*types2.Signature).Recv(), m.Name())] {
-				sig = wrapAtQual(g.sub.pkg, sig, strings.Split(p.path, "."), p.qual).(*types2.Signature)
+			if err := g.addShellMethod(old, shell, i); err != nil {
+				return err
 			}
-			shell.AddMethod(types2.NewFunc(m.Pos(), g.sub.pkg, m.Name(), sig))
 		}
 	}
+	return nil
+}
+
+func markReadonlyPathsAffected(g *overlayGraph) {
+	owners := make(map[string]bool)
+	for key := range g.readonlyPaths {
+		owners[key] = true
+		owners[ownerBase(key)] = true
+	}
+	for node := range g.nodes {
+		var name string
+		switch n := node.(type) {
+		case *types2.Named:
+			name = n.Obj().Name()
+		case *types2.Alias:
+			name = n.Obj().Name()
+		default:
+			continue
+		}
+		if owners[name] {
+			g.affected[node] = true
+		}
+	}
+}
+
+func (g *overlayGraph) fillNamedShell(old *types2.Named, shell *types2.Named) error {
+	u := substType(g.sub, old.Underlying())
+	for _, p := range g.paths[old.Obj().Name()] {
+		u = wrapAtQual(g.sub.pkg, u, strings.Split(p.path, "."), p.qual)
+	}
+	u = applyReadonlyToUnderlying(g.sub.pkg, old.Obj().Name(), u, g.readonly)
+	structPaths, genericPaths := splitReadonlyPaths(g.readonlyPaths[old.Obj().Name()])
+	var err error
+	u, err = applyReadonlyPaths(g.sub.pkg, g.orig, u, structPaths)
+	if err != nil {
+		return err
+	}
+	if err := markShellTypeParams(g.sub.pkg, g.orig, shell, genericPaths); err != nil {
+		return err
+	}
+	shell.SetUnderlying(u)
+	return nil
+}
+
+func splitReadonlyPaths(paths []string) (structPaths []string, genericPaths []string) {
+	for _, p := range paths {
+		head, _, _ := strings.Cut(p, ".")
+		if len(head) > 1 && (head[0] == 'G' || head[0] == 'H') {
+			genericPaths = append(genericPaths, p)
+			continue
+		}
+		structPaths = append(structPaths, p)
+	}
+	return structPaths, genericPaths
+}
+
+func markShellTypeParams(pkg *types2.Package, orig *types2.Package, shell *types2.Named, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	tp := shell.TypeParams()
+	if tp == nil {
+		return fmt.Errorf("logos: bad readonly path (no type parameters on %s)", shell.Obj().Name())
+	}
+	for _, p := range paths {
+		steps := strings.Split(p, ".")
+		head := steps[0]
+		if len(head) < 2 || (head[0] != 'G' && head[0] != 'H') {
+			return fmt.Errorf("logos: bad readonly path %q (want G<i> through type)", p)
+		}
+		idx, ok := parsePathIndex(head[1:])
+		if !ok || idx < 0 || idx >= tp.Len() {
+			return fmt.Errorf("logos: bad readonly path %q (bad type parameter index)", p)
+		}
+		at := tp.At(idx)
+		nt, err := markReadonlyAtPath(pkg, orig, at.Constraint(), steps[1:])
+		if err != nil {
+			return err
+		}
+		if nt != at.Constraint() {
+			at.SetConstraint(nt)
+		}
+	}
+	return nil
+}
+
+func (g *overlayGraph) addShellMethod(old *types2.Named, shell *types2.Named, i int) error {
+	m := old.Method(i)
+	sig, ok := m.Type().(*types2.Signature)
+	if !ok {
+		shell.AddMethod(m)
+		return nil
+	}
+	sig = substSignature(g.sub, sig)
+	key := methodObject(old.Obj().Name(), m.Type().(*types2.Signature).Recv(), m.Name())
+	for _, p := range g.paths[key] {
+		sig = wrapAtQual(g.sub.pkg, sig, strings.Split(p.path, "."), p.qual).(*types2.Signature)
+	}
+	if paths := g.readonlyPaths[key]; len(paths) != 0 {
+		cur, err := applyReadonlyPaths(g.sub.pkg, g.orig, sig, paths)
+		if err != nil {
+			return fmt.Errorf("logos: readonly %s: %w", key, err)
+		}
+		nsig, ok := cur.(*types2.Signature)
+		if !ok {
+			return fmt.Errorf("logos: readonly %s: path does not select signature", key)
+		}
+		sig = nsig
+	}
+	nf := types2.NewFunc(m.Pos(), g.sub.pkg, m.Name(), sig)
+	copyFuncReadonly(nf, m)
+	copyFuncAssert(nf, g.assert, key)
+	if g.readonly[key] {
+		nf.SetLogosReadonly(true)
+	}
+	shell.AddMethod(nf)
+	return nil
 }
 
 func (g *overlayGraph) alias(a *types2.Alias) *types2.Alias {
@@ -778,6 +2291,48 @@ func (g *overlayGraph) alias(a *types2.Alias) *types2.Alias {
 	n.SetTypeParams(params)
 	g.sub.aliases[a] = n
 	return n
+}
+
+func (g *overlayGraph) applyAliasReadonly(a *types2.Alias) error {
+	n, ok := g.sub.aliases[a]
+	if !ok {
+		return fmt.Errorf("logos: readonly alias %s missing shell", a.Obj().Name())
+	}
+	paths := g.readonlyPaths[a.Obj().Name()]
+	if len(paths) == 0 {
+		return nil
+	}
+	structPaths, genericPaths := splitReadonlyPaths(paths)
+	if len(structPaths) != 0 {
+		rhs, err := applyReadonlyPaths(g.sub.pkg, g.orig, n.Rhs(), structPaths)
+		if err != nil {
+			return err
+		}
+		if rhs != n.Rhs() {
+			params := typeParamSlice(n.TypeParams())
+			nn := types2.NewAlias(types2.NewTypeName(n.Obj().Pos(), g.sub.pkg, n.Obj().Name(), nil), rhs)
+			nn.SetTypeParams(params)
+			g.sub.aliases[a] = nn
+			n = nn
+		}
+	}
+	for _, p := range genericPaths {
+		steps := strings.Split(p, ".")
+		head := steps[0]
+		params := typeParamSlice(n.TypeParams())
+		idx, ok := parsePathIndex(head[1:])
+		if !ok || idx < 0 || idx >= len(params) {
+			return fmt.Errorf("logos: bad readonly path %q (bad alias type parameter index)", p)
+		}
+		nt, err := markReadonlyAtPath(g.sub.pkg, g.orig, params[idx].Constraint(), steps[1:])
+		if err != nil {
+			return err
+		}
+		if nt != params[idx].Constraint() {
+			params[idx].SetConstraint(nt)
+		}
+	}
+	return nil
 }
 
 // typeSubst remaps rebuilt declarations to their overlay copies: tparams
@@ -955,7 +2510,9 @@ func substType(sub *typeSubst, t types2.Type) types2.Type {
 				methods[i] = m
 				continue
 			}
-			methods[i] = types2.NewFunc(m.Pos(), sub.pkg, m.Name(), ns)
+			nf := types2.NewFunc(m.Pos(), sub.pkg, m.Name(), ns)
+			copyFuncReadonly(nf, m)
+			methods[i] = nf
 			changed = true
 		}
 		embeddeds := make([]types2.Type, u.NumEmbeddeds())
@@ -1128,7 +2685,9 @@ func cloneInterfaceMethods(pkg *types2.Package, u *types2.Interface, paths []qua
 		for _, p := range qp {
 			nsig = wrapSignaturePos(pkg, nsig, strings.Split(p.path, "."), p.qual).(*types2.Signature)
 		}
-		methods[i] = types2.NewFunc(m.Pos(), pkg, m.Name(), nsig)
+		nf := types2.NewFunc(m.Pos(), pkg, m.Name(), nsig)
+		copyFuncReadonly(nf, m)
+		methods[i] = nf
 	}
 	embeddeds := make([]types2.Type, u.NumEmbeddeds())
 	for i := range u.NumEmbeddeds() {

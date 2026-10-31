@@ -10,6 +10,7 @@ import (
 	"internal/abi"
 	"internal/goarch"
 	"internal/runtime/atomic"
+	"internal/runtime/gc"
 	"unsafe"
 )
 
@@ -32,6 +33,8 @@ const (
 	LogosZgcFinal        = uint8(zgcColorFinal)
 	LogosZgcColorNibble  = uint8(zgcColorMark0 | zgcColorMark1 | zgcColorRemapped | zgcColorFinal)
 	LogosZgcMaxPageBytes = zgcMaxPageBytes
+	// LogosZgcRelocateDone is the zgcRelocateStatus of a committed copy.
+	LogosZgcRelocateDone = int(zgcRelocateDone)
 )
 
 // LogosZgcPage is the page metadata header the forwarding table lives in.
@@ -176,10 +179,26 @@ func LogosZgcAllZero(addr, n uintptr) bool {
 // LogosZgcOffHeap reports whether addr lies outside every heap span.
 func LogosZgcOffHeap(addr uintptr) bool { return spanOf(addr) == nil }
 
+// LogosZgcSpanStart returns the base of the in-use heap span holding addr,
+// and whether there is one. zgcRemap resolves an interior pointer to its
+// object start through exactly this extent, so a fixture that tests
+// interior remapping must prove its sources share a span instead of
+// assuming the allocator placed them in one. A page fixture also uses it to
+// prove a mapped region is not heap memory.
+func LogosZgcSpanStart(addr uintptr) (base uintptr, ok bool) {
+	s := spanOfHeap(addr)
+	if s == nil {
+		return 0, false
+	}
+	return s.base(), true
+}
+
 // LogosZgcNewPage creates a registered page header with a forwarding
 // table sized for nObjects.
 func LogosZgcNewPage(start, live uintptr, nObjects int) *LogosZgcPage {
-	return zgcNewPage(start, zgcPageSize, live, uintptr(nObjects))
+	pg := zgcNewPage(start, zgcPageSize, live, uintptr(nObjects))
+	logosZgcTestPages = append(logosZgcTestPages, pg)
+	return pg
 }
 
 // LogosZgcNewDetachedPage creates an unregistered header of arbitrary
@@ -188,8 +207,15 @@ func LogosZgcNewDetachedPage(size, live uintptr) *LogosZgcPage {
 	return zgcNewDetachedPage(size, live)
 }
 
-// LogosZgcFreePage unregisters and frees pg.
-func LogosZgcFreePage(pg *LogosZgcPage) { zgcFreePage(pg) }
+// LogosZgcFreePage discards pg through the drain discipline: unpublish,
+// then free the metadata immediately when no transient domain or lease
+// is live, or defer the free to the next drained retire pass while a
+// reader is held. A deferred request needs the world stopped — the
+// deferred queue is stop-the-world bookkeeping — so a world-running
+// caller holding a transient domain fails loud instead of leaking.
+func LogosZgcFreePage(pg *LogosZgcPage) {
+	zgcAbandonPage(pg)
+}
 
 // LogosZgcPageEvacuable reports whether pg is over the evacuation
 // threshold.
@@ -197,6 +223,31 @@ func LogosZgcPageEvacuable(pg *LogosZgcPage) bool { return pg.evacuable() }
 
 // LogosZgcPageFor returns the registered page containing addr.
 func LogosZgcPageFor(addr uintptr) *LogosZgcPage { return zgcPageFor(addr) }
+
+// LogosZgcPageSlotFree reports whether the directory granule holding addr
+// has no registered page or pending retiring descriptor. A pending
+// descriptor keeps its retiring tombstone in the slot until reclamation,
+// so the predicate stays false across the deferred interval.
+//
+// It is the exact predicate selection uses before it claims a granule
+// (zgcPageSlotOccupied), inverted, so a test cannot drift from the claim
+// it is trying to satisfy.
+//
+// zgcPageFor answers a narrower question: a page whose exact source ranges
+// exclude addr, or whose address sits in a gap between them, resolves to
+// nil while its slot stays occupied. A test that registers a page over a
+// granule must ask about the slot instead, because registration is per
+// granule.
+func LogosZgcPageSlotFree(addr uintptr) bool {
+	base := addr &^ (zgcPageSize - 1)
+	if base > zgcAddrMask-(zgcPageSize-1) {
+		// No granule wholly inside the address field ends here, so
+		// registration refuses it whatever the directory holds; the
+		// directory is not indexed, since base>>zgcPageShift would leave it.
+		return false
+	}
+	return !zgcPageSlotOccupied(base)
+}
 
 // LogosZgcPageAddr returns the address of the header itself.
 func LogosZgcPageAddr(pg *LogosZgcPage) uintptr { return uintptr(unsafe.Pointer(pg)) }
@@ -215,6 +266,40 @@ func LogosZgcForwardInsert(pg *LogosZgcPage, from, to uintptr) uintptr {
 // LogosZgcForward looks up the relocated address of from.
 func LogosZgcForward(pg *LogosZgcPage, from uintptr) (uintptr, bool) { return pg.forward(from) }
 
+// LogosZgcCopyOneResult runs the production claim-and-commit copy path
+// for the object at src in span i of run: the real claim, bitmap write,
+// slot finish and zgcRelocateObject commit, unmodified. The status is
+// LogosZgcRelocateDone or one of its failure siblings.
+func LogosZgcCopyOneResult(pg *LogosZgcPage, r *LogosZgcSpanRun, i int, src, size uintptr) (uintptr, int) {
+	won, st := zgcCopyOneResult(pg, r.spans[i], src, size)
+	return won, int(st)
+}
+
+// LogosZgcSetSpanSmallBits stores bits into the pointer bitmap of the
+// object slot at addr in span i of run, the fixture's way to give a
+// source object its pointer map.
+func LogosZgcSetSpanSmallBits(r *LogosZgcSpanRun, i int, addr, bits uintptr) {
+	r.spans[i].zgcSetSmallBits(addr, bits)
+}
+
+// LogosZgcSpanSmallBits reads the pointer bitmap of the object slot at
+// addr in span i of run: the exact word a scanner consults for that
+// slot.
+func LogosZgcSpanSmallBits(r *LogosZgcSpanRun, i int, addr uintptr) uintptr {
+	return r.spans[i].heapBitsSmallForAddr(addr)
+}
+
+// LogosZgcToSpaceSmallBits reads the pointer bitmap of the object slot
+// at addr in pg's i-th reserved to-space span: the exact word a scanner
+// consults for that slot once the page publishes.
+func LogosZgcToSpaceSmallBits(pg *LogosZgcPage, i int, addr uintptr) uintptr {
+	st := zgcPageStateIfAny(pg)
+	if st == nil || i < 0 || i >= len(st.toSpace) || st.toSpace[i] == nil {
+		throw("zgc test: no reserved to-space span for the bitmap read")
+	}
+	return st.toSpace[i].heapBitsSmallForAddr(addr)
+}
+
 // LogosZgcRelocate copies size bytes from to dst and publishes the
 // forwarding entry.
 func LogosZgcRelocate(pg *LogosZgcPage, from, size, dst uintptr) uintptr {
@@ -229,12 +314,35 @@ func LogosZgcRelease(pg *LogosZgcPage) bool { return zgcReleasePage(pg) }
 // completed after its release, and reports whether it did.
 func LogosZgcRetire(pg *LogosZgcPage) bool { return zgcRetirePage(pg) }
 
+// logosZgcTestPages holds the pages tests created with LogosZgcNewPage,
+// so a reset frees exactly those and never a page a collection owns.
+var logosZgcTestPages []*LogosZgcPage
+
+// LogosZgcDropTestPages frees every page a test registered, so a granule
+// an earlier test owns cannot collide with a new synthetic page. Pages
+// registered by the collector are left alone: their spans are live.
+func LogosZgcDropTestPages() {
+	pages := logosZgcTestPages
+	logosZgcTestPages = nil
+	for _, pg := range pages {
+		LogosZgcDropPage(pg)
+	}
+}
+
 // LogosZgcDropPage frees a page a test registered over memory it still
 // owns, whatever it published. The collector never does this: a page
-// with published relocations leaves only through zgcRetirePage.
+// with published relocations leaves only through zgcRetirePage. The
+// free goes through the same drain discipline as LogosZgcFreePage, so a
+// held transient reader defers the metadata free instead of racing it.
 func LogosZgcDropPage(pg *LogosZgcPage) {
+	for i, p := range logosZgcTestPages {
+		if p == pg {
+			logosZgcTestPages = append(logosZgcTestPages[:i], logosZgcTestPages[i+1:]...)
+			break
+		}
+	}
 	pg.published.Store(0)
-	zgcFreePage(pg)
+	zgcAbandonPage(pg)
 }
 
 // LogosZgcRemapDone records a completed remap pass.
@@ -464,20 +572,180 @@ func LogosZgcForeignNewG(nwords int) *LogosZgcForeignG {
 // LogosZgcForeignGSet stores one word in the synthetic foreign stack.
 func LogosZgcForeignGSet(h *LogosZgcForeignG, i int, w uintptr) { h.stack[i] = w }
 
+// LogosZgcForeignGAddr returns the address of the synthetic foreign g record.
+func LogosZgcForeignGAddr(h *LogosZgcForeignG) uintptr { return uintptr(unsafe.Pointer(h.gp)) }
+
 // LogosZgcForeignRetain runs the transitive closure over live with h as the
 // only foreign thread and returns the retained-prefix length. Negative values
 // report an invalid fixture (-1) or a marked expectClear object (-2).
 func LogosZgcForeignRetain(live []*LogosZgcPage, h *LogosZgcForeignG, mark, expectClear []uintptr) int {
+	return logosZgcForeignRetainList(live, h, mark, expectClear, []*g{h.gp}) // world running; no STW allocation below
+}
+
+// LogosZgcForeignRetainColored runs the same closure over a goroutine list
+// whose single element cell carries the remapped color on the g word: the
+// word shape an -lb self-heal can leave in an allgs backing-array entry,
+// which the foreign closure plain-loads before the gcStart rewrite. The
+// slice header is left canonical in this entry-only control case (see
+// LogosZgcForeignRetainColoredHeader for colored slice header coverage).
+// Mutable globals, including the heap-backed array of allgs, are eligible
+// for self-heal coloring by -lb mutators; readers in NoLB contexts must
+// canonicalize the slice header backing array pointer before indexing,
+// and each entry pointer before dereference. The colored word resolves to
+// live heap (the g record), so zgcCanonical strips it instead of passing
+// it through. The colored cell is built before the STW, so the closure
+// reads it deterministically before any actual GC; the swap saves allgs
+// and restores it immediately.
+func LogosZgcForeignRetainColored(live []*LogosZgcPage, h *LogosZgcForeignG, mark, expectClear []uintptr) int {
 	one := []*g{h.gp} // world running; no STW allocation below
-	zgcInitForeignRoots()
+	*(*uintptr)(unsafe.Pointer(&one[0])) = LogosZgcColored(uintptr(unsafe.Pointer(h.gp)), LogosZgcRemapped)
+	return logosZgcForeignRetainList(live, h, mark, expectClear, one)
+}
+
+// LogosZgcForeignRetainColoredHeader runs the foreign closure over a goroutine
+// list whose slice header array pointer is colored with the remapped color
+// (Level 1), while the element *g entry itself remains canonical (Level 2).
+// This directly exercises the NoLB slice header array canonicalization
+// before range indexing (PC 0x48652a fault reproduction).
+func LogosZgcForeignRetainColoredHeader(live []*LogosZgcPage, h *LogosZgcForeignG, mark, expectClear []uintptr) int {
+	one := []*g{h.gp} // world running; no STW allocation below
+	return logosZgcForeignRetainColoredHeaderList(live, h, mark, expectClear, one)
+}
+
+// LogosAllGsSnapshotSortedForGCColored runs allGsSnapshotSortedForGC under STW
+// with allgs temporarily swapped to a single colored *g entry derived from h.
+func LogosAllGsSnapshotSortedForGCColored(h *LogosZgcForeignG) ([]unsafe.Pointer, int) {
+	one := []*g{h.gp}
+	*(*uintptr)(unsafe.Pointer(&one[0])) = LogosZgcColored(uintptr(unsafe.Pointer(h.gp)), LogosZgcRemapped)
+	return logosAllGsSnapshotSortedForGCTestList(one)
+}
+
+// LogosAllGsSnapshotSortedForGCColoredHeader runs allGsSnapshotSortedForGC under STW
+// with allgs temporarily swapped to a slice whose backing array pointer itself is colored
+// (Level 1), while the element entry remains canonical.
+func LogosAllGsSnapshotSortedForGCColoredHeader(h *LogosZgcForeignG) ([]unsafe.Pointer, int) {
+	one := []*g{h.gp}
+	return logosAllGsSnapshotSortedForGCColoredHeaderTestList(one)
+}
+
+// LogosAllGsSnapshotSortedForGC runs allGsSnapshotSortedForGC under STW
+// with allgs temporarily swapped to a single uncolored *g entry derived from h.
+func LogosAllGsSnapshotSortedForGC(h *LogosZgcForeignG) ([]unsafe.Pointer, int) {
+	one := []*g{h.gp}
+	return logosAllGsSnapshotSortedForGCTestList(one)
+}
+
+// LogosGCMarkrootStackG invokes logosGCMarkrootStackG over an uncolored heap-backed
+// slice containing h.gp, returning the canonical g as unsafe.Pointer.
+func LogosGCMarkrootStackG(h *LogosZgcForeignG) unsafe.Pointer {
+	raw := new([1]*g)
+	raw[0] = h.gp
+	one := abi.Escape(raw)[:]
+	if spanOfHeap(uintptr(unsafe.Pointer(&one[0]))) == nil {
+		throw("LogosGCMarkrootStackG: backing array not on heap")
+	}
+	gp := logosGCMarkrootStackG(one, 0)
+	return unsafe.Pointer(gp)
+}
+
+// LogosGCMarkrootStackGColoredHeader invokes logosGCMarkrootStackG over a heap-backed
+// slice where the header array pointer is colored (Level 1) and the entry word is colored (Level 2),
+// verifying that both levels are canonicalized without mutating the caller's backing entry.
+func LogosGCMarkrootStackGColoredHeader(h *LogosZgcForeignG) (gpCanon unsafe.Pointer, backingEntryStillColored bool) {
+	raw := new([1]*g)
+	raw[0] = h.gp
+	one := abi.Escape(raw)[:]
+	if spanOfHeap(uintptr(unsafe.Pointer(&one[0]))) == nil {
+		throw("LogosGCMarkrootStackGColoredHeader: backing array not on heap")
+	}
+	coloredWord := LogosZgcColored(uintptr(unsafe.Pointer(h.gp)), LogosZgcRemapped)
+	*(*uintptr)(unsafe.Pointer(&one[0])) = coloredWord
+
+	hdr := (*slice)(unsafe.Pointer(&one))
+	*(*uintptr)(unsafe.Pointer(&hdr.array)) = LogosZgcColored(uintptr(hdr.array), LogosZgcRemapped)
+
+	gp := logosGCMarkrootStackG(one, 0)
+	stillColored := *(*uintptr)(unsafe.Pointer(&one[0])) == coloredWord
+	return unsafe.Pointer(gp), stillColored
+}
+
+func logosAllGsSnapshotSortedForGCTestList(gs []*g) ([]unsafe.Pointer, int) {
 	stw := stopTheWorld(stwForTestForeignRetain)
 	lock(&allglock)
 	savedGs := allgs
-	allgs = one
-	atomicstorep(unsafe.Pointer(&allgptr), unsafe.Pointer(&one[0]))
-	atomic.Storeuintptr(&allglen, 1)
+	allgs = gs
+	atomicstorep(unsafe.Pointer(&allgptr), unsafe.Pointer(&gs[0]))
+	atomic.Storeuintptr(&allglen, uintptr(len(gs)))
 	unlock(&allglock)
+	defer func() {
+		lock(&allglock)
+		allgs = savedGs
+		if len(savedGs) > 0 && &savedGs[0] != allgptr {
+			atomicstorep(unsafe.Pointer(&allgptr), unsafe.Pointer(&savedGs[0]))
+		}
+		atomic.Storeuintptr(&allglen, uintptr(len(savedGs)))
+		unlock(&allglock)
+		startTheWorld(stw)
+	}()
+	sorted, cutoff := allGsSnapshotSortedForGC()
+	out := make([]unsafe.Pointer, len(sorted))
+	for i, gp := range sorted {
+		out[i] = unsafe.Pointer(gp)
+	}
+	return out, cutoff
+}
+
+func logosAllGsSnapshotSortedForGCColoredHeaderTestList(gs []*g) ([]unsafe.Pointer, int) {
+	stw := stopTheWorld(stwForTestForeignRetain)
+	lock(&allglock)
+	savedGs := allgs
+	allgs = gs
+	atomicstorep(unsafe.Pointer(&allgptr), unsafe.Pointer(&gs[0]))
+	atomic.Storeuintptr(&allglen, uintptr(len(gs)))
+	if len(allgs) > 0 {
+		hdr := (*slice)(unsafe.Pointer(&allgs))
+		*(*uintptr)(unsafe.Pointer(&hdr.array)) = LogosZgcColored(uintptr(hdr.array), LogosZgcRemapped)
+	}
+	unlock(&allglock)
+	defer func() {
+		lock(&allglock)
+		allgs = savedGs
+		if len(savedGs) > 0 && &savedGs[0] != allgptr {
+			atomicstorep(unsafe.Pointer(&allgptr), unsafe.Pointer(&savedGs[0]))
+		}
+		atomic.Storeuintptr(&allglen, uintptr(len(savedGs)))
+		unlock(&allglock)
+		startTheWorld(stw)
+	}()
+	sorted, cutoff := allGsSnapshotSortedForGC()
+	out := make([]unsafe.Pointer, len(sorted))
+	for i, gp := range sorted {
+		out[i] = unsafe.Pointer(gp)
+	}
+	return out, cutoff
+}
+
+func logosZgcForeignRetainList(live []*LogosZgcPage, h *LogosZgcForeignG, mark, expectClear []uintptr, gs []*g) int {
+	zgcInitForeignRoots()
+	gp0 := &gs[0] // Bounds check before the world stops; every caller swaps in one element.
+	stw := stopTheWorld(stwForTestForeignRetain)
+	lock(&allglock)
+	savedGs := allgs
+	allgs = gs
+	atomicstorep(unsafe.Pointer(&allgptr), unsafe.Pointer(gp0))
+	atomic.Storeuintptr(&allglen, uintptr(len(gs)))
+	unlock(&allglock)
+	// One owner, one start: the manual restore calls below stay (a bare
+	// deferred restore once ran after a manual one and started the world
+	// twice), and the deferred call below is a no-op once a manual restore
+	// ran. A panic between stop and manual restore still restarts the
+	// world instead of leaving the next stop nested inside this one.
+	stopped := true
 	restore := func() {
+		if !stopped {
+			return
+		}
+		stopped = false
 		lock(&allglock)
 		allgs = savedGs
 		if len(savedGs) > 0 && &savedGs[0] != allgptr {
@@ -487,6 +755,7 @@ func LogosZgcForeignRetain(live []*LogosZgcPage, h *LogosZgcForeignG, mark, expe
 		unlock(&allglock)
 		startTheWorld(stw)
 	}
+	defer restore()
 	for _, addr := range mark {
 		s := spanOfHeap(addr)
 		if s == nil {
@@ -520,3 +789,690 @@ func LogosZgcForeignRetain(live []*LogosZgcPage, h *LogosZgcForeignG, mark, expe
 	restore()
 	return n
 }
+
+func logosZgcForeignRetainColoredHeaderList(live []*LogosZgcPage, h *LogosZgcForeignG, mark, expectClear []uintptr, gs []*g) int {
+	zgcInitForeignRoots()
+	gp0 := &gs[0] // Bounds check before the world stops; every caller swaps in one element.
+	stw := stopTheWorld(stwForTestForeignRetain)
+	lock(&allglock)
+	savedGs := allgs
+	allgs = gs
+	atomicstorep(unsafe.Pointer(&allgptr), unsafe.Pointer(gp0))
+	atomic.Storeuintptr(&allglen, uintptr(len(gs)))
+	if len(allgs) > 0 {
+		hdr := (*slice)(unsafe.Pointer(&allgs))
+		*(*uintptr)(unsafe.Pointer(&hdr.array)) = LogosZgcColored(uintptr(hdr.array), LogosZgcRemapped)
+	}
+	unlock(&allglock)
+	// One owner, one start: the manual restore calls below stay (a bare
+	// deferred restore once ran after a manual one and started the world
+	// twice), and the deferred call below is a no-op once a manual restore
+	// ran. A panic between stop and manual restore still restarts the
+	// world instead of leaving the next stop nested inside this one.
+	stopped := true
+	restore := func() {
+		if !stopped {
+			return
+		}
+		stopped = false
+		lock(&allglock)
+		allgs = savedGs
+		if len(savedGs) > 0 && &savedGs[0] != allgptr {
+			atomicstorep(unsafe.Pointer(&allgptr), unsafe.Pointer(&savedGs[0]))
+		}
+		atomic.Storeuintptr(&allglen, uintptr(len(savedGs)))
+		unlock(&allglock)
+		startTheWorld(stw)
+	}
+	defer restore()
+	for _, addr := range mark {
+		s := spanOfHeap(addr)
+		if s == nil {
+			restore()
+			return -1
+		}
+		idx := s.objIndex(addr)
+		if idx >= uintptr(s.nelems) {
+			restore()
+			return -1
+		}
+		s.markBitsForIndex(idx).setMarked()
+	}
+	for _, addr := range expectClear {
+		s := spanOfHeap(addr)
+		if s == nil {
+			restore()
+			return -1
+		}
+		idx := s.objIndex(addr)
+		if idx >= uintptr(s.nelems) {
+			restore()
+			return -1
+		}
+		if s.markBitsForIndex(idx).isMarked() {
+			restore()
+			return -2
+		}
+	}
+	n := zgcForeignRetainLive(live)
+	restore()
+	return n
+}
+
+// Exact source-range release seam (logos_zgc_release_ranges_test.go).
+//
+// Everything under test is the runtime's own: zgcNewPage (LogosZgcNewPage),
+// the page state selection fills and zgcPageEligible with its
+// prepareSources (LogosZgcRecordSources, LogosZgcEligible),
+// zgcRelocateObject (LogosZgcRelocate), zgcReleasePage and its madvise
+// (LogosZgcRelease) and zgcRetirePage (LogosZgcRetire). The one thing the
+// tests cannot reach from package runtime_test is an *mspan, so
+// LogosZgcAllocRun hands out real spans from the real page allocator:
+// in-use heap spans from allocSpan(spanAllocHeap) and manual spans from
+// allocManual(spanAllocStack), each with the state the allocator gave it.
+// No span field, pin, goroutine status or syscall result is written here.
+//
+// Observation limit: LogosZgcPageSources reads the private prepared range
+// table, and LogosZgcGappyPages reads the private page registry; both are
+// read-only. The public effect of the same behaviour (neighbour memory
+// survives, stacks keep their frames) is asserted separately through the
+// live heap in TestLogosZgcLiveHeapGappyReleaseKeepsNeighbours.
+
+const (
+	// LogosZgcRunHeap is an in-use heap span of 1024-byte noscan objects.
+	LogosZgcRunHeap = 0
+	// LogosZgcRunManual is a manual span, as a goroutine stack occupies.
+	LogosZgcRunManual = 1
+	// LogosZgcRunHeapScan is an in-use heap span of 1024-byte scanned
+	// objects: pointer-bearing, above MinSizeForMallocHeader, the exact
+	// span class the relocation walker admits and the malloc-header path
+	// serves.
+	LogosZgcRunHeapScan = 2
+	// LogosZgcRunHeapScanSmall is an in-use heap span of a small scanned
+	// class (64-byte objects): the pointer bitmap lives in the span heap
+	// bits and adjacent slots share one bitmap word.
+	LogosZgcRunHeapScanSmall = 3
+)
+
+// LogosZgcSpanRun is a run of adjacent spans in one 2 MB region, in the
+// address order of the kinds that asked for them. The handle keeps the
+// spans held until Free.
+type LogosZgcSpanRun struct {
+	spans  []*mspan
+	kinds  []int
+	freed  []bool
+	base   []uintptr
+	bytes  []uintptr
+	elem   []uintptr
+	nelems []uintptr
+}
+
+func logosZgcRun1024Class(noscan bool) spanClass {
+	for c, sz := range gc.SizeClassToSize {
+		if sz == 1024 {
+			return makeSpanClass(uint8(c), noscan)
+		}
+	}
+	throw("zgc test: no 1024-byte size class")
+	return 0
+}
+
+// logosZgcRunClass is the fixture's original 1024-byte noscan heap class.
+func logosZgcRunClass() spanClass { return logosZgcRun1024Class(true) }
+
+// logosZgcRunClassScan is the 1024-byte scanned heap class.
+func logosZgcRunClassScan() spanClass { return logosZgcRun1024Class(false) }
+
+// logosZgcRunClassScanSmall is a small scanned heap class (64-byte
+// objects): the pointer bitmap lives in the span heap bits and adjacent
+// slots share one bitmap word.
+func logosZgcRunClassScanSmall() spanClass {
+	for c, sz := range gc.SizeClassToSize {
+		if sz == 64 {
+			return makeSpanClass(uint8(c), false)
+		}
+	}
+	throw("zgc test: no 64-byte size class")
+	return 0
+}
+
+// zgcTestRunTight reports whether spans are all present, end to end, and
+// inside one registrable 2 MB region.
+func zgcTestRunTight(spans []*mspan) bool {
+	for _, s := range spans {
+		if s == nil {
+			return false
+		}
+	}
+	region := spans[0].base() &^ (zgcPageSize - 1)
+	if region > zgcAddrMask-(zgcPageSize-1) {
+		return false
+	}
+	for i, s := range spans {
+		end := s.base() + s.npages*pageSize
+		if s.base() < region || end > region+zgcPageSize {
+			return false
+		}
+		if i > 0 && s.base() != spans[i-1].base()+spans[i-1].npages*pageSize {
+			return false
+		}
+	}
+	return true
+}
+
+// zgcTestFreeSpan returns s to the heap. It runs on the system stack.
+func zgcTestFreeSpan(s *mspan, kind int) {
+	if kind == LogosZgcRunManual {
+		mheap_.freeManual(s, spanAllocStack)
+		return
+	}
+	atomic.Store(&s.sweepgen, mheap_.sweepgen)
+	mheap_.freeSpan(s)
+}
+
+// LogosZgcAllocRun allocates one real span for each kind, each as large
+// as a system page needs, and returns them only when they came out end to
+// end inside a single 2 MB region. The page allocator hands out the
+// lowest free pages first, so a trial that lands across a hole or a
+// region edge is held (so the next trial cannot reuse it) and retried;
+// held trials are freed before returning. It returns nil when no trial
+// was tight. The caller keeps GC off while the run is held.
+func LogosZgcAllocRun(kinds []int) *LogosZgcSpanRun {
+	zgcInitPageRegistry()
+	const trials = 256
+	unitPages := max(pageSize, physPageSize) / pageSize
+	n := len(kinds)
+	run := &LogosZgcSpanRun{
+		spans:  make([]*mspan, n),
+		freed:  make([]bool, n),
+		base:   make([]uintptr, n),
+		bytes:  make([]uintptr, n),
+		elem:   make([]uintptr, n),
+		nelems: make([]uintptr, n),
+	}
+	// kinds is copied: slices is an import cycle in package runtime.
+	run.kinds = make([]int, n)
+	copy(run.kinds, kinds)
+	cur := make([]*mspan, n)
+	junk := make([]*mspan, 0, trials*n)
+	junkKind := make([]int, 0, trials*n)
+	found := false
+	for range trials {
+		systemstack(func() {
+			for i, k := range kinds {
+				if k == LogosZgcRunManual {
+					cur[i] = mheap_.allocManual(unitPages, spanAllocStack)
+				} else {
+					class := logosZgcRunClass()
+					if k == LogosZgcRunHeapScan {
+						class = logosZgcRunClassScan()
+					} else if k == LogosZgcRunHeapScanSmall {
+						class = logosZgcRunClassScanSmall()
+					}
+					cur[i] = mheap_.allocSpan(unitPages, spanAllocHeap, class)
+				}
+			}
+		})
+		if zgcTestRunTight(cur) {
+			copy(run.spans, cur)
+			found = true
+			break
+		}
+		for i, s := range cur {
+			if s != nil {
+				junk = append(junk, s)
+				junkKind = append(junkKind, kinds[i])
+			}
+		}
+	}
+	systemstack(func() {
+		for i, s := range junk {
+			zgcTestFreeSpan(s, junkKind[i])
+		}
+	})
+	if !found {
+		return nil
+	}
+	for i, s := range run.spans {
+		run.base[i] = s.base()
+		run.bytes[i] = s.npages * pageSize
+		if k := run.kinds[i]; k == LogosZgcRunHeap || k == LogosZgcRunHeapScan || k == LogosZgcRunHeapScanSmall {
+			run.elem[i] = s.elemsize
+			run.nelems[i] = uintptr(s.nelems)
+		}
+	}
+	return run
+}
+
+// logosZgcGranuleRun wraps spans of the fixture's heap class as a run.
+// Every span carries LogosZgcRunHeap, so Occupy, Free and MarkFreed treat
+// them exactly like the spans LogosZgcAllocRun handed out.
+func logosZgcGranuleRun(spans []*mspan) *LogosZgcSpanRun {
+	run := &LogosZgcSpanRun{
+		spans:  spans,
+		freed:  make([]bool, len(spans)),
+		base:   make([]uintptr, len(spans)),
+		bytes:  make([]uintptr, len(spans)),
+		elem:   make([]uintptr, len(spans)),
+		nelems: make([]uintptr, len(spans)),
+	}
+	run.kinds = make([]int, len(spans))
+	for i, s := range spans {
+		run.kinds[i] = LogosZgcRunHeap
+		run.base[i] = s.base()
+		run.bytes[i] = s.npages * pageSize
+		run.elem[i] = s.elemsize
+		run.nelems[i] = uintptr(s.nelems)
+	}
+	return run
+}
+
+// LogosZgcAllocGranule reserves one contiguous whole-granule heap span on
+// a directory granule no page owns, by construction rather than by trial
+// luck. LogosZgcAllocRun's unit-span trials cannot do this
+// deterministically: the page cache hands out the lowest free bits first,
+// so a trial's first unit span lands at the frontier's granule-relative
+// page k and every later held trial repeats that offset — a misaligned
+// frontier stays misaligned across the whole trial budget. This seam
+// instead issues one allocSpan of exactly one granule's pages in the
+// fixture's 1024-byte class: the request bypasses the page cache into
+// the radix, and the span metadata is what allocSpan itself derives —
+// elemsize 1024, nelems 2048, inline heap bits — never manufactured. A
+// granule-aligned base is accepted when the directory slot is free;
+// tight runs on occupied granules are held, not freed — freeing would
+// lower searchAddr back onto the same granule — so the next trial walks
+// to the following granule with the frontier still aligned. A misaligned
+// base is freed and exactly the pages up to the next boundary are held
+// in its place, so the next request starts on a boundary; the calling
+// P's page cache is flushed first so neither step competes with
+// cache-hidden bits. Held spans are released before returning, on
+// success and on nil. It returns nil when eight granules were considered
+// without an acceptable one or the realignment budget ran out; the span
+// operations stay inside the old 8×256-trial envelope. The caller keeps
+// GC off while the run is held, as with LogosZgcAllocRun.
+func LogosZgcAllocGranule() *LogosZgcSpanRun {
+	zgcInitPageRegistry()
+	const granuleTrials = 8
+	granulePages := uintptr(zgcPageSize / pageSize)
+	class := logosZgcRunClass()
+
+	var junk []*mspan
+	var rejected []*LogosZgcSpanRun
+	freeHeld := func() {
+		systemstack(func() {
+			for _, s := range junk {
+				zgcTestFreeSpan(s, LogosZgcRunHeap)
+			}
+			for _, r := range rejected {
+				for i := range r.spans {
+					zgcTestFreeSpan(r.spans[i], LogosZgcRunHeap)
+				}
+			}
+		})
+	}
+	// flushPcache returns the calling P's cached page bits to the radix,
+	// so whole-granule requests and boundary advances see every free
+	// page the allocator knows about.
+	flushPcache := func() {
+		systemstack(func() {
+			lock(&mheap_.lock)
+			if pp := getg().m.p.ptr(); pp != nil {
+				pp.pcache.flush(&mheap_.pages)
+			}
+			unlock(&mheap_.lock)
+		})
+	}
+	for trial, attempts := 0, 0; trial < granuleTrials && attempts < 4*granuleTrials; attempts++ {
+		flushPcache()
+		var cand *mspan
+		systemstack(func() {
+			cand = mheap_.allocSpan(granulePages, spanAllocHeap, class)
+		})
+		if cand == nil {
+			break
+		}
+		base := cand.base()
+		if base&^(zgcPageSize-1) == base && base <= zgcAddrMask-(zgcPageSize-1) {
+			if !zgcPageSlotOccupied(base) {
+				freeHeld()
+				return logosZgcGranuleRun([]*mspan{cand})
+			}
+			// Held, not freed: freeing would lower searchAddr onto the
+			// same granule and the next trial would consider it again.
+			rejected = append(rejected, logosZgcGranuleRun([]*mspan{cand}))
+			trial++
+			continue
+		}
+		// Misaligned: free the candidate and hold exactly the pages up
+		// to the next boundary, so the next request starts on one.
+		advance := granulePages - base/pageSize%granulePages
+		var hold *mspan
+		systemstack(func() {
+			zgcTestFreeSpan(cand, LogosZgcRunHeap)
+			hold = mheap_.allocSpan(advance, spanAllocHeap, class)
+		})
+		if hold == nil {
+			break
+		}
+		junk = append(junk, hold)
+	}
+	freeHeld()
+	return nil
+}
+
+// Len returns the number of spans in the run.
+func (r *LogosZgcSpanRun) Len() int { return len(r.spans) }
+
+// Base returns the first address of span i.
+func (r *LogosZgcSpanRun) Base(i int) uintptr { return r.base[i] }
+
+// Bytes returns the size of span i.
+func (r *LogosZgcSpanRun) Bytes(i int) uintptr { return r.bytes[i] }
+
+// Elem returns the object size of heap span i.
+func (r *LogosZgcSpanRun) Elem(i int) uintptr { return r.elem[i] }
+
+// Nelems returns the object count of heap span i.
+func (r *LogosZgcSpanRun) Nelems(i int) uintptr { return r.nelems[i] }
+
+// Occupy hands out slot k of heap span i as a real allocation, with the
+// allocator's own hand-out accounting (the alloc bit, allocCount, and the
+// freeindex and alloc-cache advance) and nothing else: the pointer bitmap
+// stays the caller's to write. A fixture object built by plain stores
+// skips mallocgc, so its span does not count it; without the hand-out the
+// claim path's "a published copy leaves the source count" decrement
+// (zgcCopyOneResult) moves an uncounted span below zero, and the run's
+// later free throws on a wrapped allocCount.
+func (r *LogosZgcSpanRun) Occupy(i int, k uintptr) {
+	s := r.spans[i]
+	if r.kinds[i] == LogosZgcRunManual {
+		throw("zgc test: occupy of a manual span")
+	}
+	if k >= uintptr(s.nelems) {
+		throw("zgc test: occupy past the span end")
+	}
+	if s.allocBitsForIndex(k).isMarked() {
+		throw("zgc test: occupy of an allocated slot")
+	}
+	s.allocBitsForIndex(k).setMarkedNonAtomic()
+	s.allocCount++
+	if k >= uintptr(s.freeindex) {
+		s.freeindex = uint16(k) + 1
+		if uintptr(s.freeindex) < uintptr(s.nelems) {
+			s.refillAllocCache(s.freeindex / 8)
+			s.allocCache >>= uint(s.freeindex) % 64
+		}
+	}
+}
+
+// OccupyFresh hands out slot k of heap span i through the GC-off malloc
+// fast path (nextFreeFast): freeindex past the slot, the alloc-cache
+// refill and shift, and allocCount, with the slot's alloc bit left
+// clear — the fresh hand-out state before the next sweep swaps the mark
+// bits into allocBits. The slot must be the span's next free slot, the
+// way the fast path finds it; the heap-bit pointer map stays the
+// caller's to write, as with Occupy.
+func (r *LogosZgcSpanRun) OccupyFresh(i int, k uintptr) {
+	s := r.spans[i]
+	if r.kinds[i] == LogosZgcRunManual {
+		throw("zgc test: fresh occupy of a manual span")
+	}
+	if k >= uintptr(s.nelems) {
+		throw("zgc test: occupy past the span end")
+	}
+	if k != uintptr(s.freeindex) {
+		throw("zgc test: fresh occupy off the fast-path slot")
+	}
+	if s.allocBitsForIndex(k).isMarked() {
+		throw("zgc test: occupy of an allocated slot")
+	}
+	s.refillAllocCache(uint16(k) / 8)
+	s.allocCache >>= uint(s.freeindex) % 64
+	if v := nextFreeFast(s); v == 0 || uintptr(v) != s.base()+k*s.elemsize {
+		throw("zgc test: fresh occupy did not hand out the slot")
+	}
+}
+
+// MarkFreed records that span i was freed by the runtime itself (a
+// retired page frees its source spans), so Free skips it.
+func (r *LogosZgcSpanRun) MarkFreed(i int) { r.freed[i] = true }
+
+// Free returns span i to the heap unless it is already freed.
+func (r *LogosZgcSpanRun) Free(i int) {
+	if r.freed[i] {
+		return
+	}
+	r.freed[i] = true
+	s, k := r.spans[i], r.kinds[i]
+	systemstack(func() { zgcTestFreeSpan(s, k) })
+}
+
+// LogosZgcRecordSources records the spans of r at idx as the source spans
+// of pg, in the order given, the way zgcSelectPages does for a page it
+// selects: into the page's state list. The list is in no address order
+// (selection walks allspans), and prepareSources sorts it.
+func LogosZgcRecordSources(pg *LogosZgcPage, r *LogosZgcSpanRun, idx []int) {
+	zgcInitPageRegistry()
+	st := zgcPageState(pg)
+	st.spans = st.spans[:0]
+	for _, i := range idx {
+		st.spans = append(st.spans, r.spans[i])
+	}
+}
+
+// LogosZgcEligible runs zgcPageEligible: the selection pause's vet, which
+// prepares the exact source ranges.
+func LogosZgcEligible(pg *LogosZgcPage) bool { return zgcPageEligible(pg) }
+
+// LogosZgcWithWorldStopped runs fn with the world stopped, mirroring the
+// mark-termination/GC-start pauses that own zgcPageEligible (selection vet)
+// and zgcRetirePage (retire). Under goexperiment.staticlockranking those
+// seams assert the world is stopped; calling them with the world running
+// throws even though the same bytes pass without the tag. Relocation
+// (zgcRelocateObject) and release (zgcReleasePage) stay outside: concurrent
+// evacuators copy with the world running, and the release seam takes no
+// STW assertion, so wrapping copies would hide races the tests must keep.
+//
+// fn runs on the caller's goroutine stack, not on g0: the race build
+// leaves g0 without a race context (mp.g0.racectx = 0), so an instrumented
+// test function entering on the system stack faults in __tsan_func_enter.
+// Every seam callback drives runtime paths that wrap their own systemstack
+// sections where the heap lock demands g0 — zgcRetirePage,
+// zgcAbandonDrain, mheap.alloc — so nothing here may call a bare
+// //go:systemstack function, and fn must not allocate unboundedly: stack
+// growth and runtime locks stay legal while the world is stopped, the
+// leaf sections stay on g0 exactly like the pauses mirrored.
+func LogosZgcWithWorldStopped(fn func()) {
+	stw := stopTheWorld(stwUnknown)
+	// Exactly one start on every path: a panic in fn still restarts the
+	// world instead of leaving the next stop nested inside this one.
+	defer startTheWorld(stw)
+	fn()
+}
+
+// LogosZgcWalkAllLiveFix runs the GC-start rewrite over the real heap
+// graph: the exact logosWalkAllWith call of zgcGCStartHook
+// (logos_zgc_cycle.go), with the quarantine skip and post-sweep
+// alloc-bit liveness. Slots are rewritten only when they name an object
+// with a published copy. The world must be stopped, as in the pause
+// that owns the call.
+func LogosZgcWalkAllLiveFix() {
+	logosWalkAllWith(zgcFixSlot, logosWalkPolicy{skipSpan: zgcSpanQuarantined, useAllocBits: true})
+}
+
+// LogosZgcPageSources returns the prepared source ranges of pg as sorted
+// [lo, hi) pairs, and whether prepareSources produced them (a registered
+// page that was never prepared reports its whole region).
+func LogosZgcPageSources(pg *LogosZgcPage) (ranges [][2]uintptr, exact bool) {
+	for i := uintptr(0); i < pg.srcN; i++ {
+		r := pg.sourceRangeAt(i)
+		ranges = append(ranges, [2]uintptr{r.lo, r.hi})
+	}
+	return ranges, pg.srcExact
+}
+
+// LogosZgcNewDetachedPageAt creates an unregistered header whose region is
+// [start, start+size), for prepareSources vetting that must not claim the
+// directory slot.
+func LogosZgcNewDetachedPageAt(start, size uintptr) *LogosZgcPage {
+	return zgcAllocPage(start, size, 0, 0)
+}
+
+// LogosZgcForgetPage drops the span lists selection recorded for pg.
+func LogosZgcForgetPage(pg *LogosZgcPage) { zgcPageForget(pg) }
+
+// LogosZgcFirstMismatch returns the offset of the first byte of
+// [addr, addr+n) that is not b, or -1.
+func LogosZgcFirstMismatch(addr, n uintptr, b byte) int {
+	for i, c := range unsafe.Slice((*byte)(add(nil, addr)), n) {
+		if c != b {
+			return i
+		}
+	}
+	return -1
+}
+
+// LogosZgcByteAt reads the byte at addr.
+func LogosZgcByteAt(addr uintptr) byte { return *(*byte)(add(nil, addr)) }
+
+// LogosZgcGappyPages counts the registered pages whose prepared source
+// ranges do not cover their whole region.
+func LogosZgcGappyPages() int {
+	n := 0
+	zgcPagesLock()
+	for _, pg := range zgcAllPages {
+		if !pg.srcExact {
+			continue
+		}
+		var covered uintptr
+		for i := uintptr(0); i < pg.srcN; i++ {
+			r := pg.sourceRangeAt(i)
+			covered += r.hi - r.lo
+		}
+		if covered < pg.size {
+			n++
+		}
+	}
+	zgcPagesUnlock()
+	return n
+}
+
+// LogosZgcPageAcquire resolves addr to its relocation source page and
+// returns a leased handle: nil when addr is not a source of any
+// registered page. The caller owes exactly one LogosZgcPageRelease per
+// non-nil result, on every path.
+func LogosZgcPageAcquire(addr uintptr) *LogosZgcPage { return zgcPageAcquire(addr) }
+
+// LogosZgcPageRelease drops one lease gained by LogosZgcPageAcquire.
+func LogosZgcPageRelease(pg *LogosZgcPage) { zgcPageRelease(pg) }
+
+// LogosZgcTransientEnter opens a transient read domain: every raw
+// pointer derived inside it stays valid until the matching
+// LogosZgcTransientLeave. Test-side stand-in for a signal-stack or no-P
+// reader, including one held across a stop-the-world window.
+func LogosZgcTransientEnter() { zgcPageTransientEnter() }
+
+// LogosZgcTransientLeave closes one open transient read domain.
+func LogosZgcTransientLeave() { zgcPageTransientLeave() }
+
+// LogosZgcPublishToSpaceSpans publishes pg's filled to-space spans onto
+// the swept span sets. Stop-the-world caller: it asserts a stopped
+// world. A leased page is skipped whole, its destination list retained
+// for a later pause.
+func LogosZgcPublishToSpaceSpans(pg *LogosZgcPage) { zgcPublishToSpaceSpans(pg) }
+
+// LogosZgcReserveToSpace pre-reserves one to-space span per source span
+// of pg, the selection-pause step. Stop-the-world caller.
+func LogosZgcReserveToSpace(pg *LogosZgcPage) bool { return zgcReservePageToSpace(pg) }
+
+// LogosZgcQuarantineSource quarantines the i-th source span of pg exactly
+// as the selection pause does: it drops the marks, takes the pre-bump
+// sweepgen stamp and enters the quarantine set the walker, sweeper and
+// scan admission all consult. Stop-the-world caller.
+func LogosZgcQuarantineSource(pg *LogosZgcPage, r *LogosZgcSpanRun, i int) {
+	zgcQuarantineSpan(r.spans[i], pg)
+}
+
+// LogosZgcPageStateToSpaceLen returns how many to-space spans pg's
+// state lists: the deferred destination list a lease retains and
+// publication drains.
+func LogosZgcPageStateToSpaceLen(pg *LogosZgcPage) int {
+	st := zgcPageStateIfAny(pg)
+	if st == nil {
+		return 0
+	}
+	return len(st.toSpace)
+}
+
+// LogosZgcPageStateCursor returns pg's claim cursor.
+func LogosZgcPageStateCursor(pg *LogosZgcPage) uintptr {
+	st := zgcPageStateIfAny(pg)
+	if st == nil {
+		return 0
+	}
+	return st.cursor
+}
+
+// LogosZgcToSpaceBase returns the base of the i-th reserved to-space
+// span of pg, or 0 when pg lists no such span. It is the exact
+// destination address publication scrubs and pushes; a source span
+// base never proves the transfer.
+func LogosZgcToSpaceBase(pg *LogosZgcPage, i int) uintptr {
+	st := zgcPageStateIfAny(pg)
+	if st == nil || i < 0 || i >= len(st.toSpace) || st.toSpace[i] == nil {
+		return 0
+	}
+	return st.toSpace[i].base()
+}
+
+// LogosZgcSpanSwept reports whether the span at addr carries the current
+// sweepgen, the mark publication leaves on a pushed to-space span.
+func LogosZgcSpanSwept(addr uintptr) bool {
+	s := spanOfHeap(addr)
+	return s != nil && atomic.Load(&s.sweepgen) == mheap_.sweepgen
+}
+
+// LogosZgcRetirePendingLen returns how many descriptors — retired pages
+// and deferred headers — wait in the retire queue.
+func LogosZgcRetirePendingLen() int {
+	lock(&zgcQuarantineLock)
+	n := len(zgcRetirePending)
+	unlock(&zgcQuarantineLock)
+	return n
+}
+
+// LogosZgcRetirePendingRegionCount returns how many queued descriptors
+// name the directory granule holding addr. It observes the real pending
+// queue, rather than a test counter, to catch duplicate descriptors for a
+// region while a transient acquisition domain keeps reclamation open.
+func LogosZgcRetirePendingRegionCount(addr uintptr) int {
+	base := addr &^ (zgcPageSize - 1)
+	lock(&zgcQuarantineLock)
+	n := 0
+	for _, pg := range zgcRetirePending {
+		if pg.start == base {
+			n++
+		}
+	}
+	unlock(&zgcQuarantineLock)
+	return n
+}
+
+// LogosZgcClaimGranule is a test seam for the authoritative directory
+// claim used by selection. It intentionally delegates directly to
+// zgcClaimPage: a held registered or retiring slot returns nil, and the
+// detached candidate allocated by that failed claim is freed by the
+// production failure path. A successful result is a freshly registered
+// page the caller must abandon or retire. The caller must hold the world
+// stopped.
+func LogosZgcClaimGranule(base, live uintptr, nObjects int) *LogosZgcPage {
+	pg, ok := zgcClaimPage(base, zgcPageSize, live, uintptr(nObjects))
+	if !ok {
+		return nil
+	}
+	return pg
+}
+
+// LogosZgcDrainRetirePending runs the pending-queue consumer once.
+// Stop-the-world caller: it asserts a stopped world.
+func LogosZgcDrainRetirePending() { zgcRetirePendingDrain() }

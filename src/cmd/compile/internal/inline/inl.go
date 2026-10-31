@@ -303,23 +303,45 @@ func CanInline(fn *ir.Func, profile *pgoir.Profile) {
 	}
 
 	if visitor.tooHairy(fn) {
+		if visitor.budget < 0 {
+			if retryBudget := logosConservativeBudget(fn); retryBudget > 0 {
+				visitor2 := hairyVisitor{
+					curFunc:           fn,
+					debug:             visitor.debug,
+					isBigFunc:         visitor.isBigFunc,
+					budget:            retryBudget,
+					maxBudget:         retryBudget,
+					extraCallCost:     cc,
+					profile:           profile,
+					dbg:               dbg,
+					conservativeCalls: true,
+				}
+				if !visitor2.tooHairy(fn) {
+					visitor = visitor2
+					goto inlinable
+				}
+			}
+		}
 		reason = visitor.reason
 		if dbg {
 			ir.AstDump(fn, "inline, too hairy because "+visitor.reason+", "+ir.FuncName(fn))
 		}
 		return
-	} else if dbg {
+	}
+
+inlinable:
+	if dbg {
 		ir.AstDump(fn, "inline, OK, "+ir.FuncName(fn))
 	}
 
 	n.Func.Inl = &ir.Inline{
-		Cost:            budget - visitor.budget,
+		Cost:            visitor.maxBudget - visitor.budget,
 		Dcl:             pruneUnusedAutos(n.Func.Dcl, &visitor),
 		HaveDcl:         true,
 		CanDelayResults: canDelayResults(fn),
 	}
 	if base.Flag.LowerM != 0 || logopt.Enabled() {
-		noteInlinableFunc(n, fn, budget-visitor.budget)
+		noteInlinableFunc(n, fn, visitor.maxBudget-visitor.budget)
 	}
 }
 
@@ -443,17 +465,18 @@ func canDelayResults(fn *ir.Func) bool {
 // hairiness and whether or not it can be inlined.
 type hairyVisitor struct {
 	// This is needed to access the current caller in the doNode function.
-	curFunc       *ir.Func
-	isBigFunc     bool
-	debug         bool
-	budget        int32
-	maxBudget     int32
-	reason        string
-	extraCallCost int32
-	usedLocals    ir.NameSet
-	do            func(ir.Node) bool
-	profile       *pgoir.Profile
-	dbg           bool
+	curFunc           *ir.Func
+	isBigFunc         bool
+	debug             bool
+	conservativeCalls bool
+	budget            int32
+	maxBudget         int32
+	reason            string
+	extraCallCost     int32
+	usedLocals        ir.NameSet
+	do                func(ir.Node) bool
+	profile           *pgoir.Profile
+	dbg               bool
 }
 
 func isDebugFn(fn *ir.Func) bool {
@@ -638,9 +661,12 @@ opSwitch:
 				// by looking at what has already been inlined.
 				// Since we haven't done any inlining yet we
 				// will miss those.
-				//
 				// TODO: in the case of a single-call closure, the inlining budget here is potentially much, much larger.
 				//
+				if v.conservativeCalls {
+					v.budget -= logosConservativeCallCost(callee.Inl.Cost, extraCost)
+					break
+				}
 				v.budget -= callee.Inl.Cost
 				break
 			}
@@ -1068,6 +1094,19 @@ func canInlineCallExpr(callerfn *ir.Func, n *ir.CallExpr, callee *ir.Func, bigCa
 		if log && logopt.Enabled() {
 			logopt.LogOpt(n.Pos(), "cannotInlineCall", "inline", ir.FuncName(callerfn),
 				fmt.Sprintf("%s cannot be inlined", ir.PkgFuncName(callee)))
+		}
+		return false, 0, false
+	}
+
+	if logosNoLBFence(callerfn, callee) {
+		if log {
+			if base.Flag.LowerM > 1 {
+				fmt.Printf("%v: cannot inline %v into %v: load-barrier policy differs\n", ir.Line(n), callee, ir.FuncName(callerfn))
+			}
+			if logopt.Enabled() {
+				logopt.LogOpt(n.Pos(), "cannotInlineCall", "inline", ir.FuncName(callerfn),
+					fmt.Sprintf("%s and %s differ in load-barrier policy", ir.PkgFuncName(callerfn), ir.PkgFuncName(callee)))
+			}
 		}
 		return false, 0, false
 	}

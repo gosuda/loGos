@@ -177,20 +177,19 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 		gcCleanups.createGs()
 	}
 
-	// Resolve the stable attach address before taking locks: when the
-	// object sits unpublished on a registered page, addCleanup copies it
-	// into to-space and attaches the special to the copy, so a handle
-	// naming the source would miss at Stop once the source page is
-	// released, retired, and reused and the forwarding entry is gone.
-	// Keeping the copy's address makes the handle independent of the
-	// forwarding table: the copy's span carries the special, so page
-	// selection excludes it (sticky logosNoReloc plus specials != nil)
-	// and it cannot move again while the handle is live. addCleanup
-	// re-resolves the same copy through its own hoisted ensure-copy (a
-	// published forward-hit: no copy, no allocation), so both agree on
-	// the span. Without a cycle this is the identity and nothing changes.
-	attach := zgcAttachEnsureCopy(unsafe.Pointer(ptr))
-	id := addCleanup(attach, cleanupFn{
+	// addCleanup attaches at the object's home and returns that address:
+	// when the object is unpublished on a registered page it is copied
+	// into to-space first and the special goes onto the copy, and a
+	// pause that moves the page again before the attach pins the M makes
+	// addCleanup copy once more. The handle keeps the address the special
+	// actually landed on, never the pre-attach word, so a handle naming
+	// the source would not miss at Stop once the source page is released,
+	// retired and reused and its forwarding entry is gone. The home span
+	// carries the special, so page selection excludes it (sticky
+	// logosNoReloc plus specials != nil) and the home cannot move again
+	// while the handle is live. Without a cycle this is the identity and
+	// nothing changes.
+	id, home := addCleanup(unsafe.Pointer(ptr), cleanupFn{
 		// Instantiate a caller function to call the cleanup, that is cleanup(*argv).
 		//
 		// TODO(mknyszek): This allocates because the generic dictionary argument
@@ -202,11 +201,11 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 	})
 	if debug.checkfinalizers != 0 {
 		cleanupFn := *(**funcval)(unsafe.Pointer(&cleanup))
-		setCleanupContext(attach, abi.TypeFor[T](), sys.GetCallerPC(), cleanupFn.fn, id)
+		setCleanupContext(home, abi.TypeFor[T](), sys.GetCallerPC(), cleanupFn.fn, id)
 	}
 	return Cleanup{
 		id:  id,
-		ptr: uintptr(attach),
+		ptr: uintptr(home),
 	}
 }
 
@@ -241,11 +240,17 @@ func (c Cleanup) Stop() {
 		return
 	}
 
-	// Canonicalize without copying, mirroring removespecial: the handle
-	// already names the copy's span, so this is the identity for it, and
-	// it keeps the lookup on the copy's span for a stale or colored word.
-	// The following block removes the Special record of type cleanup for the object c.ptr.
-	ptr := uintptr(logosZgcAttachSpecial(unsafe.Pointer(c.ptr)))
+	// Home ownership, never forwarding: the handle names the home span the
+	// special was spliced onto (the to-space copy when attach relocated,
+	// the object itself otherwise). Cancellation resolves only that home
+	// and never follows forwarding, so a copy published while Stop is in
+	// flight cannot divert the lookup to the copy's span (double-run),
+	// the unlinked record's argument and closure become collectable at
+	// once (no leak), and Stop never touches forwarding records or source
+	// ranges that release/retire may free concurrently
+	// (no use-after-release). A stale or colored word cannot appear here:
+	// c.ptr is the stored home, never a heap word the barrier may color.
+	ptr := c.ptr
 	span := spanOfHeap(ptr)
 	if span == nil {
 		return

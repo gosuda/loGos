@@ -382,6 +382,45 @@ func TestPackagesAndErrors(ld *modload.Loader, ctx context.Context, done func(),
 			t.ImportXtest = true
 		}
 
+		// loGo/s test mains need the runtime helper archive as a direct
+		// build dependency: the lowered test files call into logos/rt,
+		// and the test-main compile's importcfg only names direct deps.
+		// Reuse the already loaded helper from the test graph. The
+		// closure logos guard keeps ordinary Go mains unchanged; the
+		// edge rides Internal.Imports only so the generated _testmain.go
+		// source imports and go list output stay source-accurate.
+		{
+			roots := []*Package{ptest}
+			if pxtest != nil {
+				roots = append(roots, pxtest)
+			}
+			var rt *Package
+			hasLogos := false
+			for _, q := range PackageList(roots) {
+				if q == nil {
+					continue
+				}
+				if q.IsLogos() {
+					hasLogos = true
+				}
+				if rt == nil && q.ImportPath == LogosRTPkg {
+					rt = q
+				}
+			}
+			if hasLogos && rt != nil {
+				present := false
+				for _, q := range pmain.Internal.Imports {
+					if q != nil && q.ImportPath == LogosRTPkg {
+						present = true
+						break
+					}
+				}
+				if !present {
+					pmain.Internal.Imports = append(pmain.Internal.Imports, rt)
+				}
+			}
+		}
+
 		// Sort and dedup pmain.Imports.
 		// Only matters for go list -test output.
 		sort.Strings(pmain.Imports)

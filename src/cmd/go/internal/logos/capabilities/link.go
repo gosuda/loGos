@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 
 	"cmd/go/internal/cfg"
@@ -22,8 +23,10 @@ import (
 // LinkPolicy is the JSON policy cmd/go writes for the linker -logos.cap
 // flag (M12-S2). Severities follow the [capabilities] table; MainModules
 // holds the main module paths (first-party packages under them are never
-// blamed); CgoAllowed holds the import paths whose cgo use the M0 policy
-// allowed.
+// blamed); NestedModules holds nested module roots (modules in the build
+// list under a main module path that are not themselves main modules),
+// so the linker blames their packages as dependencies; CgoAllowed holds
+// the import paths whose cgo use the M0 policy allowed.
 //
 // The wire format is encoding/json v1 with a plain struct on both sides:
 // cmd/go and cmd/link build in every experiment configuration, while
@@ -36,14 +39,15 @@ type LinkPolicy struct {
 	TransitiveExecAllowlist []string `json:"transitive_exec_allowlist"`
 	TransitiveNetAllowlist  []string `json:"transitive_net_allowlist"`
 	MainModules             []string `json:"main_modules"`
+	NestedModules           []string `json:"nested_modules"`
 	CgoAllowed              []string `json:"cgo_allowed"`
 }
 
 // PolicyForLink builds the linker policy from the governing main-module
-// logos.toml, every modload main module path, and the recorded cgo
-// allowances.
+// logos.toml, every modload main module path, the recorded build modules
+// (filtered to nested roots), and the recorded cgo allowances.
 func PolicyForLink(cf *config.File, mainModules []string) *LinkPolicy {
-	p := &LinkPolicy{CgoAllowed: CgoAllowed(), MainModules: mainModules}
+	p := &LinkPolicy{CgoAllowed: CgoAllowed(), MainModules: mainModules, NestedModules: NestedModuleRoots(mainModules, BuildModules())}
 	if cf == nil {
 		p.TransitiveReflect = string(Warn)
 		p.TransitiveExec = string(Deny)
@@ -96,6 +100,69 @@ func CgoAllowed() []string {
 	cgoAllowedSet.Lock()
 	defer cgoAllowedSet.Unlock()
 	return slices.Sorted(maps.Keys(cgoAllowedSet.byPath))
+}
+
+// NestedModuleRoots returns the sorted nested module roots among
+// buildModules: module paths strictly under a main module path that are
+// not themselves main modules. A nested module owns its own go.mod under
+// a main-module-path directory tree but is consumed as a dependency, so
+// the linker blames packages at or under its root. A path that merely
+// shares a string prefix (example.com/application under
+// example.com/app) is not nested; only a full segment boundary
+// (main + "/") counts. A nested path that is itself a main module
+// (workspace builds list every main module) stays exempt and is
+// excluded. Results are deduplicated and sorted for a stable wire
+// encoding and link action hash.
+func NestedModuleRoots(mainModules, buildModules []string) []string {
+	isMain := make(map[string]bool, len(mainModules))
+	for _, m := range mainModules {
+		if m != "" {
+			isMain[m] = true
+		}
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, b := range buildModules {
+		if b == "" || isMain[b] || seen[b] {
+			continue
+		}
+		for _, m := range mainModules {
+			if m != "" && strings.HasPrefix(b, m+"/") {
+				out = append(out, b)
+				seen[b] = true
+				break
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// buildModulesSet holds module paths seen during load; the mutex makes
+// updates linearizable and entries are write-once per process.
+var buildModulesSet = struct {
+	sync.Mutex
+	byPath map[string]bool
+}{byPath: make(map[string]bool)}
+
+// NoteBuildModule records modulePath as a module observed in the loaded
+// package graph. Callers: load.checkLogosLoaded records every loaded
+// package's module; standard-library and module-less packages never
+// reach it, so only real modules are recorded.
+func NoteBuildModule(modulePath string) {
+	if modulePath == "" {
+		return
+	}
+	buildModulesSet.Lock()
+	defer buildModulesSet.Unlock()
+	buildModulesSet.byPath[modulePath] = true
+}
+
+// BuildModules returns the recorded build module paths, sorted.
+func BuildModules() []string {
+	buildModulesSet.Lock()
+	defer buildModulesSet.Unlock()
+	return slices.Sorted(maps.Keys(buildModulesSet.byPath))
 }
 
 // linkPolicySnapshot holds the marshaled effective policy for this build,

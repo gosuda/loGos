@@ -237,7 +237,7 @@ func computeInterfaceTypeSet(check *Checker, pos syntax.Pos, ityp *Interface) *_
 			// error message.
 			if check != nil {
 				check.later(func() {
-					if pos.IsKnown() && !check.allowVersion(go1_14) || !Identical(m.typ, other.Type()) {
+					if pos.IsKnown() && !check.allowVersion(go1_14) || !Identical(m.typ, other.Type()) || logosEmbedReadonlyConflict(m, other.(*Func)) {
 						err := check.newError(DuplicateDecl)
 						err.addf(atPos(pos), "duplicate method %s", m.name)
 						err.addf(atPos(mpos[other.(*Func)]), "other declaration of method %s", m.name)

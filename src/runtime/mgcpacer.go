@@ -457,7 +457,7 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 	} else {
 		// N.B. gomaxprocs and dedicatedMarkWorkersNeeded are guaranteed not to
 		// change during a GC cycle.
-		c.setMaxIdleMarkWorkers(int32(procs) - int32(dedicatedMarkWorkersNeeded))
+		c.setMaxIdleMarkWorkers(logosIdleMarkWorkerMax(procs, dedicatedMarkWorkersNeeded))
 	}
 
 	// Compute initial values for controls that are updated
@@ -711,19 +711,13 @@ func (c *gcControllerState) enlistWorker() {
 	//
 	// Note: with Green Tea, this places a requirement on enlistWorker
 	// that it must not be called while a G's scan bit is held.
+	//
+	// Only wake an idle P if dedicated mark workers are needed. Idle mark
+	// workers remain opportunistic (executed by already-running Ms in
+	// findRunnable and checkIdleGCNoP) so that idle marking does not mint
+	// new OS threads (Ms) solely to run idle workers.
 	if goexperiment.GreenTeaGC {
-		needIdle := c.needIdleMarkWorker()
-
-		// If we're all full on dedicated and idle workers, nothing
-		// to do.
-		if !needDedicated && !needIdle {
-			return
-		}
-
-		// If there are idle Ps, wake one so it will run a worker
-		// (the scheduler will already prefer to spin up a new
-		// dedicated worker over an idle one).
-		if sched.npidle.Load() != 0 && sched.nmspinning.Load() == 0 {
+		if needDedicated && sched.npidle.Load() != 0 && sched.nmspinning.Load() == 0 {
 			wakep() // Likely to consume our worker request.
 			return
 		}

@@ -149,17 +149,15 @@ func (fl *fileLower) splitRecvTarget(c *syntax.CommClause, as *syntax.AssignStmt
 	}
 	list := strings.Join(names, ", ")
 	region := span{start: fl.off(pos), end: to + 1}
-	var text strings.Builder
-	text.WriteString(leftoverComments(fl, region, []span{lhs, rhs}))
-	text.WriteString("case " + list + " := " + fl.copyRegion(rhs) + ": ")
+	parts := []otext{leftoverComments(fl, region, []span{lhs, rhs}), gen("case " + list + " := " + fl.copyRegion(rhs) + ": ")}
 	var prefix []syntax.Stmt
 	for _, h := range hoists {
-		text.WriteString(h.text + "; ")
+		parts = append(parts, h.text, gen("; "))
 		prefix = append(prefix, h.stmts...)
 	}
 	anchorScopes(prefix, pos)
-	text.WriteString(fl.copyRegion(lhs) + " = " + list + "; ")
-	fl.add(region.start, region.end, text.String())
+	parts = append(parts, gen(fl.copyRegion(lhs)+" = "+list+"; "))
+	fl.addT(region.start, region.end, cat(parts...))
 	prefix = append(prefix, assignOf(pos, syntax.UnpackListExpr(as.Lhs), vals))
 	c.Comm = defineOf(pos, temps, []syntax.Expr{as.Rhs})
 	c.Body = append(prefix, c.Body...)
@@ -189,7 +187,7 @@ func (fl *fileLower) lowerChainGroup(s syntax.Stmt, inner syntax.Stmt, enc []cha
 			}
 			for _, h := range fl.lowerChainPiece(e, enc) {
 				out = append(out, h.stmts...)
-				fl.add(fl.stmtStartOf(s), fl.stmtStartOf(s), h.text+"; ")
+				fl.addT(fl.stmtStartOf(s), fl.stmtStartOf(s), cat(h.text, gen("; ")))
 			}
 		}
 	} else {
@@ -401,8 +399,9 @@ func (fl *fileLower) chainErrCheck(enc []chainResult, pos syntax.Pos, errName st
 // and the eject text that goes before and after the condition's own
 // tokens, which stay where they are.
 type condRewrite struct {
-	call       *syntax.CallExpr
-	head, tail string
+	call *syntax.CallExpr
+	head otext
+	tail string
 }
 
 // condClosure wraps cond in `func() bool { hoists; return cond }()`. The
@@ -420,16 +419,15 @@ func (fl *fileLower) condClosure(cond syntax.Expr, hoists []chainHoist, anchor s
 	ret := lit.Body.List[0].(*syntax.ReturnStmt)
 	ret.Results = cond
 	var body []syntax.Stmt
-	var head strings.Builder
-	head.WriteString("func() bool { ")
+	parts := []otext{gen("func() bool { ")}
 	for _, h := range hoists {
 		anchorScopes(h.stmts, anchor)
 		body = append(body, h.stmts...)
-		head.WriteString(h.text + "; ")
+		parts = append(parts, h.text, gen("; "))
 	}
-	head.WriteString("return ")
+	parts = append(parts, gen("return "))
 	lit.Body.List = append(body, ret)
-	return condRewrite{call: call, head: head.String(), tail: " }()"}
+	return condRewrite{call: call, head: cat(parts...), tail: " }()"}
 }
 
 // postClosure wraps post in `func() { hoists; post }()`. The call stays
@@ -443,15 +441,14 @@ func (fl *fileLower) postClosure(post syntax.SimpleStmt, hoists []chainHoist, sp
 	}
 	lit := call.Fun.(*syntax.FuncLit)
 	var body []syntax.Stmt
-	var head strings.Builder
-	head.WriteString("func() { ")
+	parts := []otext{gen("func() { ")}
 	for _, h := range hoists {
 		anchorScopes(h.stmts, anchor)
 		body = append(body, h.stmts...)
-		head.WriteString(h.text + "; ")
+		parts = append(parts, h.text, gen("; "))
 	}
 	lit.Body.List = append(body, post)
-	fl.add(sp.start, sp.start, head.String())
+	fl.addT(sp.start, sp.start, cat(parts...))
 	fl.add(sp.end, sp.end, " }()")
 	return exprStmtOf(anchor, call)
 }
@@ -473,7 +470,7 @@ func (fl *fileLower) lowerChainFor(s syntax.Stmt, fs *syntax.ForStmt, enc []chai
 	if fs.Init != nil {
 		for _, h := range fl.lowerChainPiece(fs.Init, enc) {
 			out = append(out, h.stmts...)
-			fl.add(fl.stmtStartOf(s), fl.stmtStartOf(s), h.text+"; ")
+			fl.addT(fl.stmtStartOf(s), fl.stmtStartOf(s), cat(h.text, gen("; ")))
 		}
 	}
 	errName := chainErrName(fs.Pos())
@@ -494,7 +491,8 @@ func (fl *fileLower) lowerChainFor(s syntax.Stmt, fs *syntax.ForStmt, enc []chai
 	// The rewritten clauses install after the body lowers, so the walk of
 	// function literals never meets the synthesized closures.
 	cond, post := fs.Cond, fs.Post
-	var head, tail string
+	var head otext
+	var tail string
 	if len(condHoists) > 0 {
 		cc := fl.condClosure(fs.Cond, condHoists, anchor)
 		cond, head, tail = cc.call, cc.head, cc.tail
@@ -502,13 +500,13 @@ func (fl *fileLower) lowerChainFor(s syntax.Stmt, fs *syntax.ForStmt, enc []chai
 	if len(postHoists) > 0 {
 		post = fl.postClosure(fs.Post, postHoists, hdr.post, anchor)
 		if fs.Cond != nil {
-			head = errName + " != nil || (" + head
+			head = cat(gen(errName+" != nil || ("), head)
 			tail += ")"
 			cond = at(&syntax.Operation{Op: syntax.OrOr, X: notNil(anchor, nameOf(anchor, errName)), Y: at(&syntax.ParenExpr{X: cond}, anchor)}, anchor)
 		}
 	}
-	if head != "" {
-		fl.add(hdr.cond.start, hdr.cond.start, head)
+	if head.s != "" {
+		fl.addT(hdr.cond.start, hdr.cond.start, head)
 		fl.add(hdr.cond.end, hdr.cond.end, tail)
 	}
 	check, checkText := fl.chainErrCheck(enc, anchor, errName)
@@ -544,7 +542,7 @@ func (fl *fileLower) lowerChainIf(s syntax.Stmt, ifs *syntax.IfStmt, enc []chain
 	start := fl.stmtStartOf(s)
 	for _, h := range fl.lowerChainPiece(ifs.Init, enc) {
 		out = append(out, h.stmts...)
-		fl.add(start, start, h.text+"; ")
+		fl.addT(start, start, cat(h.text, gen("; ")))
 	}
 	errName := chainErrName(ifs.Pos())
 	hoists := fl.lowerChainPieceExit(ifs.Cond, enc, condFail(errName))
@@ -568,7 +566,7 @@ func (fl *fileLower) rewriteIfCond(ifs *syntax.IfStmt, hoists []chainHoist, enc 
 	anchor := ifs.Then.Pos()
 	sp := fl.ifCondSpan(ifs)
 	cc := fl.condClosure(ifs.Cond, hoists, anchor)
-	fl.add(sp.start, sp.start, cc.head)
+	fl.addT(sp.start, sp.start, cc.head)
 	fl.add(sp.end, sp.end, cc.tail)
 	check, checkText := fl.chainErrCheck(enc, anchor, errName)
 	open := fl.off(anchor) + 1
@@ -841,7 +839,7 @@ func (fl *fileLower) moveShortOperand(op *syntax.Operation, sp span, typ, name, 
 	if guard == "" {
 		return chainHoist{
 			stmts: []syntax.Stmt{defineOf(pos, []syntax.Expr{nameOf(pos, name)}, []syntax.Expr{x})},
-			text:  name + " := " + mark,
+			text:  gen(name + " := " + mark),
 		}
 	}
 	take := ifOf(pos, nil, parseChainExprFrag(fl, guard, pos), []syntax.Stmt{
@@ -849,7 +847,7 @@ func (fl *fileLower) moveShortOperand(op *syntax.Operation, sp span, typ, name, 
 	})
 	return chainHoist{
 		stmts: append(parseChainStmtFrag(fl, "var "+name+" "+typ, pos), take),
-		text:  "var " + name + " " + typ + "; if " + guard + " { " + name + " = " + mark + " }",
+		text:  gen("var " + name + " " + typ + "; if " + guard + " { " + name + " = " + mark + " }"),
 	}
 }
 
@@ -959,7 +957,7 @@ func (fl *fileLower) lowerChainSwitch(s syntax.Stmt, ss *syntax.SwitchStmt, enc 
 	if ss.Init != nil {
 		for _, h := range fl.lowerChainPiece(ss.Init, enc) {
 			pre = append(pre, h.stmts...)
-			fl.add(start, start, h.text+"; ")
+			fl.addT(start, start, cat(h.text, gen("; ")))
 		}
 	}
 	var tagHoists []chainHoist
@@ -985,7 +983,7 @@ func (fl *fileLower) lowerChainSwitch(s syntax.Stmt, ss *syntax.SwitchStmt, enc 
 		out := pre
 		for _, h := range tagHoists {
 			out = append(out, h.stmts...)
-			fl.add(start, start, h.text+"; ")
+			fl.addT(start, start, cat(h.text, gen("; ")))
 		}
 		out = append(out, s)
 		fl.lowerChainChildren(s, enc)
@@ -1006,22 +1004,21 @@ func (fl *fileLower) emitChainSwitch(s syntax.Stmt, ss *syntax.SwitchStmt, tagHo
 	tagN, selN, matchN := pfx+"_tag", pfx+"_sel", pfx+"_m"
 	hasTag := ss.Tag != nil
 	var wrapper []syntax.Stmt
-	var text strings.Builder
-	text.WriteString("{ " + leftoverComments(fl, hdr.region, []span{hdr.init, hdr.tag}))
+	parts := []otext{gen("{ "), leftoverComments(fl, hdr.region, []span{hdr.init, hdr.tag})}
 	if ss.Init != nil {
-		text.WriteString(fl.copyRegion(hdr.init) + "; ")
+		parts = append(parts, gen(fl.copyRegion(hdr.init)+"; "))
 		wrapper = append(wrapper, ss.Init)
 	}
 	for _, h := range tagHoists {
-		text.WriteString(h.text + "; ")
+		parts = append(parts, h.text, gen("; "))
 		anchorScopes(h.stmts, p0)
 		wrapper = append(wrapper, h.stmts...)
 	}
 	if hasTag {
-		text.WriteString(tagN + " := " + fl.copyRegion(hdr.tag) + "; ")
+		parts = append(parts, gen(tagN+" := "+fl.copyRegion(hdr.tag)+"; "))
 		wrapper = append(wrapper, defineOf(p0, []syntax.Expr{nameOf(p0, tagN)}, []syntax.Expr{ss.Tag}))
 	}
-	text.WriteString(selN + " := 0; ")
+	parts = append(parts, gen(selN+" := 0; "))
 	wrapper = append(wrapper, defineOf(p0, []syntax.Expr{nameOf(p0, selN)}, []syntax.Expr{litOf(p0, "0", syntax.IntLit)}))
 	for i, c := range ss.Body {
 		if c.Cases == nil {
@@ -1039,10 +1036,10 @@ func (fl *fileLower) emitChainSwitch(s syntax.Stmt, ss *syntax.SwitchStmt, tagHo
 		var kept []span
 		for j, g := range runs[i] {
 			kept = append(kept, g.sp)
-			var hoists strings.Builder
+			var hoists []otext
 			var inner []syntax.Stmt
 			for _, h := range g.hoists {
-				hoists.WriteString(h.text + "; ")
+				hoists = append(hoists, h.text, gen("; "))
 				anchorScopes(h.stmts, p0)
 				inner = append(inner, h.stmts...)
 			}
@@ -1058,17 +1055,17 @@ func (fl *fileLower) emitChainSwitch(s syntax.Stmt, ss *syntax.SwitchStmt, tagHo
 			inner = append(inner, defineOf(p0, []syntax.Expr{nameOf(p0, matchN)}, []syntax.Expr{rhs}), take)
 			unmatched := at(&syntax.Operation{Op: syntax.Eql, X: nameOf(p0, selN), Y: litOf(p0, "0", syntax.IntLit)}, p0)
 			wrapper = append(wrapper, ifOf(p0, nil, unmatched, inner))
-			text.WriteString("if " + selN + " == 0 { " + hoists.String() + matchN + " := " + rhsText + "; if " + matchN + " { " + selN + " = " + k + " } }; ")
+			parts = append(parts, cat(gen("if "+selN+" == 0 { "), cat(hoists...), gen(matchN+" := "+rhsText+"; if "+matchN+" { "+selN+" = "+k+" } }; ")))
 		}
 		clause := span{start: fl.off(c.Pos()), end: fl.off(c.Colon) + 1}
-		fl.add(clause.start, clause.end, leftoverComments(fl, clause, kept)+"case "+k+":")
+		fl.addT(clause.start, clause.end, cat(leftoverComments(fl, clause, kept), gen("case "+k+":")))
 		c.Cases = litOf(c.Pos(), k, syntax.IntLit)
 	}
 	for _, l := range stmtLabels(s) {
-		text.WriteString(l + ": ")
+		parts = append(parts, gen(l+": "))
 	}
-	text.WriteString("switch " + selN + " {")
-	fl.add(hdr.region.start, hdr.region.end, text.String())
+	parts = append(parts, gen("switch "+selN+" {"))
+	fl.addT(hdr.region.start, hdr.region.end, cat(parts...))
 	closeOff := fl.off(ss.Rbrace) + 1
 	fl.add(closeOff, closeOff, " }")
 	ss.Init = nil

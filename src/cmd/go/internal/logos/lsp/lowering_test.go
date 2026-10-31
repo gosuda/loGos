@@ -46,9 +46,16 @@ func lowerQuestion(src []byte) ([]byte, EditMap, bool) {
 	if bytes.Contains(src, []byte("SYNTAX ERROR")) {
 		return nil, EditMap{}, false
 	}
+	// copyRun is one run of a replacement text copied from the original:
+	// the replacement-relative bytes [start, end) copy original offset orig.
+	type copyRun struct {
+		start, end int
+		orig       int
+	}
 	type step struct {
-		span EditSpan
-		text string
+		span   EditSpan
+		text   string
+		copies []copyRun
 	}
 	var steps []step
 	off := 0
@@ -57,22 +64,44 @@ func lowerQuestion(src []byte) ([]byte, EditMap, bool) {
 		if m := questionLine.FindStringSubmatch(text); m != nil {
 			indent := m[1]
 			repl := fmt.Sprintf("%s, _e := %s\n%s_logosTrace(_e)\n%sif _e != nil { return \"\", _e }", m[2], m[3], indent, indent)
-			steps = append(steps, step{EditSpan{Start: off + len(indent), End: off + len(text), Len: len(repl)}, repl})
+			name, operand := m[2], m[3]
+			// The replacement reuses the variable name and the operand
+			// verbatim; the ", _e := " between them and the trace and
+			// return lines are generated.
+			operandStart := len(name) + len(", _e := ")
+			steps = append(steps, step{
+				span: EditSpan{Start: off + len(indent), End: off + len(text), Len: len(repl)},
+				text: repl,
+				copies: []copyRun{
+					{start: 0, end: len(name), orig: off + len(indent)},
+					{start: operandStart, end: operandStart + len(operand), orig: off + len(indent) + len(name) + len(" := ")},
+				},
+			})
 		}
 		off += len(line)
 	}
-	steps = append(steps, step{EditSpan{Start: len(src), End: len(src), Len: len(siteTrailer)}, siteTrailer})
+	steps = append(steps, step{EditSpan{Start: len(src), End: len(src), Len: len(siteTrailer)}, siteTrailer, nil})
 	var out []byte
 	var spans []EditSpan
+	var segs segBuilder
 	prev := 0
 	for _, s := range steps {
 		out = append(out, src[prev:s.span.Start]...)
+		segs.copy(prev, s.span.Start-prev)
 		out = append(out, s.text...)
+		rp := 0
+		for _, c := range s.copies {
+			segs.gen(c.start - rp)
+			segs.copy(c.orig, c.end-c.start)
+			rp = c.end
+		}
+		segs.gen(len(s.text) - rp)
 		prev = s.span.End
 		spans = append(spans, s.span)
 	}
 	out = append(out, src[prev:]...)
-	return out, EditMap{Version: EditMapVersion, Size: len(src), Out: len(out), Edits: spans}, true
+	segs.copy(prev, len(src)-prev)
+	return out, EditMap{Version: EditMapVersion, Size: len(src), Out: len(out), Edits: spans, Segments: segs.done()}, true
 }
 
 // fakeCompiler is a Compiler that lowers with lowerQuestion. Every .lgo

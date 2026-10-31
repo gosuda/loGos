@@ -25,14 +25,16 @@ logos list -compiled -f '{{.Imports}}' ./l/a
 stdout 'encoding/binary'
 stdout 'fmt'
 stdout 'math'
-stdout 'reflect'
 stdout 'slices'
 
-# The external test build passes and carries the import in its own list.
+# The external test build passes and carries the import in its own list;
+# its walk-shaped type is what pulls reflect into compiled imports.
 logos test ./l/...
 stdout 'ok\s+example\.com/l/a'
 logos list -test -f '{{.ImportPath}} {{.Deps}}' ./l/...
 stdout 'example\.com/l/a_test \[example\.com/l/a\.test\] \[.*logos/rt/json.*\]'
+logos list -test -compiled -f '{{.Imports}}' ./l/...
+stdout 'reflect'
 
 # A Go importer in another module marshals and unmarshals through the
 # generated methods, in the same bytes encoding/json writes.

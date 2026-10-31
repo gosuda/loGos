@@ -289,7 +289,20 @@ func tryDeferToSpanScan(p uintptr, gcw *gcWork) bool {
 	// Find the object's index from the span class info stored in the inline mark bits.
 	base := alignDown(p, gc.PageSize)
 	q := spanInlineMarkBitsFromBase(base)
-	objIndex := uint16((uint64(p-base) * uint64(gc.SizeClassToDivMagic[q.class.sizeclass()])) >> 32)
+	// Stale pointers may read garbage class bytes; genuine pointers always
+	// read a valid class. ZGC-only: without the moving collector every
+	// pointer is current and the bounds fault stays a corruption tripwire.
+	class := q.class
+	sc := int(class.sizeclass())
+	if zgcCycleEnabled() && sc >= len(gc.SizeClassToDivMagic) {
+		return false
+	}
+	objIndex := uint16((uint64(p-base) * uint64(gc.SizeClassToDivMagic[sc])) >> 32)
+
+	// Stale pointers may compute an out-of-range index; genuine pointers stay in range.
+	if zgcCycleEnabled() && objIndex/8 >= uint16(len(q.marks)) {
+		return false
+	}
 
 	// Set mark bit.
 	idx, mask := objIndex/8, uint8(1)<<(objIndex%8)
@@ -299,8 +312,8 @@ func tryDeferToSpanScan(p uintptr, gcw *gcWork) bool {
 	atomic.Or8(&q.marks[idx], mask)
 
 	// Fast-track noscan objects.
-	if q.class.noscan() {
-		gcw.bytesMarked += uint64(gc.SizeClassToSize[q.class.sizeclass()])
+	if class.noscan() {
+		gcw.bytesMarked += uint64(gc.SizeClassToSize[sc])
 		return true
 	}
 

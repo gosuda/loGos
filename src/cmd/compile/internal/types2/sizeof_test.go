@@ -40,7 +40,9 @@ func TestSizeof(t *testing.T) {
 		{Const{}, 60, 104},
 		{TypeName{}, 52, 88},
 		{Var{}, 60, 104},
-		{Func{}, 60, 104},
+		// logosAssert pointer payload adds one word; masks live off-Func
+		// and known-zero declarations share the logosAssertZero singleton.
+		{Func{}, 64, 112},
 		{Label{}, 56, 96},
 		{Builtin{}, 56, 96},
 		{Nil{}, 52, 88},

@@ -57,6 +57,12 @@ func TestEmitPackagePlatformFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stagingPkg, "plat_linux.go"), []byte("package main\n\nfunc Platform() string { return \"linux\" }\n"), 0666); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(stagingPkg, "plat_windows.go"), []byte("package main\n\nfunc Platform() string { return \"windows\" }\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingPkg, "plat_notlinux.go"), []byte("//go:build !linux\n\npackage main\n\nfunc NotLinux() {}\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(stagingPkg, "cgo_helper.go"), []byte("package main\n\nfunc CgoHelper() {}\n"), 0666); err != nil {
 		t.Fatal(err)
 	}
@@ -100,5 +106,31 @@ func TestEmitPackagePlatformFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outDir, "plat", "plus_ignore.go")); !os.IsNotExist(err) {
 		t.Errorf("plus_ignore.go should not be emitted, stat err: %v", err)
+	}
+}
+
+func TestFindVariantContextPlatformLogosSyntax(t *testing.T) {
+	modDir := t.TempDir()
+	pkgDir := filepath.Join(modDir, "plat")
+	if err := os.MkdirAll(pkgDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	linuxSrc := "package main\n\nfunc Platform() string {\n\tvar u *User? = &User{Name: \"linux\"}\n\treturn (u?.Name ?? \"fallback\")\n}\n"
+	windowsSrc := "package main\n\nfunc Platform() string {\n\tvar u *User? = &User{Name: \"windows\"}\n\treturn (u?.Name ?? \"fallback\")\n}\n"
+	arm64Src := "package main\n\nfunc PlatformARM64() string {\n\tvar u *User? = &User{Name: \"windows-arm64\"}\n\treturn (u?.Name ?? \"fallback\")\n}\n"
+	for name, src := range map[string]string{
+		"plat_linux.lgo":         linuxSrc,
+		"plat_windows.lgo":       windowsSrc,
+		"plat_windows_arm64.lgo": arm64Src,
+	} {
+		if err := os.WriteFile(filepath.Join(pkgDir, name), []byte(src), 0666); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if goos, goarch, _, ok := findVariantContextForFile(pkgDir, "plat_windows.lgo", "linux", "amd64", nil); !ok || goos != "windows" {
+		t.Errorf("plat_windows.lgo context = %q/%q ok=%v, want windows", goos, goarch, ok)
+	}
+	if goos, goarch, _, ok := findVariantContextForFile(pkgDir, "plat_windows_arm64.lgo", "linux", "amd64", nil); !ok || goos != "windows" || goarch != "arm64" {
+		t.Errorf("plat_windows_arm64.lgo context = %q/%q ok=%v, want windows/arm64", goos, goarch, ok)
 	}
 }

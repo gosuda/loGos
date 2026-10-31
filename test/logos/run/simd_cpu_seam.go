@@ -1,4 +1,4 @@
-// run -goexperiment simd -godebug cpu.avx=off,cpu.avx2=off,cpu.avx512f=off
+// run -goexperiment simd -godebug cpu.avx=off,cpu.avx2=off,cpu.avx512f=off -goamd64=v1
 
 package main
 

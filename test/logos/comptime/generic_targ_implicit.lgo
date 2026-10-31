@@ -1,0 +1,34 @@
+// errorcheck
+
+// M7-S3 nested comptime call without explicit type arguments (SPEC Sec
+// 2.5, T-205): a call to a comptime generic inside an expansion must
+// spell its type arguments explicitly, even when inference could fill
+// them in. Identity below infers U from its argument during checking,
+// so only the expansion rule rejects the call.
+
+package p
+
+import "comptime"
+
+type Solo struct {
+	X int
+}
+
+func Identity[U any](x U) U {
+	var zero U
+	const for _, g := range comptime.Fields[U]() {
+		_ = zero.[g]
+	}
+	return x
+}
+
+func Outer[T any](v T) T {
+	const for _, f := range comptime.Fields[T]() {
+		_ = Identity(v.[f])
+	}
+	return v
+}
+
+func use(s Solo) Solo {
+	return Outer[Solo](s) // ERROR "comptime::generic_targ"
+}

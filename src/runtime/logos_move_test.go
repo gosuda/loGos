@@ -228,6 +228,9 @@ func runLogosMove(t *testing.T, exe, scenario, expectMove string, env ...string)
 var logosMoveScenarios = []string{
 	"canmove", "evacuate", "pinner", "mapkey", "syscall", "weakunique",
 	"finreg", "finqueued", "finresurrect", "finreclaim", "cleanupmoved", "cleanupstop",
+	"deferheld", "panicheld", "ctxheld", "rootspreserved",
+	"interiorheld", "boxroots", "sizemix", "attachrace",
+	"cbcorigin", "cbpinnersep", "cbretire",
 }
 
 // TestLogosMoveScenarios runs every scenario under immix with and without

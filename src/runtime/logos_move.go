@@ -12,7 +12,10 @@ func logosImmixMode() bool {
 	return goexperiment.LogosGCMoving && logosGCMode == "immix"
 }
 
-// logosHeapObjectsCanMove is heapObjectsCanMove for the moving modes.
+// logosHeapObjectsCanMove is heapObjectsCanMove for the moving modes: immix
+// (M19-S5) and zgc, which relocates objects out of fragmented pages through
+// an off-heap forwarding table (SPEC Sec 19.2) with an identity hash that
+// survives relocation (SPEC Sec 8.4).
 func logosHeapObjectsCanMove() bool {
-	return logosImmixMode()
+	return logosImmixMode() || (goexperiment.LogosGCMoving && logosGCMode == "zgc")
 }

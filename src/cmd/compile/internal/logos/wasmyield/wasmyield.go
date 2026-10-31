@@ -25,7 +25,9 @@
 package wasmyield
 
 import (
+	"bytes"
 	"cmp"
+	"encoding/hex"
 	"internal/buildcfg"
 	"slices"
 	"strconv"
@@ -226,6 +228,7 @@ func mergeFns(cur *facts.Facts, yield []facts.FnFact) []facts.FnFact {
 	for _, y := range yield {
 		if i, ok := at[y.Object]; ok {
 			out[i].MayYield, out[i].HasMayYield = y.MayYield, true
+			mergeAssertInto(&out[i], y)
 			continue
 		}
 		at[y.Object] = len(out)
@@ -236,6 +239,56 @@ func mergeFns(cur *facts.Facts, yield []facts.FnFact) []facts.FnFact {
 
 // objectName spells sym as a facts object relative to the package being
 // compiled, or "" when the name is outside the facts grammar.
+// mergeAssertInto folds src's generic assertion effects into dst's. Yield
+// records never carry assertion effects today, so this preserves the
+// checking-time masks; if both sides ever carry them, the masks OR and
+// HasAssert ORs instead of the backend dropping producer facts.
+func mergeAssertInto(dst *facts.FnFact, src facts.FnFact) {
+	if !src.HasAssert {
+		return
+	}
+	if !dst.HasAssert {
+		dst.AssertTP, dst.AssertRTP, dst.HasAssert = src.AssertTP, src.AssertRTP, true
+		return
+	}
+	dst.AssertTP = orHexStr(dst.AssertTP, src.AssertTP)
+	dst.AssertRTP = orHexStr(dst.AssertRTP, src.AssertRTP)
+}
+
+// orHexStr returns the bitwise OR of two canonical hex masks, rendered
+// normalized lowercase ("0" for zero). "" and malformed input read as
+// zero. Masks have arbitrary width: they are left-aligned by value, never
+// truncated to 64 bits.
+func orHexStr(a, b string) string {
+	ab, bb := parseHexStr(a), parseHexStr(b)
+	n := len(ab)
+	if len(bb) > n {
+		n = len(bb)
+	}
+	out := make([]byte, n)
+	copy(out[n-len(ab):], ab)
+	for i := range bb {
+		out[n-len(bb)+i] |= bb[i]
+	}
+	if s := hex.EncodeToString(bytes.TrimLeft(out, "\x00")); s != "" {
+		return s
+	}
+	return "0"
+}
+
+// parseHexStr decodes a canonical hex mask into big-endian bytes; ""
+// and malformed input decode as zero.
+func parseHexStr(s string) []byte {
+	if len(s)%2 != 0 {
+		s = "0" + s
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
 func objectName(sym *obj.LSym) string {
 	rest, ok := strings.CutPrefix(sym.Name, types.LocalPkg.Prefix+".")
 	if !ok || !facts.ValidObject(rest) {

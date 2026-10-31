@@ -1,0 +1,62 @@
+// run
+
+package main
+
+import "fmt"
+
+// Runtime companion to
+// test/logos/compile/const_interface_generic_assert.lgo. Only the
+// allowed generic half runs here: ordinary generic declarations stay
+// legal and only Qualified instantiations from any/ordinary forge (the
+// latter never run). Identity has no assertion so Identity[Qualified]
+// over an already-proven Good stays allowed; GenericAs[int]/[Good] are
+// ordinary instantiations; storage-only StoreBox only stores and returns
+// T; concrete `any` to Good is runtime-checkable, then assignment to
+// Qualified is proved by the direct Good body scan. Each printed line is
+// a hand-computed literal with a W prefix.
+
+type Qualified interface {
+	const Name() string
+}
+
+type Good struct {
+	name string
+}
+
+func (g Good) Name() string { return g.name }
+
+func Identity[T any](x T) T { return x }
+
+func GenericAs[T any](x any) T { return x.(T) }
+
+func WrapAs[T any](x any) T { return GenericAs[T](x) }
+
+type StoreBox[T any] struct {
+	V T
+}
+
+func (b StoreBox[T]) Get() T { return b.V }
+
+func ViaConcrete(v any) string {
+	g := v.(Good)
+	var q Qualified = g
+	return q.Name()
+}
+
+func main() {
+	g := Good{name: "ada"}
+	fmt.Println("W1", Identity[Qualified](g).Name())
+	fmt.Println("W2", Identity[int](7))
+	fmt.Println("W3", GenericAs[int](any(41)))
+	fmt.Println("W4", GenericAs[Good](any(Good{name: "good"})).Name())
+	fmt.Println("W5", WrapAs[int](any(7))+1)
+	b := StoreBox[Qualified]{V: Good{name: "box"}}
+	fmt.Println("W6", b.Get().Name())
+	c := StoreBox[int]{V: 41}
+	fmt.Println("W7", c.Get()+1)
+	var v any = Good{name: "via"}
+	fmt.Println("W8", ViaConcrete(v))
+	d := StoreBox[Good]{V: Good{name: "held"}}
+	var q Qualified = d.V
+	fmt.Println("W9", q.Name())
+}

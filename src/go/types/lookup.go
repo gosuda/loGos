@@ -11,6 +11,7 @@ package types
 
 import (
 	"bytes"
+	"go/token"
 	"strings"
 )
 
@@ -379,6 +380,10 @@ func MissingMethod(V Type, T *Interface, static bool) (method *Func, wrongType b
 // The comparator is used to compare signatures.
 // If a method is missing and cause is not nil, *cause describes the error.
 func (check *Checker) missingMethod(V, T Type, static bool, equivalent func(x, y Type) bool, cause *string) (method *Func, wrongType bool) {
+	return check.missingMethodAt(V, T, static, equivalent, cause, nopos)
+}
+
+func (check *Checker) missingMethodAt(V, T Type, static bool, equivalent func(x, y Type) bool, cause *string, pos token.Pos) (method *Func, wrongType bool) {
 	methods := T.Underlying().(*Interface).typeSet().methods // T must be an interface
 	if len(methods) == 0 {
 		return nil, false
@@ -394,6 +399,7 @@ func (check *Checker) missingMethod(V, T Type, static bool, equivalent func(x, y
 		ptrRecv
 		field
 		nointerface
+		readonly
 	)
 
 	state := ok
@@ -417,6 +423,10 @@ func (check *Checker) missingMethod(V, T Type, static bool, equivalent func(x, y
 				state = wrongSig
 				break
 			}
+
+			// loGo/s: a qualified requirement needs a qualified provider.
+			// Ordinary requirements accept either; qualified requirements
+			// accept only providers carrying the obligation themselves.
 		}
 	} else {
 		for _, m = range methods {
@@ -466,6 +476,12 @@ func (check *Checker) missingMethod(V, T Type, static bool, equivalent func(x, y
 				state = wrongSig
 				break
 			}
+
+			// loGo/s: a qualified requirement needs a proven readonly
+			// capability. Proven bits (imported trusted facts, cached local
+			// proofs) accept immediately; imported absent facts fail closed;
+			// local unproven methods defer to a package-end re-scan so
+			// declaration order cannot change legality.
 		}
 	}
 
@@ -528,7 +544,7 @@ func (check *Checker) missingMethod(V, T Type, static bool, equivalent func(x, y
 		}
 	}
 
-	return m, state == wrongSig || state == ptrRecv
+	return m, state == wrongSig || state == ptrRecv || state == readonly
 }
 
 // hasAllMethods is similar to checkMissingMethod but instead reports whether all methods are present.
@@ -538,10 +554,14 @@ func (check *Checker) missingMethod(V, T Type, static bool, equivalent func(x, y
 // If the result is false and cause is not nil, *cause describes the error.
 // Use hasAllMethods to avoid follow-on errors due to incorrect types.
 func (check *Checker) hasAllMethods(V, T Type, static bool, equivalent func(x, y Type) bool, cause *string) bool {
+	return check.hasAllMethodsAt(V, T, static, equivalent, cause, nopos)
+}
+
+func (check *Checker) hasAllMethodsAt(V, T Type, static bool, equivalent func(x, y Type) bool, cause *string, pos token.Pos) bool {
 	if !isValid(V) {
 		return true // we don't know anything about V, assume it implements T
 	}
-	m, _ := check.missingMethod(V, T, static, equivalent, cause)
+	m, _ := check.missingMethodAt(V, T, static, equivalent, cause, pos)
 	return m == nil || hasInvalidEmbeddedFields(V, nil)
 }
 
@@ -601,6 +621,11 @@ func (check *Checker) assertableTo(V, T Type, cause *string) bool {
 	// no static check is required if T is an interface
 	// spec: "If T is an interface type, x.(T) asserts that the
 	//        dynamic type of x implements the interface T."
+	//
+	// loGo/s: the one exception is a readonly obligation. Runtime Go erases
+	// the readonly bit, so `x.(T)` cannot check purity dynamically; every
+	// readonly method T requires must already be guaranteed by V's own
+	// readonly method contracts (see logosAssertReadonly).
 	if IsInterface(T) {
 		return true
 	}
@@ -617,6 +642,9 @@ func (check *Checker) newAssertableTo(V, T Type, cause *string) bool {
 	// no static check is required if T is an interface
 	// spec: "If T is an interface type, x.(T) asserts that the
 	//        dynamic type of x implements the interface T."
+	//
+	// loGo/s: readonly obligations of T must be implied by V; see
+	// assertableTo.
 	if IsInterface(T) {
 		return true
 	}

@@ -95,7 +95,8 @@ func (fl *fileLower) lowerPlatform() {
 			j.expr,
 			at(&syntax.Operation{Op: syntax.And, X: nameOf(pos, site)}, pos),
 		}))
-		fl.add(j.span.start, j.span.end, rtAlias+".MustNonNil("+inner+", &"+site+")")
+		fl.addT(j.span.start, j.span.end, cat(
+			gen(rtAlias+".MustNonNil("), inner, gen(", &"+site+")")))
 	}
 }
 

@@ -22,6 +22,22 @@ import (
 func checkLogosLoaded(ld *modload.Loader, all []*Package) {
 	checkLogosModules(all)
 	checkLogosCapabilities(ld, all)
+	noteLogosBuildModules(all)
+}
+
+// noteLogosBuildModules records the build-module census feeding the
+// link-time capabilities policy (M12-S2): every loaded module path is
+// recorded for capabilities.PolicyForLink, which filters the set to nested
+// roots. Standard-library and module-less packages contribute nothing.
+func noteLogosBuildModules(all []*Package) {
+	if !cfg.Logos {
+		return
+	}
+	for _, p := range all {
+		if p.Module != nil {
+			capabilities.NoteBuildModule(p.Module.Path)
+		}
+	}
 }
 
 // checkLogosCapabilities enforces the logos.toml [capabilities]

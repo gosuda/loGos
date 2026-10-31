@@ -7,6 +7,7 @@ package capabilities
 import (
 	"bytes"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -52,6 +53,88 @@ func TestPolicyForLinkNilConfigFailsClosed(t *testing.T) {
 	p := PolicyForLink(nil, []string{"example.com/m"})
 	if p.TransitiveExec != "deny" || p.TransitiveNet != "deny" || p.TransitiveReflect != "warn" {
 		t.Errorf("nil config severities = %q %q %q, want deny deny warn", p.TransitiveExec, p.TransitiveNet, p.TransitiveReflect)
+	}
+}
+
+func TestNestedModuleRoots(t *testing.T) {
+	tests := []struct {
+		name   string
+		mains  []string
+		builds []string
+		want   []string
+	}{
+		{
+			name:   "nested under main",
+			mains:  []string{"example.com/main"},
+			builds: []string{"example.com/main", "example.com/main/nested", "example.com/dep"},
+			want:   []string{"example.com/main/nested"},
+		},
+		{
+			name:   "prefix without boundary is not nested",
+			mains:  []string{"example.com/app"},
+			builds: []string{"example.com/app", "example.com/application"},
+			want:   nil,
+		},
+		{
+			name:   "nested main stays exempt",
+			mains:  []string{"example.com/app", "example.com/app/nested"},
+			builds: []string{"example.com/app", "example.com/app/nested", "example.com/app/nested/sub"},
+			want:   []string{"example.com/app/nested/sub"},
+		},
+		{
+			name:   "no mains emits nothing",
+			mains:  nil,
+			builds: []string{"example.com/main/nested"},
+			want:   nil,
+		},
+		{
+			name:   "dedupes and sorts",
+			mains:  []string{"example.com/main"},
+			builds: []string{"example.com/main/z", "example.com/main/a", "example.com/main/z"},
+			want:   []string{"example.com/main/a", "example.com/main/z"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NestedModuleRoots(tc.mains, tc.builds); !slices.Equal(got, tc.want) {
+				t.Errorf("NestedModuleRoots(%q, %q) = %q, want %q", tc.mains, tc.builds, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPolicyForLinkEmitsNestedModules(t *testing.T) {
+	buildModulesSet.Lock()
+	saved := maps.Clone(buildModulesSet.byPath)
+	buildModulesSet.byPath = make(map[string]bool)
+	buildModulesSet.Unlock()
+	t.Cleanup(func() {
+		buildModulesSet.Lock()
+		defer buildModulesSet.Unlock()
+		buildModulesSet.byPath = saved
+	})
+	NoteBuildModule("example.com/nestemit")
+	NoteBuildModule("example.com/nestemit/nested")
+	NoteBuildModule("example.com/nestemit/nested/sub")
+	p := PolicyForLink(testConfigFile(), []string{"example.com/nestemit"})
+	for _, want := range []string{"example.com/nestemit/nested", "example.com/nestemit/nested/sub"} {
+		if !slices.Contains(p.NestedModules, want) {
+			t.Errorf("NestedModules = %q, missing %q", p.NestedModules, want)
+		}
+	}
+	data, err := MarshalPolicy(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"nested_modules":["example.com/nestemit/nested"`) {
+		t.Errorf("marshaled policy missing nested_modules key: %s", data)
+	}
+	back, err := UnmarshalPolicy(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(back.NestedModules, p.NestedModules) {
+		t.Errorf("round trip NestedModules = %q, want %q", back.NestedModules, p.NestedModules)
 	}
 }
 
@@ -125,5 +208,141 @@ func TestSnapshotRecordsCgoAllowed(t *testing.T) {
 	}
 	if !slices.Contains(back.CgoAllowed, path) {
 		t.Errorf("CgoAllowed = %q, missing %q", back.CgoAllowed, path)
+	}
+}
+
+// TestPolicyForLinkSharedPluginInternal pins the linker policy inputs
+// for the three link root shapes the linker audits (seedRoots in
+// cmd/link/internal/ld): shared libraries, plugins, and ordinary
+// entry-symbol binaries. PolicyForLink itself takes no build mode, so
+// these cases pin that mode-shaped inputs (workspace multi-main, single
+// main with nested dep, cgo-allowed dep) produce identical,
+// round-tripping wire output. Delivery is separate: ordinary and plugin
+// links receive the policy through AppendLinkCapFlag, while
+// -buildmode=shared links currently do not (ldShared in work/gc.go never
+// appends the flag; out of scope, reported as a gap), so this test proves
+// policy construction, not that every mode is audited.
+func TestPolicyForLinkSharedPluginInternal(t *testing.T) {
+	buildModulesSet.Lock()
+	savedBuilds := maps.Clone(buildModulesSet.byPath)
+	buildModulesSet.Unlock()
+	cgoAllowedSet.Lock()
+	savedCgo := maps.Clone(cgoAllowedSet.byPath)
+	cgoAllowedSet.Unlock()
+	t.Cleanup(func() {
+		buildModulesSet.Lock()
+		buildModulesSet.byPath = savedBuilds
+		buildModulesSet.Unlock()
+		cgoAllowedSet.Lock()
+		cgoAllowedSet.byPath = savedCgo
+		cgoAllowedSet.Unlock()
+	})
+	tests := []struct {
+		name       string
+		mains      []string
+		builds     []string
+		cgo        []string
+		wantNested []string
+	}{
+		{
+			name:       "shared workspace with nested dep",
+			mains:      []string{"example.com/app", "example.com/lib"},
+			builds:     []string{"example.com/app", "example.com/app/nested", "example.com/lib", "example.com/dep"},
+			cgo:        []string{"example.com/dep"},
+			wantNested: []string{"example.com/app/nested"},
+		},
+		{
+			name:       "plugin with nested dep",
+			mains:      []string{"example.com/p"},
+			builds:     []string{"example.com/p", "example.com/p/nested", "example.com/dep"},
+			wantNested: []string{"example.com/p/nested"},
+		},
+		{
+			name:       "internal-link exe with cgo dep",
+			mains:      []string{"example.com/m"},
+			builds:     []string{"example.com/m", "example.com/dep"},
+			cgo:        []string{"example.com/dep"},
+			wantNested: nil,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buildModulesSet.Lock()
+			buildModulesSet.byPath = make(map[string]bool)
+			buildModulesSet.Unlock()
+			cgoAllowedSet.Lock()
+			cgoAllowedSet.byPath = make(map[string]bool)
+			cgoAllowedSet.Unlock()
+			for _, b := range tc.builds {
+				NoteBuildModule(b)
+			}
+			for _, c := range tc.cgo {
+				NoteCgoAllowed(c)
+			}
+			p := PolicyForLink(testConfigFile(), tc.mains)
+			if !slices.Equal(p.MainModules, tc.mains) {
+				t.Errorf("MainModules = %q, want %q", p.MainModules, tc.mains)
+			}
+			if !slices.Equal(p.NestedModules, tc.wantNested) {
+				t.Errorf("NestedModules = %q, want %q", p.NestedModules, tc.wantNested)
+			}
+			if !slices.Equal(p.CgoAllowed, tc.cgo) {
+				t.Errorf("CgoAllowed = %q, want %q", p.CgoAllowed, tc.cgo)
+			}
+			if p.TransitiveReflect != "warn" || p.TransitiveExec != "deny" || p.TransitiveNet != "allow" {
+				t.Errorf("severities = %q %q %q, want warn deny allow", p.TransitiveReflect, p.TransitiveExec, p.TransitiveNet)
+			}
+			data, err := MarshalPolicy(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			back, err := UnmarshalPolicy(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(back.MainModules, tc.mains) {
+				t.Errorf("round trip MainModules = %q, want %q", back.MainModules, tc.mains)
+			}
+			if !slices.Equal(back.NestedModules, tc.wantNested) {
+				t.Errorf("round trip NestedModules = %q, want %q", back.NestedModules, tc.wantNested)
+			}
+			if !slices.Equal(back.CgoAllowed, tc.cgo) {
+				t.Errorf("round trip CgoAllowed = %q, want %q", back.CgoAllowed, tc.cgo)
+			}
+		})
+	}
+}
+
+// TestLinkPolicyPlainGoUnchanged pins the plain-go byte-identical
+// guarantee: outside logos mode the snapshotted policy never reaches the
+// link action ID hash and no -logos.cap flag is appended, even when a
+// snapshot is set. Plain go keeps its upstream link behavior.
+func TestLinkPolicyPlainGoUnchanged(t *testing.T) {
+	old := cfg.Logos
+	cfg.Logos = false
+	t.Cleanup(func() { cfg.Logos = old })
+	linkPolicySnapshot.Lock()
+	savedSet, savedData := linkPolicySnapshot.set, linkPolicySnapshot.data
+	linkPolicySnapshot.Unlock()
+	t.Cleanup(func() {
+		linkPolicySnapshot.Lock()
+		linkPolicySnapshot.set, linkPolicySnapshot.data = savedSet, savedData
+		linkPolicySnapshot.Unlock()
+	})
+	SnapshotLinkPolicy(testConfigFile(), []string{"example.com/m"}, nil)
+	var h bytes.Buffer
+	if err := HashLinkPolicy(&h); err != nil {
+		t.Fatal(err)
+	}
+	if h.Len() != 0 {
+		t.Errorf("HashLinkPolicy outside logos mode wrote %q, want nothing", h.String())
+	}
+	objdir := t.TempDir()
+	got := AppendLinkCapFlag([]string{"-s"}, objdir)
+	if !slices.Equal(got, []string{"-s"}) {
+		t.Errorf("AppendLinkCapFlag outside logos mode = %q, want unchanged", got)
+	}
+	if entries, err := os.ReadDir(objdir); err != nil || len(entries) != 0 {
+		t.Errorf("AppendLinkCapFlag outside logos mode wrote %d files, want none (err=%v)", len(entries), err)
 	}
 }

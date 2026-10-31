@@ -15,11 +15,15 @@ package syntax
 // elements. The element becomes a *Field whose Name is F and whose Type
 // is a *PropertyType; types2 lowers it to Logos_GetF/Logos_SetF methods.
 
-// logosPropertyConst parses a `const F T` property element. It returns
-// nil, consuming nothing, unless in LogosMode the current token is
-// `const`. Unlike the bare form, `const` never starts a valid plain-Go
+// logosPropertyConst parses a `const F T` property element or a
+// `const M(...) ...` readonly interface method. It returns nil,
+// consuming nothing, unless in LogosMode the current token is `const`.
+// Unlike the bare property form, `const` never starts a valid plain-Go
 // interface element, so no exportedness gate is needed here: no .go
-// input parses differently.
+// input parses differently. After Name, `(` selects the method shape
+// with the ordinary FuncType parser and records the qualifier on
+// Field.Const; every other token keeps the value-type property shape
+// with PropertyType.Const. Ordinary funcs and methods never reach here.
 func (p *parser) logosPropertyConst() *Field {
 	if p.mode&LogosMode == 0 || p.tok != _Const {
 		return nil
@@ -27,13 +31,19 @@ func (p *parser) logosPropertyConst() *Field {
 	pos := p.pos()
 	p.next()
 	name := p.name()
+	f := new(Field)
+	f.pos = pos
+	f.Name = name
+	if p.tok == _Lparen {
+		_, ft := p.funcType("interface method")
+		f.Const = true
+		f.Type = ft
+		return f
+	}
 	t := new(PropertyType)
 	t.pos = pos
 	t.Const = true
 	t.Type = p.type_()
-	f := new(Field)
-	f.pos = pos
-	f.Name = name
 	f.Type = t
 	return f
 }

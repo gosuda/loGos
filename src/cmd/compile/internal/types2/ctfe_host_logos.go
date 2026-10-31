@@ -109,7 +109,32 @@ func (h *ctfeHost) entityOf(obj Object, name string) (ctfe.Entity, bool) {
 				if fn == nil {
 					return ctfe.Entity{}, false
 				}
-				if _, isConst := check.logosConstSyntax[body]; isConst {
+				_, isConst := check.logosConstSyntax[body]
+				h.logosRecordConstFunc(obj.name, body, isConst)
+				// Lowered code spells this body as a plain declaration,
+				// so a later check sharing this Info sees a false local
+				// verdict. The Info proof preserves the first check's
+				// declared-const verdict; it only ever upgrades.
+				if rec, ok := h.logosInfoConstFunc(obj.name); ok && rec.Const {
+					isConst = true
+				}
+				if isConst {
+					fn.Const = true
+					return ctfe.Entity{Kind: ctfe.EntConstFunc, Fn: fn}, true
+				}
+				return ctfe.Entity{Kind: ctfe.EntPlainFunc, Fn: fn}, true
+			}
+			// Copies check on a fresh checker whose body maps are
+			// empty, so the local lookup above misses. Resolve the
+			// callee from the first check's Info proof instead of a
+			// package-level global, keeping the proof
+			// invocation-owned like the other Logos Info hooks.
+			if rec, ok := h.logosInfoConstFunc(obj.name); ok {
+				fn := h.buildFunc(obj, rec.Decl)
+				if fn == nil {
+					return ctfe.Entity{}, false
+				}
+				if rec.Const {
 					fn.Const = true
 					return ctfe.Entity{Kind: ctfe.EntConstFunc, Fn: fn}, true
 				}
@@ -498,6 +523,47 @@ func (h *ctfeHost) fromType(t Type) *ctfe.Type {
 		return h.fromType(t.Elem)
 	}
 	return nil
+}
+
+// LogosConstFunc is the Info-carried CTFE proof for one same-package
+// function (SPEC Sec 2.1, T-201). Decl is the recorded body for
+// transitive evaluation from copies sharing the same Info, and Const
+// reports whether the first check saw the body through a `const func`
+// declaration. The static purity scan still reports impurities in the
+// first check; the proof carries only the declared-const fact the
+// evaluator needs to stay silent inside const bodies.
+type LogosConstFunc struct {
+	Decl  *syntax.FuncDecl
+	Const bool
+}
+
+// logosRecordConstFunc stores the first check's proof for one
+// same-package function name. The first record wins, so a later
+// observation through a plain declaration cannot downgrade the proof.
+func (h *ctfeHost) logosRecordConstFunc(name string, body *syntax.FuncDecl, isConst bool) {
+	if body == nil || h.check.Info == nil {
+		return
+	}
+	if h.check.Info.LogosConstFuncs == nil {
+		h.check.Info.LogosConstFuncs = map[string]LogosConstFunc{}
+	}
+	if _, ok := h.check.Info.LogosConstFuncs[name]; ok {
+		return
+	}
+	h.check.Info.LogosConstFuncs[name] = LogosConstFunc{Decl: body, Const: isConst}
+}
+
+// logosInfoConstFunc reports the Info proof for one same-package
+// function name. A nil body never resolves, so it reports missing.
+func (h *ctfeHost) logosInfoConstFunc(name string) (LogosConstFunc, bool) {
+	if h.check.Info == nil {
+		return LogosConstFunc{}, false
+	}
+	rec, ok := h.check.Info.LogosConstFuncs[name]
+	if !ok || rec.Decl == nil {
+		return LogosConstFunc{}, false
+	}
+	return rec, true
 }
 
 // buildFunc assembles an interpreter function from a checked signature

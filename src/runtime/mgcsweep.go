@@ -25,6 +25,7 @@
 package runtime
 
 import (
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"unsafe"
 )
@@ -727,6 +728,15 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 	// Initialize alloc bits cache.
 	s.refillAllocCache(0)
 
+	if goexperiment.LogosGCMoving {
+		// Rebuild plane O from the post-swap freeindex OR allocBits
+		// composite and reset the bump/hole cursor. Re-cached partial
+		// spans re-enter mcaches with allocated lines covered, so hole
+		// reuse serves only genuinely free slots. Fully freed spans
+		// return to the heap below, where freeSpanLocked clears planes.
+		logosImmixRebuildOccupancy(s)
+	}
+
 	// The span must be in our exclusive ownership until we update sweepgen,
 	// check for potential races.
 	if state := s.state.get(); state != mSpanInUse || s.sweepgen != sweepgen-1 {
@@ -811,7 +821,18 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				return true
 			}
 			// Return span back to the right mcentral list.
-			if nalloc == s.nelems || logosGenClosed(s) {
+			// For immix-managed classes, keep the reusable set to spans
+			// that actually freed an object this sweep (nfreed > 0). A
+			// merely partial immix span (nalloc < nelems, nfreed == 0)
+			// has only never-used tail free; admitting it to partialSwept
+			// lets cacheSpan pop it FIFO ahead of unswept dropped spans
+			// and serve virgin tail at a fresh block start instead of
+			// reusing a dropped slot. Hide immix tail for this cycle on
+			// fullSwept; next cycle it becomes fullUnswept and is still
+			// found via nextFreeIndex. Non-immix classes keep the
+			// classic partial/full split so the plain collector neither
+			// grows fresh spans nor sweeps twice.
+			if nalloc == s.nelems || logosGenClosed(s) || (nfreed == 0 && logosImmixSpanClass(spc)) {
 				mheap_.central[spc].mcentral.fullSwept(sweepgen).push(s)
 			} else {
 				mheap_.central[spc].mcentral.partialSwept(sweepgen).push(s)

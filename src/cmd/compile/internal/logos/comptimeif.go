@@ -247,7 +247,7 @@ func (fl *fileLower) cfInnerConstFors(body *syntax.BlockStmt, active cfChain, si
 // and the names inside them take the record's markers through visit.
 func (b *cfRecordBuilder) foldCond(e syntax.Expr) {
 	if val, ok := typeConst(b.fl.pkg.info, e); ok && val.Kind() == constant.Bool {
-		ctx := cfCtx{src: b.fl.src, starts: b.fl.start}
+		ctx := cfCtx{buf: b.fl.srcMap, starts: b.fl.start}
 		s := offAt(ctx.starts, syntax.StartPos(e))
 		b.subs = append(b.subs, splice{start: s, end: cfExactEnd(ctx, e), text: strconv.FormatBool(constant.BoolVal(val))})
 		return

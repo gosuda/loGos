@@ -1,4 +1,7 @@
 env GO111MODULE=on
+# Explicit environment control: scrub any ambient GODEBUG so the directives
+# below, not inherited environment values, determine the annotation state.
+env GODEBUG=
 
 [!GOOS:linux] skip
 [short] skip
@@ -7,12 +10,19 @@ env GO111MODULE=on
 # This ensures that the runtime has not overridden the default.
 go run .
 
+# Opposite-default control: the Go 1.25 runtime default is decoratemappings=1.
+# With the directive explicitly enabling, annotations must appear, proving the
+# mechanism works and the assertion above fails whenever the directive is not
+# honored.
+cd control
+go run .
+
 -- go.mod --
 go 1.25
 module m
 
 -- main.go --
-//go:debug decoratemappings=1
+//go:debug decoratemappings=0
 package main
 
 import (
@@ -30,5 +40,31 @@ func main() {
 	if strings.Contains(string(b), "[anon: Go:") {
 		log.Printf("/proc/self/maps:\n%s", string(b))
 		log.Fatalf("/proc/self/maps contains Go annotation")
+	}
+}
+
+-- control/go.mod --
+go 1.25
+module control
+
+-- control/main.go --
+//go:debug decoratemappings=1
+package main
+
+import (
+	"log"
+	"os"
+	"strings"
+)
+
+func main() {
+	b, err := os.ReadFile("/proc/self/maps")
+	if err != nil {
+		log.Fatalf("Error reading: %v", err)
+	}
+
+	if !strings.Contains(string(b), "[anon: Go:") {
+		log.Printf("/proc/self/maps:\n%s", string(b))
+		log.Fatalf("/proc/self/maps lacks Go annotation")
 	}
 }

@@ -122,7 +122,7 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 		defaultGcFlags = append(defaultGcFlags, "-symabis", symabis)
 	}
 
-	gcflags := str.StringList(forcedGcflags, p.Internal.Gcflags)
+	gcflags := str.StringList(logosForcedGcflags(p), p.Internal.Gcflags)
 	if p.Internal.FuzzInstrument {
 		gcflags = append(gcflags, fuzzInstrumentFlags()...)
 	}

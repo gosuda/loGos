@@ -118,11 +118,11 @@ func TestLogosElasticAssistsRunInBuiltProgram(t *testing.T) {
 }
 
 // TestLogosPlainBuildKeepsUpstreamPacing: a go build with no -gc keeps the
-// upstream pacing until run.bash passes with the elastic default (G3).
+// upstream pacing; elastic requires the greentea collector mode.
 func TestLogosPlainBuildKeepsUpstreamPacing(t *testing.T) {
-	out := logosPacerTrace(t)
+	out := logosPacerRun(t, "LogosPacerForced")
 	if logosElasticLine.MatchString(out) {
-		t.Fatalf("a build without -gc paces elastically:\n%s", out)
+		t.Fatalf("plain go build paced elastically:\n%s", out)
 	}
 }
 
@@ -243,7 +243,7 @@ func logosProgramRunWasm(t *testing.T, wasm string, env []string) string {
 }
 
 func logosProgramWasmEnv() []string {
-	return []string{"GOOS=js", "GOARCH=wasm", "GOEXPERIMENT=", "GOTOOLCHAIN=local", "GOPROXY=off"}
+	return []string{"GOOS=js", "GOARCH=wasm", "GOMAXPROCS=1", "GOEXPERIMENT=", "GOTOOLCHAIN=local", "GOPROXY=off"}
 }
 
 func TestLogosPacerWasmDefaultLogosKeepsUpstream(t *testing.T) {
@@ -258,6 +258,9 @@ func TestLogosPacerWasmDefaultLogosKeepsUpstream(t *testing.T) {
 	}
 }
 
+// TestLogosPacerWasmPlainGoKeepsUpstream: plain go wasm has an empty
+// production-controller mode, which keeps the upstream pacing like every
+// other empty mode; only an explicit greentea selection paces elastically.
 func TestLogosPacerWasmPlainGoKeepsUpstream(t *testing.T) {
 	env := logosProgramWasmEnv()
 	wasm := logosProgramBuildWasm(t, "go", env)
@@ -266,7 +269,7 @@ func TestLogosPacerWasmPlainGoKeepsUpstream(t *testing.T) {
 		t.Fatalf("wasm program did not finish:\n%s", out)
 	}
 	if logosElasticLine.MatchString(out) {
-		t.Fatalf("plain go wasm paces elastically:\n%s", out)
+		t.Fatalf("plain go wasm paced elastically:\n%s", out)
 	}
 }
 

@@ -216,6 +216,8 @@ func gcenable() {
 	<-c
 	<-c
 	memstats.enablegc = true // now that runtime is initialized, GC is okay
+	// Start card recording for amd64 GreenTea builds run without -gc or
+	// under -gc=greentea; other modes stay non-generational.
 	logosGenEnable()
 }
 
@@ -239,7 +241,7 @@ var gcphase uint32
 //go:linkname writeBarrier
 var writeBarrier struct {
 	enabled bool    // compiler emits a check of this before calling write barrier
-	cards   bool    // pointer stores record their slots for the card table (logosgen)
+	cards   bool    // pointer stores record their slots for the card table on amd64 GreenTea
 	pad     [2]byte // compiler uses 32-bit load for "enabled" field
 	alignme uint64  // guarantee alignment so that compiler can use a 32 or 64-bit load
 }
@@ -857,6 +859,10 @@ func gcStart(trigger gcTrigger) {
 		finishsweep_m()
 	})
 	logosGenBeginCycle(trigger)
+	// Immix O4: flip to a clean active dirty table. World stopped (after
+	// stopTheWorldWithSema above), so no barrier is in flight — lossless.
+	// Incoming table was cleared at the previous termination.
+	logosImmixFlipDirtyEpoch()
 
 	// clearpools before we start the GC. If we wait the memory will not be
 	// reclaimed until the next GC cycle.
@@ -1420,6 +1426,11 @@ func gcMarkTermination(stw worldStop) {
 		}
 		logosGenEndCycle()
 		logosMovingMarkTermination()
+		// Immix O4: selection has read the active dirty plane; clear the
+		// incoming table for exactly the previous cycle's dirtied blocks.
+		// Still STW (world restarts below), bounded work, no whole-heap
+		// scan. Stale dirt would only over-pin (underselect), never free.
+		logosImmixClearIncomingDirty()
 
 		// marking is complete so we can turn the write barrier off
 		setGCPhase(_GCoff)
@@ -2102,6 +2113,7 @@ func gcSweep(mode gcMode) bool {
 	mheap_.reclaimIndex.Store(0)
 	mheap_.reclaimCredit.Store(0)
 	unlock(&mheap_.lock)
+	zgcRefreshDeferredSpans()
 
 	sweep.centralIndex.clear()
 

@@ -8,6 +8,7 @@ package json
 
 import (
 	stdjson "encoding/json"
+	jsonv2 "encoding/json/v2"
 	"reflect"
 	"strings"
 )
@@ -15,6 +16,13 @@ import (
 // maxWalkDepth mirrors jsontext maxNestingDepth: the encoder push fails
 // once the stack holds this many tokens.
 const maxWalkDepth = 10000
+
+var walkMethodTypes = []reflect.Type{
+	reflect.TypeFor[jsonv2.MarshalerTo](),
+	marshalerType,
+	textAppenderType,
+	textMarshalerType,
+}
 
 // newWalkDepthError obtains the standard library's depth error using
 // only its public API. This runs only after encoding has already failed,

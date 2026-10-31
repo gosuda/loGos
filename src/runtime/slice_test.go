@@ -515,9 +515,6 @@ func byteSlice(n int) []byte {
 	return r
 }
 func TestAppendByteInLoop(t *testing.T) {
-	if logosOptAppendByteInLoop(t) {
-		return
-	}
 	testenv.SkipIfOptimizationOff(t)
 	if race.Enabled {
 		t.Skip("skipping in -race mode")
@@ -579,9 +576,6 @@ func ptrSlice(n int, p *[]*byte) {
 	*p = r
 }
 func TestAppendPtrInLoop(t *testing.T) {
-	if logosOptAppendPtrInLoop(t) {
-		return
-	}
 	testenv.SkipIfOptimizationOff(t)
 	if race.Enabled {
 		t.Skip("skipping in -race mode")
@@ -651,9 +645,6 @@ func byteCapSlice(n int) ([]byte, int) {
 	return r, cap(r)
 }
 func TestAppendByteCapInLoop(t *testing.T) {
-	if logosOptAppendByteCapInLoop(t) {
-		return
-	}
 	testenv.SkipIfOptimizationOff(t)
 	if race.Enabled {
 		t.Skip("skipping in -race mode")

@@ -1,0 +1,58 @@
+// run -O=3
+
+package main
+
+import "fmt"
+
+// REDTEAM #121 (SPEC Sec 2.3, T-203.4; IMPLEMENTATION.md M13-S3): a
+// `const []Creature` parameter receiving a `[]*Monster` must specialize
+// with no copy loop. The `const` is a container qualifier over the slice;
+// it must not ban the interface element and must not demand `const`
+// methods. No run-time call-site cache must exist. At -O=3 the call below
+// folds to a `const []*Monster` clone; at -O=1 the same program runs
+// through the const-slice lowering with identical output. A nil slice stays
+// nil and a slice that is already a []Creature takes the original function.
+// There is no Go twin: const views are loGo/s syntax. Distinct from
+// test/logos/run/specialize_constslice.lgo, which pins the same property
+// with different values; this fixture is the #121 close-out probe.
+
+type r121Creature interface {
+	const Name() string
+}
+
+type r121Monster struct{ name string }
+
+func (m *r121Monster) Name() string { return m.name }
+
+func r121Names(cs const []r121Creature) string {
+	out := ""
+	for i, c := range cs {
+		if i > 0 {
+			out += ","
+		}
+		out += c.Name()
+	}
+	return out
+}
+
+// Ordinary-method covariance: the container `const` must not require the
+// element interface methods to be `const`. This mirrors the admitted shape
+// in src/internal/types/testdata/logos/const_slice_cov.lgo, which pins
+// `const []Creature` with an ordinary `Name` for declaration and passing;
+// only len is exercised here, so no dynamic-call rule is at stake.
+type r121Ordinary interface {
+	Name() string
+}
+
+func r121OrdLen(cs const []r121Ordinary) int { return len(cs) }
+
+func main() {
+	ms := []*r121Monster{{name: "ash"}, {name: "birch"}, {name: "cedar"}}
+	fmt.Println(r121Names(ms))
+	fmt.Println(r121Names(nil))
+	var none []*r121Monster
+	fmt.Println(len(r121Names(none)))
+	cs := []r121Creature{&r121Monster{name: "dune"}}
+	fmt.Println(r121Names(cs))
+	fmt.Println(r121OrdLen(ms))
+}

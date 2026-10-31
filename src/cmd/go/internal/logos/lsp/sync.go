@@ -86,7 +86,7 @@ func (p *Proxy) clientNotification(ctx context.Context, m *message) {
 	case "textDocument/didSave":
 		p.didSave(ctx, m)
 	case "textDocument/didClose":
-		p.didClose(m)
+		p.didClose(ctx, m)
 	case "workspace/didChangeWatchedFiles":
 		p.watched(ctx, m)
 	default:
@@ -196,10 +196,14 @@ func (p *Proxy) didSave(ctx context.Context, m *message) {
 	p.forwardUnlessLogos(m, path)
 }
 
-// didClose forgets the document. The package stays compiled while another
-// of its documents is open; when none is, the lowered documents only it
-// needed go away.
-func (p *Proxy) didClose(m *message) {
+// didClose forgets the document and what the compiles took from its
+// buffer. Closing discards the client's unsaved text, so every package
+// compiled with it, the package of the document and each one whose
+// closure holds that package, is marked dirty and recompiled from what is
+// on disk. The package of the document stays compiled while another of its
+// documents is open; when none is, the unit goes away, and with it the
+// lowered documents only it needed.
+func (p *Proxy) didClose(ctx context.Context, m *message) {
 	var params docParams
 	if err := json.Unmarshal(m.Params, &params); err != nil {
 		p.logf("didClose: %v", err)
@@ -209,14 +213,33 @@ func (p *Proxy) didClose(m *message) {
 	path := docPath(params.TextDocument.URI)
 	p.work.Lock()
 	defer p.work.Unlock()
-	p.mu.Lock()
-	delete(p.docs, path)
-	p.dropUnitLocked(filepath.Dir(path))
-	p.pruneLocked()
-	p.mu.Unlock()
+	open := p.forget(path)
 	p.forwardUnlessLogos(m, path)
+	if open {
+		p.refreshLocked(ctx)
+	}
 	p.syncGopls()
 	p.publishAll()
+}
+
+// forget removes the open document at path, marks dirty the units that
+// compiled with its buffer, and drops the unit of its package when no
+// open document is left there. It reports whether the document was open.
+// The caller holds p.work.
+func (p *Proxy) forget(path string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, open := p.docs[path]
+	if open {
+		// The touch comes before the drop: touchLocked makes a unit for
+		// the package of path when it has none, so touching after the
+		// drop would bring back a unit no open document holds.
+		delete(p.docs, path)
+		p.touchLocked(path)
+		p.dropUnitLocked(filepath.Dir(path))
+	}
+	p.pruneLocked()
+	return open
 }
 
 // watched marks every package for recompilation when a watched file that

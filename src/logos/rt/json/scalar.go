@@ -250,7 +250,7 @@ func quotedOther(item string) quotedResult {
 	case 'n', 't', 'f':
 		return qSavedTag
 	case '"':
-		if _, ok := unquoteLiteral(item); ok {
+		if _, ok := unquoteStringContent(item); ok {
 			return qString
 		}
 	}
@@ -274,6 +274,9 @@ func quotedIntValue(item string, bits int) (int64, quotedResult) {
 		return 0, qNoop
 	}
 	if item == "" || !isNumberStart(item[0]) {
+		if v, ok := quotedIntFallback(item, bits); ok {
+			return v, qSet
+		}
 		return 0, quotedOther(item)
 	}
 	if v, ok := parseInt(item, bits); ok {
@@ -287,6 +290,9 @@ func quotedUintValue(item string, bits int) (uint64, quotedResult) {
 		return 0, qNoop
 	}
 	if item == "" || !isNumberStart(item[0]) {
+		if v, ok := quotedUintFallback(item, bits); ok {
+			return v, qSet
+		}
 		return 0, quotedOther(item)
 	}
 	if v, ok := parseUint(item, bits); ok {
@@ -300,6 +306,9 @@ func quotedFloatValue(item string, bits int) (float64, quotedResult) {
 		return 0, qNoop
 	}
 	if item == "" || !isNumberStart(item[0]) {
+		if v, ok := quotedFloatFallback(item, bits); ok {
+			return v, qSet
+		}
 		return 0, quotedOther(item)
 	}
 	if v, err := strconv.ParseFloat(item, bits); err == nil {
@@ -313,7 +322,7 @@ func quotedStringValue(item string) (string, quotedResult) {
 		return "", qNoop
 	}
 	if item != "" && item[0] == '"' {
-		if v, ok := unquoteLiteral(item); ok {
+		if v, ok := unquoteStringContent(item); ok {
 			return v, qSet
 		}
 		return "", qFatalTag
@@ -321,14 +330,15 @@ func quotedStringValue(item string) (string, quotedResult) {
 	return "", quotedOther(item)
 }
 
+// rejectQuoted records a failed quoted ,string value. The saved-versus-fatal
+// policy and the error shape are version-gated in rejectQuotedContent
+// (path_v1.go preserves the legacy tagError behavior, path_v2.go saves the
+// bridge-compatible *UnmarshalTypeError). qRange is version-proof and stays
+// here; qNoop and qSet never reach this function.
 func rejectQuoted[T any](s *Scanner, res quotedResult, item string) {
 	switch res {
-	case qSavedTag:
-		s.save(tagMismatch(item, reflect.TypeFor[T]()))
-	case qFatalTag:
-		s.fatal(tagMismatch(item, reflect.TypeFor[T]()))
-	case qString:
-		s.rejectKind(reflect.TypeFor[T]())
+	case qSavedTag, qFatalTag, qString:
+		s.rejectQuotedContent(res, item, reflect.TypeFor[T]())
 	case qRange:
 		s.rejectNumber(item, reflect.TypeFor[T]())
 	}
@@ -338,7 +348,7 @@ func readQuotedAs[T any](s *Scanner, dst *T, parse func(string) (T, quotedResult
 	item, st := s.readQuoted()
 	switch st {
 	case quotedBare:
-		s.save(tagUnquoted(reflect.TypeFor[T]()))
+		s.rejectQuotedBare(reflect.TypeFor[T]())
 	case quotedContent:
 		v, res := parse(item)
 		if res == qSet {

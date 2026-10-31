@@ -30,6 +30,21 @@ from mercurial import registrar, ui, hg, node
 from mercurial.i18n import _
 cmdtable = {}
 command = registrar.command(cmdtable)
+
+def _branchmap_items(peer):
+  """Iterate the peer branchmap on every supported Mercurial.
+
+  Mercurial up to 6.x returns a dict of branch name to head nodes.
+  7.x local peers return a BranchCacheV2, which iterates branch names and
+  serves the head nodes, closed heads included, via
+  branchheads(name, closed=True). Both spellings yield every head of every
+  branch in Mercurial's canonical order, so the hashed input is unchanged.
+  """
+  bm = peer.branchmap()
+  if hasattr(bm, 'items'):
+    return bm.items()
+  return [(name, bm.branchheads(name, closed=True)) for name in bm]
+
 @command(b'goreposum', [], _('url'), norepo=True)
 def goreposum(ui, url):
   """
@@ -41,7 +56,7 @@ def goreposum(ui, url):
   """
   h = hashlib.sha256()
   peer = hg.peer(ui, {}, url)
-  for name, revs in peer.branchmap().items():
+  for name, revs in _branchmap_items(peer):
     h.update(name)
     for r in revs:
       h.update(b' ')

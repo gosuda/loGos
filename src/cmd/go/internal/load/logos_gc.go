@@ -23,6 +23,7 @@ func LogosBuildGC(ld *modload.Loader) (mode string, set bool) {
 }
 
 // logosGCGcflags returns the compile flags the collector mode adds to p.
+// ZGC adds load barriers to every package, including the runtime.
 // Batch and epsilon compile every package without write barriers except the
 // runtime and the packages it imports (the objabi runtime list), which keep
 // them. The mode is sound only because marking never runs concurrently with
@@ -31,6 +32,8 @@ func LogosBuildGC(ld *modload.Loader) (mode string, set bool) {
 // package's other gcflags.
 func logosGCGcflags(p *Package) []string {
 	switch cfg.LogosGC {
+	case "zgc":
+		return []string{"-lb"}
 	case "batch", "epsilon":
 		if !p.Standard || !objabi.LookupPkgSpecial(p.ImportPath).Runtime {
 			return []string{"-wb=false"}

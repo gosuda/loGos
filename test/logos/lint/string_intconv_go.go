@@ -1,4 +1,4 @@
-// errorcheck -0
+// errorcheck
 
 // suspicious::string_intconv on a Go package (LINT-RULES.md Sec 1.2): detects
 // conversions of the form string(x) where x has an integer type other than
@@ -9,9 +9,9 @@ package p
 import "strconv"
 
 func badConversions(port int, id int64) {
-	_ = string(port) // ERROR "\[suspicious::string_intconv\]"
-	_ = string(1234) // ERROR "\[suspicious::string_intconv\]"
-	_ = string(id)   // ERROR "\[suspicious::string_intconv\]"
+	_ = string(port) // ERROR "\[suspicious::string_intconv\]" "\[nogo::stringintconv\]"
+	_ = string(1234) // ERROR "\[suspicious::string_intconv\]" "\[nogo::stringintconv\]"
+	_ = string(id)   // ERROR "\[suspicious::string_intconv\]" "\[nogo::stringintconv\]"
 }
 
 func formatDecimal(x int) string {
@@ -29,6 +29,7 @@ func cleanConversions(port int, r rune, b byte, bs []byte) {
 }
 
 //logos:allow(suspicious::string_intconv)
+//logos:allow(nogo::stringintconv)
 func allowedInGo(port int) string {
 	return string(port)
 }

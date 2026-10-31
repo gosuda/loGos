@@ -659,7 +659,7 @@ func simdChunkAddr(sh *simdShape, v string, c, k int64) string {
 
 // simdElemwiseText builds the IIFE text computing aText op bText over
 // shape sh, in vector form when the build selects it.
-func (fl *fileLower) simdElemwiseText(sh *simdShape, op syntax.Operator, aText, bText string) string {
+func (fl *fileLower) simdElemwiseText(sh *simdShape, op syntax.Operator, aText, bText otext) otext {
 	params := "_logos_a, _logos_b " + sh.spell
 	if vec, chunks, feat, ok := simdVecForm(sh, op); ok {
 		load := logosSimdAlias + ".Load" + vec + "Array"
@@ -680,11 +680,11 @@ func (fl *fileLower) simdElemwiseText(sh *simdShape, op syntax.Operator, aText, 
 		fl.needSimd = true
 		vecBody := strings.Join(stmts, "; ")
 		if cond := fl.simdGuardCond(feat); cond != "" {
-			return "func(" + params + ") " + sh.spell + " { if " + cond + " { " + vecBody + " } else { " + simdScalarBody(sh, op) + " } }(" + aText + ", " + bText + ")"
+			return cat(gen("func("+params+") "+sh.spell+" { if "+cond+" { "+vecBody+" } else { "+simdScalarBody(sh, op)+" } }("), aText, gen(", "), bText, gen(")"))
 		}
-		return "func(" + params + ") " + sh.spell + " { " + vecBody + " }(" + aText + ", " + bText + ")"
+		return cat(gen("func("+params+") "+sh.spell+" { "+vecBody+" }("), aText, gen(", "), bText, gen(")"))
 	}
-	return "func(" + params + ") " + sh.spell + " { " + simdScalarBody(sh, op) + " }(" + aText + ", " + bText + ")"
+	return cat(gen("func("+params+") "+sh.spell+" { "+simdScalarBody(sh, op)+" }("), aText, gen(", "), bText, gen(")"))
 }
 
 // simdReduceBody folds the lanes of v in the fixed pairwise tree, one
@@ -757,19 +757,19 @@ func (fl *fileLower) lowerSimdCall(c *syntax.CallExpr, s simdSite) {
 	}
 	method := sel.Sel.Value
 	recvText := fl.textOf(s.ops[0])
-	var text string
+	var text otext
 	switch method {
 	case "sum":
-		text = "func(_logos_a " + sh.spell + ") " + sh.elemSpell + " { " + simdSumBody("_logos_a", sh.len) + " }(" + recvText + ")"
+		text = cat(gen("func(_logos_a "+sh.spell+") "+sh.elemSpell+" { "+simdSumBody("_logos_a", sh.len)+" }("), recvText, gen(")"))
 	case "min", "max":
-		text = "func(_logos_a " + sh.spell + ") " + sh.elemSpell + " { " + simdMinMaxBody("_logos_a", sh.len, method) + " }(" + recvText + ")"
+		text = cat(gen("func(_logos_a "+sh.spell+") "+sh.elemSpell+" { "+simdMinMaxBody("_logos_a", sh.len, method)+" }("), recvText, gen(")"))
 	case "dot":
 		if len(c.ArgList) != 1 {
 			return
 		}
 		argText := fl.textOf(s.ops[1])
 		inner := fl.simdElemwiseText(sh, syntax.Mul, recvText, argText)
-		text = "func(_logos_p " + sh.spell + ") " + sh.elemSpell + " { " + simdSumBody("_logos_p", sh.len) + " }(" + inner + ")"
+		text = cat(gen("func(_logos_p "+sh.spell+") "+sh.elemSpell+" { "+simdSumBody("_logos_p", sh.len)+" }("), inner, gen(")"))
 	default:
 		return
 	}
@@ -778,10 +778,10 @@ func (fl *fileLower) lowerSimdCall(c *syntax.CallExpr, s simdSite) {
 
 // replaceSimd parses text as the replacement expression and swaps it
 // for old, recording the matching eject splice over whole.
-func (fl *fileLower) replaceSimd(old syntax.Expr, whole span, text string) {
-	frag := parseSimdExprFrag(text, old.Pos())
+func (fl *fileLower) replaceSimd(old syntax.Expr, whole span, text otext) {
+	frag := parseSimdExprFrag(text.s, old.Pos())
 	replaceTupleExpr(fl.file, old, frag)
-	fl.add(whole.start, whole.end, text)
+	fl.addT(whole.start, whole.end, text)
 }
 
 // parseSimdExprFrag parses text as one expression and normalizes every

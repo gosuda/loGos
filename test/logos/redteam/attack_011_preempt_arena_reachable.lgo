@@ -1,0 +1,162 @@
+// run -goexperiment logosarena
+
+package main
+
+// #11: async preemption migrating G mid-arena use (IMPLEMENTATION.md
+// M18-S3, SPEC Sec 8.3, T-301.1). Arena objects in use must stay reachable
+// across preemption, the bump sequence must be an async-preemption unsafe
+// point, and the collector must scan scan-region objects with the owning
+// goroutine stack. The PCDATA unsafe marker itself is pinned by
+// test/logos/codegen/arena_bump.lgo; this run fixture pins the end-to-end
+// reachability: scan objects keep heap referents alive across GC, and
+// noscan/scan allocations survive preemption (Gosched) with concurrent GC.
+// Small waves only, value checks only, no timing or counter asserts.
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"runtime"
+	"testing"
+)
+
+type preNode struct {
+	v int
+}
+
+var preSink int
+
+var prePool []*preNode
+
+//go:noinline
+func preScratch(n int) int {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte((i * 17) & 0xFF)
+	}
+	s := 0
+	for _, v := range b {
+		s += int(v)
+	}
+	return s
+}
+
+//go:noinline
+func preScanSum(n int) (int, bool) {
+	s := make([]*preNode, 0, n)
+	for i := 0; i < n; i++ {
+		s = append(s, &preNode{v: i})
+	}
+	before := 0
+	for _, p := range s {
+		before += p.v
+	}
+	first := s[0]
+	last := s[n-1]
+	runtime.GC()
+	runtime.GC()
+	after := 0
+	for _, p := range s {
+		after += p.v
+	}
+	ident := s[0] == first && s[n-1] == last && before == after
+	runtime.KeepAlive(s)
+	return after, ident
+}
+
+func scanReachable() error {
+	sum, ident := preScanSum(512)
+	if !ident {
+		return fmt.Errorf("scan objects lost referents across GC")
+	}
+	want := 512 * 511 / 2
+	if sum != want {
+		return fmt.Errorf("scan sum %d, want %d", sum, want)
+	}
+	return nil
+}
+
+//go:noinline
+func preSliceFromPool(pool []*preNode, n int) int {
+	s := make([]*preNode, 0, n)
+	for _, p := range pool[:n] {
+		s = append(s, p)
+	}
+	sum := 0
+	for _, p := range s {
+		sum += p.v
+	}
+	return sum
+}
+
+func preemptWaves(ctx context.Context) error {
+	const workers = 8
+	const iters = 200
+	sums := make([]int, workers)
+	go group (ctx) {
+		for w := 0; w < workers; w++ {
+			go {
+				total := 0
+				for i := 0; i < iters; i++ {
+					total += preScratch(1024)
+					if i%16 == 0 {
+						runtime.Gosched()
+					}
+				}
+				sums[w] = total
+			}
+		}
+		go {
+			for i := 0; i < 4; i++ {
+				runtime.GC()
+				runtime.Gosched()
+			}
+		}
+	}
+	for w := 0; w < workers; w++ {
+		if sums[w] == 0 {
+			return fmt.Errorf("worker %d sum zero", w)
+		}
+	}
+	// Determinism check: same computation without preemption must match
+	// the per-iteration sum shape (each iteration sums the same pattern).
+	single := preScratch(1024)
+	for w := 0; w < workers; w++ {
+		if sums[w] != single*iters {
+			return fmt.Errorf("worker %d sum %d, want %d", w, sums[w], single*iters)
+		}
+	}
+	return nil
+}
+
+//logos:allow(complexity::cognitive_overflow)
+func main() {
+	ctx := context.Background()
+	if err := scanReachable(); err != nil {
+		fmt.Println("FAIL", err)
+		os.Exit(1)
+	}
+	fmt.Println("scan-reachable: ok")
+	if err := preemptWaves(ctx); err != nil {
+		fmt.Println("FAIL", err)
+		os.Exit(1)
+	}
+	fmt.Println("preempt-reachable: ok")
+	prePool = make([]*preNode, 0, 512)
+	for i := 0; i < 512; i++ {
+		prePool = append(prePool, &preNode{v: i})
+	}
+	allocNoscan := testing.AllocsPerRun(100, func() { preSink = preScratch(1024) })
+	fmt.Println("alloc-noscan:", allocNoscan)
+	if allocNoscan != 0 {
+		fmt.Println("FAIL noscan backing took heap allocations")
+		os.Exit(1)
+	}
+	allocScan := testing.AllocsPerRun(100, func() { preSink = preSliceFromPool(prePool, 512) })
+	fmt.Println("alloc-scan:", allocScan)
+	if allocScan != 0 {
+		fmt.Println("FAIL scan backing took heap allocations")
+		os.Exit(1)
+	}
+	_ = preSink
+}

@@ -13,6 +13,7 @@
 package runtime
 
 import (
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/gc"
 	"internal/runtime/sys"
@@ -82,6 +83,9 @@ func (c *mcentral) fullSwept(sweepgen uint32) *spanSet {
 func (c *mcentral) cacheSpan() *mspan {
 	// Deduct credit for this span allocation and sweep if necessary.
 	spanBytes := uintptr(gc.SizeClassToNPages[c.spanclass.sizeclass()]) * pageSize
+	if goexperiment.LogosGCMoving {
+		spanBytes = logosImmixCacheSpanBytes(c.spanclass)
+	}
 	deductSweepCredit(spanBytes, 0)
 
 	traceDone := false
@@ -258,6 +262,9 @@ func (c *mcentral) uncacheSpan(s *mspan) {
 // grow allocates a new empty span from the heap and initializes it for c's size class.
 func (c *mcentral) grow() *mspan {
 	npages := uintptr(gc.SizeClassToNPages[c.spanclass.sizeclass()])
+	if goexperiment.LogosGCMoving {
+		npages = logosImmixGrowNPages(c.spanclass)
+	}
 	s := mheap_.alloc(npages, c.spanclass)
 	if s == nil {
 		return nil

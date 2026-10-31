@@ -211,3 +211,79 @@ func TestLogosArenaVetoes(t *testing.T) {
 		}
 	})
 }
+
+// TestLogosArenaConstProductOverflow pins that the constant-size verdicts
+// bound the capacity by division before any product exists: an element size
+// that wraps capacity*size to a small value must not pass for a small make.
+func TestLogosArenaConstProductOverflow(t *testing.T) {
+	enableLogosArena(t)
+	fn := &ir.Func{}
+	pos := src.NoXPos
+
+	constMake := func(elem *types.Type, capVal int64) *ir.MakeExpr {
+		n := logosArenaTestMake(ir.NewInt(pos, capVal), nil, ir.EscNone)
+		n.SetType(types.NewSlice(elem))
+		return n
+	}
+	array := func(size int64) *types.Type {
+		return types.NewArray(types.Types[types.TUINT8], size)
+	}
+
+	// A product of 2^64+2^15 wraps to 2^15: a size that fits one chunk if
+	// the multiplication is trusted.
+	wrapElem, wrapCap := types.MaxWidth/2+1, int64(1)<<15
+	if uint64(wrapElem)*uint64(wrapCap) != 1<<15 {
+		t.Fatalf("premise: %d * %d does not wrap to 2^15", wrapElem, wrapCap)
+	}
+	// A product of exactly 2^64 wraps to zero.
+	zeroElem, zeroCap := types.MaxWidth/2, int64(1)<<15
+	if uint64(zeroElem)*uint64(zeroCap) != 0 {
+		t.Fatalf("premise: %d * %d does not wrap to 0", zeroElem, zeroCap)
+	}
+
+	tests := []struct {
+		name      string
+		make      *ir.MakeExpr
+		wantBytes int64
+		wantOK    bool
+	}{
+		{"byte slice", constMake(types.Types[types.TUINT8], 4096), 4096, true},
+		{"largest byte slice", constMake(types.Types[types.TUINT8], LogosArenaMaxBytes), LogosArenaMaxBytes, true},
+		{"one byte too large", constMake(types.Types[types.TUINT8], LogosArenaMaxBytes+1), 0, false},
+		{"largest word slice", constMake(types.Types[types.TUINT64], LogosArenaMaxBytes/8), LogosArenaMaxBytes / 8 * 8, true},
+		{"one word too large", constMake(types.Types[types.TUINT64], LogosArenaMaxBytes/8+1), 0, false},
+		{"element of one chunk", constMake(array(LogosArenaMaxBytes), 1), LogosArenaMaxBytes, true},
+		{"element past one chunk", constMake(array(LogosArenaMaxBytes+1), 1), 0, false},
+		{"zero capacity", constMake(types.Types[types.TUINT8], 0), 0, false},
+		{"product wraps to small", constMake(array(wrapElem), wrapCap), 0, false},
+		{"product wraps to zero", constMake(array(zeroElem), zeroCap), 0, false},
+		{"dynamic capacity", logosArenaDynamicMake(ir.EscNone), 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBytes, gotOK := LogosArenaConstBytes(tt.make)
+			if gotBytes != tt.wantBytes || gotOK != tt.wantOK {
+				t.Errorf("LogosArenaConstBytes() = %d, %v, want %d, %v", gotBytes, gotOK, tt.wantBytes, tt.wantOK)
+			}
+			if got := LogosArenaConstMake(tt.make, fn); got != (tt.wantOK && tt.wantBytes > int64(base.Debug.VariableMakeThreshold)) {
+				t.Errorf("LogosArenaConstMake() = %v for %d bytes (ok %v)", got, tt.wantBytes, tt.wantOK)
+			}
+		})
+	}
+
+	// The retained-result shape test divides first as well.
+	for _, tt := range []struct {
+		name         string
+		elemSize, n  int64
+		wantFitsOnce bool
+	}{
+		{"wraps to small", wrapElem, wrapCap, false},
+		{"wraps to zero", zeroElem, zeroCap, false},
+		{"exact fit", 8, LogosArenaMaxBytes / 8, true},
+		{"one past", 8, LogosArenaMaxBytes/8 + 1, false},
+	} {
+		if got := logosArenaConstFits(tt.n, tt.elemSize); got != tt.wantFitsOnce {
+			t.Errorf("logosArenaConstFits(%d, %d) = %v (%s), want %v", tt.n, tt.elemSize, got, tt.name, tt.wantFitsOnce)
+		}
+	}
+}

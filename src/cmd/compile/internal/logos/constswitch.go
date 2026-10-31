@@ -51,7 +51,7 @@ type cswCase struct {
 	typ  types2.Type
 
 	// spell is the source spelling of the case type.
-	spell string
+	spell otext
 
 	// lo and hi are the byte offsets where the clause body starts and ends.
 	lo, hi int
@@ -167,7 +167,7 @@ func isIfaceLower(typ types2.Type) bool {
 // brace for the tag), because EndPos stops early on composite types. The
 // type starts at the first token after the header keywords and ends at the
 // last token before bound.
-func (c *cswLower) spell(from, bound int) string {
+func (c *cswLower) spell(from, bound int) otext {
 	start := typeStart(c.fl.src, from, bound)
 	return c.fl.textOf(span{start, typeEnd(c.fl.src, start, bound)})
 }
@@ -243,7 +243,7 @@ func (c *cswLower) lowerFold() []syntax.Stmt {
 	stmts, text := c.caseBody(match, "")
 	block := closeAt(c.stmt.Pos(), stmts, c.stmt.Rbrace)
 	kept := span{match.lo, match.hi}
-	c.fl.add(c.start, c.end, leftoverComments(c.fl, span{c.start, c.end}, []span{kept})+"{"+text+"}")
+	c.fl.addT(c.start, c.end, cat(leftoverComments(c.fl, span{c.start, c.end}, []span{kept}), gen("{"), text, gen("}")))
 	return []syntax.Stmt{block}
 }
 
@@ -279,19 +279,19 @@ func (c *cswLower) lowerRuntime() []syntax.Stmt {
 			}
 		}
 		stmt, text := c.typeSwitch(exacts, rest, "")
-		c.fl.add(c.start, c.end, text)
+		c.fl.addT(c.start, c.end, text)
 		return []syntax.Stmt{stmt}
 	}
 	pos := c.stmt.Pos()
 	done := fmt.Sprintf("_logos_csw%d", c.start)
 	block := at(&syntax.BlockStmt{Rbrace: c.stmt.Rbrace}, pos)
 	block.List = append(block.List, defineOf(pos, []syntax.Expr{nameOf(pos, done)}, []syntax.Expr{nameOf(pos, "false")}))
-	text := "{" + done + " := false\n"
+	text := gen("{" + done + " := false\n")
 	for _, run := range runs {
 		first := run[0].syn.Case
 		close := run[len(run)-1].close
 		var inner syntax.Stmt
-		var innerText string
+		var innerText otext
 		if run[0].kind == cswExact {
 			inner, innerText = c.typeSwitch(run, nil, done)
 			if sw, ok := inner.(*syntax.SwitchStmt); ok {
@@ -305,17 +305,17 @@ func (c *cswLower) lowerRuntime() []syntax.Stmt {
 			Cond: guard,
 			Then: closeAt(first, []syntax.Stmt{inner}, close),
 		}, first))
-		text += "if !" + done + " {" + innerText + "}\n"
+		text = cat(text, gen("if !"+done+" {"), innerText, gen("}\n"))
 	}
-	text += "}"
-	c.fl.add(c.start, c.end, text)
+	text = cat(text, gen("}"))
+	c.fl.addT(c.start, c.end, text)
 	return []syntax.Stmt{block}
 }
 
 // typeSwitch lowers the exact clauses of one run into a type switch on
 // any((*T)(nil)), with rest as its default clause when given. done names the
 // matched flag of a multi-run statement, or is empty.
-func (c *cswLower) typeSwitch(exacts, rest []*cswCase, done string) (syntax.Stmt, string) {
+func (c *cswLower) typeSwitch(exacts, rest []*cswCase, done string) (syntax.Stmt, otext) {
 	pos := c.stmt.Pos()
 	if len(exacts) > 0 {
 		pos = exacts[0].syn.Case
@@ -323,38 +323,38 @@ func (c *cswLower) typeSwitch(exacts, rest []*cswCase, done string) (syntax.Stmt
 		pos = rest[0].syn.Case
 	}
 	tag := c.spell(c.fl.off(c.stmt.Pos()), c.fl.off(c.stmt.Lbrace))
-	guard, ok := parseExprAt("any((*"+tag+")(nil))", pos)
+	guard, ok := parseExprAt("any((*"+tag.s+")(nil))", pos)
 	if !ok {
-		base.Fatalf("logos: const switch tag %s at %s cannot be respelled", tag, pos.String())
+		base.Fatalf("logos: const switch tag %s at %s cannot be respelled", tag.s, pos.String())
 	}
 	sw := at(&syntax.SwitchStmt{
 		Tag:    at(&syntax.TypeSwitchGuard{X: guard}, pos),
 		Rbrace: c.stmt.Rbrace,
 	}, pos)
-	text := "switch any((*" + tag + ")(nil)).(type) {"
+	text := cat(gen("switch any((*"), tag, gen(")(nil)).(type) {"))
 	for _, cs := range exacts {
 		stmts, bodyText := c.caseBody(cs, done)
-		ptr, ok := parseExprAt("*"+cs.spell, cs.syn.Case)
+		ptr, ok := parseExprAt("*"+cs.spell.s, cs.syn.Case)
 		if !ok {
-			base.Fatalf("logos: const switch case %s at %s cannot be respelled", cs.spell, cs.syn.Case.String())
+			base.Fatalf("logos: const switch case %s at %s cannot be respelled", cs.spell.s, cs.syn.Case.String())
 		}
 		sw.Body = append(sw.Body, at(&syntax.CaseClause{Cases: ptr, Body: stmts}, cs.syn.Case))
-		text += "\ncase *" + cs.spell + ":" + bodyText
+		text = cat(text, gen("\ncase *"), cs.spell, gen(":"), bodyText)
 	}
 	if len(rest) > 0 {
 		chain, chainText := c.chainIf(rest, done)
 		sw.Body = append(sw.Body, at(&syntax.CaseClause{Body: []syntax.Stmt{chain}}, rest[0].syn.Case))
-		text += "\ndefault:\n" + chainText
+		text = cat(text, gen("\ndefault:\n"), chainText)
 	}
-	text += "\n}"
+	text = cat(text, gen("\n}"))
 	return sw, text
 }
 
 // chainIf lowers a run of tilde and interface cases into one if chain, in
 // source order. The run is never empty.
-func (c *cswLower) chainIf(run []*cswCase, done string) (syntax.Stmt, string) {
+func (c *cswLower) chainIf(run []*cswCase, done string) (syntax.Stmt, otext) {
 	var next syntax.Stmt
-	var nextText string
+	var nextText otext
 	for i := len(run) - 1; i >= 0; i-- {
 		cs := run[i]
 		cond, condText := c.cond(cs)
@@ -364,9 +364,9 @@ func (c *cswLower) chainIf(run []*cswCase, done string) (syntax.Stmt, string) {
 			Then: closeAt(cs.syn.Case, stmts, cs.close),
 			Else: next,
 		}, cs.syn.Case)
-		text := "if " + condText + " {" + bodyText + "}"
+		text := cat(gen("if "), condText, gen(" {"), bodyText, gen("}"))
 		if next != nil {
-			text += " else " + nextText
+			text = cat(text, gen(" else "), nextText)
 		}
 		next, nextText = link, text
 	}
@@ -382,17 +382,17 @@ func closeAt(pos syntax.Pos, list []syntax.Stmt, close syntax.Pos) *syntax.Block
 
 // cond returns the run-time test of a tilde or interface case, as native
 // syntax and as eject text. Both use the support helpers of logos/rt.
-func (c *cswLower) cond(cs *cswCase) (syntax.Expr, string) {
+func (c *cswLower) cond(cs *cswCase) (syntax.Expr, otext) {
 	c.fl.needRT = true
 	tag := c.spell(c.fl.off(c.stmt.Pos()), c.fl.off(c.stmt.Lbrace))
 	helper := "Implements"
 	if cs.kind == cswTilde {
 		helper = "TildeIs"
 	}
-	text := rtAlias + "." + helper + "[" + tag + ", " + cs.spell + "]()"
-	expr, ok := parseExprAt(text, cs.syn.Case)
+	text := cat(gen(rtAlias+"."+helper+"["), tag, gen(", "), cs.spell, gen("]()"))
+	expr, ok := parseExprAt(text.s, cs.syn.Case)
 	if !ok {
-		base.Fatalf("logos: const switch case %s at %s cannot be respelled", cs.spell, cs.syn.Case.String())
+		base.Fatalf("logos: const switch case %s at %s cannot be respelled", cs.spell.s, cs.syn.Case.String())
 	}
 	return expr, text
 }
@@ -404,7 +404,7 @@ func (c *cswLower) cond(cs *cswCase) (syntax.Expr, string) {
 // them; the rebinding declarations and the matched flag come first; and the
 // body text is read once, with every splice applied. done, when set, is the
 // matched flag that the body raises before it runs.
-func (c *cswLower) caseBody(cs *cswCase, done string) ([]syntax.Stmt, string) {
+func (c *cswLower) caseBody(cs *cswCase, done string) ([]syntax.Stmt, otext) {
 	if cs.kind == cswIface {
 		c.wrapSelectors(cs.syn.Body, cs)
 	} else if cs.sub.Target != nil {
@@ -412,23 +412,23 @@ func (c *cswLower) caseBody(cs *cswCase, done string) ([]syntax.Stmt, string) {
 	}
 	lowered := c.fc.lowerList(cs.syn.Body)
 	var head []syntax.Stmt
-	var headText string
+	var headText otext
 	if done != "" {
 		head = append(head, at(&syntax.AssignStmt{Lhs: nameOf(cs.syn.Case, done), Rhs: nameOf(cs.syn.Case, "true")}, cs.syn.Case))
-		headText = done + " = true\n"
+		headText = gen(done + " = true\n")
 	}
 	decls, declText := c.rebindings(cs)
 	body := c.fl.textOf(span{cs.lo, cs.hi})
 	stmts := append(head, decls...)
-	return append(stmts, lowered...), headText + declText + body
+	return append(stmts, lowered...), cat(headText, declText, body)
 }
 
 // rebindings declares each variable of cs whose type names the switched type
 // with its case type, at the start of the body. It returns the declarations
 // as native statements and as eject text.
-func (c *cswLower) rebindings(cs *cswCase) ([]syntax.Stmt, string) {
+func (c *cswLower) rebindings(cs *cswCase) ([]syntax.Stmt, otext) {
 	var decls []syntax.Stmt
-	var text string
+	var text otext
 	for _, r := range c.rebound(cs) {
 		c.fl.needRT = true
 		rhs := rtAlias + ".Reinterpret[" + r.spell + "](&" + r.name + ")"
@@ -437,7 +437,7 @@ func (c *cswLower) rebindings(cs *cswCase) ([]syntax.Stmt, string) {
 			base.Fatalf("logos: const switch rebinding of %s at %s cannot be respelled", r.name, cs.syn.Case.String())
 		}
 		decls = append(decls, defineOf(cs.syn.Case, []syntax.Expr{nameOf(cs.syn.Case, r.name)}, []syntax.Expr{expr}))
-		text += r.name + " := " + rhs + "\n"
+		text = cat(text, gen(r.name+" := "+rhs+"\n"))
 	}
 	return decls, text
 }
@@ -496,14 +496,14 @@ func (c *cswLower) replaceTargetNames(body []syntax.Stmt, cs *cswCase) {
 		info:   c.info,
 		target: cs.sub.Target,
 		repl: func(pos syntax.Pos) syntax.Expr {
-			e, ok := parseExprAt(spell, pos)
+			e, ok := parseExprAt(spell.s, pos)
 			if !ok {
-				base.Fatalf("logos: const switch case %s at %s cannot be respelled", spell, pos.String())
+				base.Fatalf("logos: const switch case %s at %s cannot be respelled", spell.s, pos.String())
 			}
 			return e
 		},
 		off:    c.fl.off,
-		splice: func(start, end int) { c.fl.add(start, end, spell) },
+		splice: func(start, end int) { c.fl.addT(start, end, spell) },
 	}
 	w.list(body)
 }
@@ -613,9 +613,9 @@ func (c *cswLower) wrapSelectors(body []syntax.Stmt, cs *cswCase) {
 				return true
 			}
 			xpos := leftmostOf(sel.X)
-			iface, ok := typeExprAt(cs.spell, xpos)
+			iface, ok := typeExprAt(cs.spell.s, xpos)
 			if !ok {
-				base.Fatalf("logos: const switch interface %s at %s cannot be respelled", cs.spell, xpos.String())
+				base.Fatalf("logos: const switch interface %s at %s cannot be respelled", cs.spell.s, xpos.String())
 			}
 			xstart := c.fl.off(xpos)
 			xend := typeEnd(c.fl.src, xstart, c.fl.off(sel.Sel.Pos()))
@@ -631,7 +631,7 @@ func (c *cswLower) wrapSelectors(body []syntax.Stmt, cs *cswCase) {
 				}, xpos),
 				Type: iface,
 			}, xpos)
-			c.fl.add(xspan.start, xspan.end, "any("+xtext+").("+cs.spell+")")
+			c.fl.addT(xspan.start, xspan.end, cat(gen("any("), xtext, gen(").("), cs.spell, gen(")")))
 			return true
 		})
 	}

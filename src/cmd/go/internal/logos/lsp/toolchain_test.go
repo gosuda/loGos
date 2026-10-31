@@ -18,6 +18,13 @@ import (
 // module (packages b and plain, b importing a), the shape SPEC Sec 0.1
 // allows, and returns the toolchain the tests drive: the go binary of the
 // toolchain under test, run as logos, as logos lsp runs it.
+
+// workspaceA is the loGo/s source realWorkspace writes for package a:
+// aLgo with an accurate package comment, so the good package is
+// ST1000-clean under the default full nogo registry. The body matches
+// aLgo one line down; fixtures derived from it keep exact coordinates.
+const workspaceA = "// Package a reads files.\n" + aLgo
+
 func realWorkspace(t *testing.T) (root string, tc *toolchain) {
 	t.Helper()
 	testenv.MustHaveGoBuild(t)
@@ -31,7 +38,7 @@ func realWorkspace(t *testing.T) (root string, tc *toolchain) {
 	for name, content := range map[string]string{
 		"go.work":           "go 1.27\n\nuse (\n\t./lmod\n\t./gomod\n)\n",
 		"lmod/go.mod":       "module example.com/lmod\n\ngo 1.27\n",
-		"lmod/a/a.lgo":      aLgo,
+		"lmod/a/a.lgo":      workspaceA,
 		"lmod/app/main.lgo": "package main\n\nfunc main() {}\n",
 		"gomod/go.mod":      "module example.com/gomod\n\ngo 1.27\n\nrequire example.com/lmod v0.0.0\n\nreplace example.com/lmod => ../lmod\n",
 		"gomod/b/b.go":      "package b\n\nimport \"example.com/lmod/a\"\n\nvar _ = a.Read\n",
@@ -80,7 +87,7 @@ func TestToolchainLowersImportedLogosPackage(t *testing.T) {
 		}
 	}
 	file := low.Files[0]
-	if string(file.Src) != aLgo {
+	if string(file.Src) != workspaceA {
 		t.Errorf("source read by the compiler = %q, want the file on disk", file.Src)
 	}
 	pm, err := newPosMap(file.Src, file.Out, file.Map)
@@ -92,7 +99,7 @@ func TestToolchainLowersImportedLogosPackage(t *testing.T) {
 		t.Errorf("lowered text does not hold the lowered statement:\n%s", out)
 	}
 
-	orig := shift(findPos(t, aLgo, "ReadFile(path)?", 0), len("ReadFile("))
+	orig := shift(findPos(t, workspaceA, "ReadFile(path)?", 0), len("ReadFile("))
 	lowPos := pm.toLowered(orig)
 	if got := lineOf(out, lowPos.Line)[lowPos.Character:]; !strings.HasPrefix(got, "path)") {
 		t.Errorf("operand %v maps to lowered %v, which starts %q", orig, lowPos, got)
@@ -100,8 +107,8 @@ func TestToolchainLowersImportedLogosPackage(t *testing.T) {
 	if back := pm.toOriginal(lowPos); back != orig {
 		t.Errorf("operand round trip %v -> %v -> %v", orig, lowPos, back)
 	}
-	q := findPos(t, aLgo, "?", 0)
-	end := findPos(t, aLgo, "return string(data)", 0)
+	q := findPos(t, workspaceA, "?", 0)
+	end := findPos(t, workspaceA, "return string(data)", 0)
 	lowEnd := pm.toLowered(end)
 	if lines := lowEnd.Line - pm.toLowered(q).Line; lines < 2 {
 		t.Errorf("the ? statement expands to %d more lines in the lowered text, want at least 2", lines)
@@ -113,7 +120,7 @@ func TestToolchainLowersImportedLogosPackage(t *testing.T) {
 		}
 	}
 
-	edited := "// unsaved\n" + aLgo
+	edited := "// unsaved\n" + workspaceA
 	low, err = tc.Lower(ctx, bDir, map[string][]byte{aPath: []byte(edited)})
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +129,7 @@ func TestToolchainLowersImportedLogosPackage(t *testing.T) {
 		t.Errorf("an unsaved buffer was not lowered: %+v", low)
 	}
 	onDisk, _ := os.ReadFile(aPath)
-	if string(onDisk) != aLgo {
+	if string(onDisk) != workspaceA {
 		t.Errorf("the file on disk changed to %q", onDisk)
 	}
 }
@@ -175,7 +182,7 @@ func TestToolchainReportsBrokenSourceAsMissing(t *testing.T) {
 	ctx := t.Context()
 	aDir := filepath.Join(root, "lmod", "a")
 	aPath := filepath.Join(aDir, "a.lgo")
-	broken := strings.Replace(aLgo, "return string(data), nil", "x := 1\n\treturn string(data), nil", 1)
+	broken := strings.Replace(workspaceA, "return string(data), nil", "x := 1\n\treturn string(data), nil", 1)
 
 	low, err := tc.Lower(ctx, aDir, map[string][]byte{aPath: []byte(broken)})
 	if err != nil {
@@ -190,12 +197,12 @@ func TestToolchainReportsBrokenSourceAsMissing(t *testing.T) {
 	}
 	var found bool
 	for _, d := range diags {
-		if d.File == aPath && strings.Contains(d.Message, "declared and not used") && d.Span.StartLine == 7 {
+		if d.File == aPath && strings.Contains(d.Message, "declared and not used") && d.Span.StartLine == 8 {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("diagnostics = %+v, want declared and not used at line 7 of %s", diags, aPath)
+		t.Errorf("diagnostics = %+v, want declared and not used at line 8 of %s", diags, aPath)
 	}
 	diags, err = tc.Diagnose(ctx, aDir, nil)
 	if err != nil || len(diags) != 0 {
@@ -355,9 +362,8 @@ func TestHintsArchLevelsFollowsModuleTargetCPU(t *testing.T) {
 	}
 }
 
-// TestExecutableDirFlag checks when the executable directory is asked for:
-// only for a build of exactly one main package, the one build that writes
-// an executable into the current directory.
+// TestExecutableDirFlag checks that only a single-main build gets an output
+// override, and that the override is the null device.
 func TestExecutableDirFlag(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "bin")
 	lib, app := pkgInfo{importPath: "m/lib", name: "lib"}, pkgInfo{importPath: "m/app", name: "main"}
@@ -379,8 +385,8 @@ func TestExecutableDirFlag(t *testing.T) {
 		if got := len(flag) > 0; got != c.want {
 			t.Errorf("%s: flag = %v, want one: %v", c.name, flag, c.want)
 		}
-		if c.want && (len(flag) != 2 || flag[0] != "-o" || flag[1] != bin+string(filepath.Separator)) {
-			t.Errorf("%s: flag = %v, want -o %s/", c.name, flag, bin)
+		if c.want && (len(flag) != 2 || flag[0] != "-o" || flag[1] != os.DevNull) {
+			t.Errorf("%s: flag = %v, want -o %s", c.name, flag, os.DevNull)
 		}
 	}
 }

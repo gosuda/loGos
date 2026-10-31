@@ -13,12 +13,27 @@ import (
 )
 
 // allowDirective matches //logos:allow(<rule>), optionally followed by a
-// space and free text.
-var allowDirective = regexp.MustCompile(`^//logos:allow\(([a-z][a-z_]*::[a-z][a-z_]*)\)(?:\s.*)?$`)
+// space and free text. Both parts allow digits after the first letter so the
+// helper's canonical nogo::<lowercase-analyzer> IDs (for example,
+// nogo::sa1019, nogo::printf) parse with the same scope logic as the native
+// group::name IDs, which remain lowercase without digits. Uppercase stays
+// rejected: the driver lowercases helper categories (SA1019 to sa1019)
+// before forming IDs, so only the lowercase canonical form reaches here.
+// An own-line comment that attempts the directive but fails to match is
+// not silently dropped: fileDirectives records it as malformed and Run
+// reports correctness::allow_malformed, so a typo cannot silently leave a
+// rule enabled while the author believes it allowed.
+var allowDirective = regexp.MustCompile(`^//logos:allow\(([a-z][a-z0-9_]*::[a-z][a-z0-9_]*)\)(?:\s.*)?$`)
 
 // AllowForbiddenRule is the ID of the diagnostic for a //logos:allow
 // directive that names a forbid rule in a loGo/s package.
 const AllowForbiddenRule = "correctness::allow_forbidden_rule"
+
+// AllowMalformedRule is the ID of the diagnostic for a //logos:allow
+// comment that fails to parse. It names no rule, silences nothing, and
+// always reports at forbid (in Go packages too) so a typo cannot silently
+// leave a rule enabled while the author believes it allowed.
+const AllowMalformedRule = "correctness::allow_malformed"
 
 // directive is one //logos:allow comment and the statement or declaration
 // it precedes. The scope runs from the line after the directive through the
@@ -33,11 +48,16 @@ type directive struct {
 	end      syntax.Pos
 	scope    bool
 	from, to uint
+	// text is the raw comment of a malformed directive; empty otherwise.
+	text string
 }
 
-// directives holds the directives of one package, keyed by file base.
+// directives holds the directives of one package, keyed by file base,
+// plus the malformed //logos:allow comments of every file in source order.
+// Malformed entries silence nothing: silences consults byFile only.
 type directives struct {
-	byFile map[*syntax.PosBase][]directive
+	byFile    map[*syntax.PosBase][]directive
+	malformed []directive
 }
 
 // collectDirectives scans the comments of every file that has source.
@@ -49,38 +69,58 @@ func collectDirectives(in *Input) *directives {
 	}
 	for _, f := range in.Files {
 		src, ok := in.Sources[f]
-		if !ok || !bytes.Contains(src, []byte("//logos:allow(")) {
+		if !ok || !bytes.Contains(src, []byte("//logos:allow")) {
 			continue
 		}
 		fileBase := f.Pos().FileBase()
-		ds.byFile[fileBase] = fileDirectives(f, src, fileBase, mode)
+		dirs, bad := fileDirectives(f, src, fileBase, mode)
+		ds.byFile[fileBase] = dirs
+		ds.malformed = append(ds.malformed, bad...)
 	}
 	return ds
 }
 
+// isAllowComment reports whether text attempts a //logos:allow directive:
+// the prefix followed by "(", whitespace, or nothing. The trailing guard
+// keeps longer words such as //logos:allowlist out of the malformed set.
+func isAllowComment(text string) bool {
+	rest, ok := strings.CutPrefix(text, "//logos:allow")
+	if !ok {
+		return false
+	}
+	return rest == "" || rest[0] == '(' || rest[0] == ' ' || rest[0] == '\t'
+}
+
 // fileDirectives returns the directives of one file in source order,
-// scanning its comments with the given parser mode.
-func fileDirectives(f *syntax.File, src []byte, fileBase *syntax.PosBase, mode syntax.Mode) []directive {
+// scanning its comments with the given parser mode. The second result
+// holds the malformed //logos:allow comments: own-line attempts that fail
+// to parse, such as an uppercase group, a missing "::", or a missing
+// parenthesized ID. Well-formed but unknown IDs (for example the external
+// nogo:: helpers) are valid directives, not malformed: they parse with
+// the same scope logic and simply silence no native rule.
+func fileDirectives(f *syntax.File, src []byte, fileBase *syntax.PosBase, mode syntax.Mode) (out, bad []directive) {
 	lines := strings.Split(string(src), "\n")
 	starts := nodeStarts(f)
-	var out []directive
 	syntax.CommentsDoMode(bytes.NewReader(src), mode, func(line, col uint, text string) {
-		m := allowDirective.FindStringSubmatch(text)
-		if m == nil || !ownLine(lines, line, col) {
+		if !isAllowComment(text) || !ownLine(lines, line, col) {
 			return
 		}
-		d := directive{
-			rule: m[1],
-			pos:  syntax.MakePos(fileBase, line, col),
-			end:  syntax.MakePos(fileBase, line, col+uint(len(strings.TrimRight(text, " \t\r")))),
+		trimmed := strings.TrimRight(text, " \t\r")
+		pos := syntax.MakePos(fileBase, line, col)
+		end := syntax.MakePos(fileBase, line, col+uint(len(trimmed)))
+		m := allowDirective.FindStringSubmatch(text)
+		if m == nil {
+			bad = append(bad, directive{pos: pos, end: end, text: trimmed})
+			return
 		}
+		d := directive{rule: m[1], pos: pos, end: end}
 		target := nextCodeLine(lines, line)
 		if lastLine, ok := starts[target]; ok {
 			d.scope, d.from, d.to = true, line+1, lastLine
 		}
 		out = append(out, d)
 	})
-	return out
+	return out, bad
 }
 
 // ownLine reports whether the comment at (line, col) is the first token on
@@ -149,7 +189,12 @@ func (ds *directives) silences(rule string, pos syntax.Pos) bool {
 }
 
 // forbidden returns one allow_forbidden_rule result for each directive
-// that names a rule reporting at forbid in a package of the given kind.
+// that names a rule reporting at forbid in a package of the given kind,
+// plus one allow_malformed result for each malformed directive. Both are
+// directive misuses that Run reports without consulting silencing, so
+// neither can silently disable a rule. Resolve (failed-check packages)
+// reports neither: it applies only severity and silencing to the findings
+// of earlier phases.
 func (ds *directives) forbidden(policy *Policy, kind Kind) []Result {
 	var out []Result
 	for _, list := range ds.byFile {
@@ -165,6 +210,25 @@ func (ds *directives) forbidden(policy *Policy, kind Kind) []Result {
 				Message:  "//logos:allow(" + d.rule + "): rule " + d.rule + " is forbid and cannot be allowed",
 			})
 		}
+	}
+	return append(out, ds.malformedResults()...)
+}
+
+// malformedResults returns one allow_malformed result for each malformed
+// //logos:allow comment. The severity stays forbid in every package kind:
+// malformed syntax is not a language-neutral lint, so the Go cap that
+// lowers forbid findings to deny does not apply. A malformed comment names
+// no rule and therefore cannot silence one; the result is always reported.
+func (ds *directives) malformedResults() []Result {
+	var out []Result
+	for _, d := range ds.malformed {
+		out = append(out, Result{
+			Rule:     AllowMalformedRule,
+			Severity: Forbid,
+			Pos:      d.pos,
+			End:      d.end,
+			Message:  d.text + ": malformed directive, want //logos:allow(<group>::<name>)",
+		})
 	}
 	return out
 }

@@ -10,12 +10,12 @@ import (
 	"strings"
 )
 
-// M19-S2 (SPEC Sec 19, T-301.2, G3): a plain go build with no -gc keeps the
-// upstream pacing until run.bash passes with the elastic default. The
+// M19-S2 (SPEC Sec 19, T-301.2, G3): a plain go build with no -gc keeps
+// upstream pacing; elastic pacing is a greentea-only contract. The
 // program re-executes itself as "child" with GODEBUG=gcpacertrace=1; the
 // child starts two collections by hand, and only elastic pacing prints a
-// "pacer: elastic" line. gc_pacing_greentea_go.go builds the same program
-// with -gc=greentea.
+// "pacer: elastic" line. gc_pacing_greentea_go.go builds the same
+// program with -gc=greentea.
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "child" {

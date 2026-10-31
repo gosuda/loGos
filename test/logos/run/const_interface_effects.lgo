@@ -1,0 +1,115 @@
+// run
+
+package main
+
+import "fmt"
+
+// Readonly interface methods: `interface { const Name() string }`
+// declares a readonly method, parallel to the existing `const Name T`
+// property prefix, inside interface braces only. Every implementation
+// below is a pure getter: value receivers that only read scalars,
+// strings, len, indexes, and ranges, plus one explicit const-pointer
+// receiver. The early caller is declared above (before) the Late type
+// it exercises, so the effect proof must hold package-wide, not just
+// for bodies already checked. Concrete const-view calls, qualified
+// `const []Q` covariance, an alias edge, and a proved-generic edge are
+// covered. Each printed line is a hand-computed literal.
+
+type Qualified interface {
+	const Name() string
+}
+
+type Ordinary interface {
+	Name() string
+}
+
+// Early caller, declared before the Late implementation below.
+func Early(q Qualified) string { return "early:" + q.Name() }
+
+func Greet(q Qualified) string { return q.Name() }
+
+func GreetOrd(o Ordinary) string { return o.Name() }
+
+func ViaConst(p const *Rock) string { return p.Name() }
+
+func Names(cs const []Qualified) string {
+	out := ""
+	for i, c := range cs {
+		if i > 0 {
+			out += ","
+		}
+		out += c.Name()
+	}
+	return out
+}
+
+type Rock struct {
+	name string
+}
+
+func (r Rock) Name() string { return "rock:" + r.name }
+
+type Troll struct {
+	name string
+}
+
+func (t Troll) Name() string { return "troll:" + t.name }
+
+func (r const *Rock) Title() string { return "title:" + r.name }
+
+// Box carries a reference field yet its Name is pure: len and range
+// reads only, no store through the slice.
+type Box struct {
+	label string
+	items []int
+}
+
+func (b Box) Name() string {
+	if len(b.items) == 0 {
+		return b.label + ":empty"
+	}
+	total := 0
+	for _, x := range b.items {
+		total += x
+	}
+	if total == 0 {
+		return b.label + ":zero"
+	}
+	return b.label
+}
+
+type Alias = Rock
+
+func GenericName[T Qualified](t T) string { return t.Name() }
+
+func main() {
+	r := Rock{name: "a"}
+	fmt.Println(Greet(r))
+	fmt.Println(GreetOrd(r))
+	fmt.Println(ViaConst(&r))
+	fmt.Println(r.Title())
+
+	t := Troll{name: "grok"}
+	fmt.Println(Greet(t), GreetOrd(t))
+
+	b := Box{label: "box", items: []int{1, 2, 3}}
+	fmt.Println(Greet(b))
+	e := Box{label: "e", items: []int{}}
+	fmt.Println(Greet(e))
+
+	fmt.Println(Early(Late{tag: "x"}))
+
+	var a Alias = Alias{name: "al"}
+	fmt.Println(Greet(a))
+	fmt.Println(GenericName(r))
+
+	fmt.Println(Names([]Rock{{name: "a"}, {name: "b"}}))
+	fmt.Println(Names([]Troll{{name: "ug"}}))
+	fmt.Println(Names([]Alias{{name: "al"}}))
+}
+
+type Late struct {
+	tag string
+}
+
+func (l Late) Name() string { return "late:" + l.tag }

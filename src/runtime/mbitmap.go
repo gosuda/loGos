@@ -658,7 +658,7 @@ func (span *mspan) writeHeapBitsSmall(x, dataSize uintptr, typ *_type) (scanSize
 
 	// Since we're never writing more than one uintptr's worth of bits, we're either going
 	// to do one or two writes.
-	dstBase, _ := spanHeapBitsRange(span.base(), pageSize, span.elemsize)
+	dstBase, _ := spanHeapBitsRange(span.base(), span.npages*pageSize, span.elemsize)
 	dst := unsafe.Pointer(dstBase)
 	o := (x - span.base()) / goarch.PtrSize
 	i := o / ptrBits
@@ -1368,7 +1368,10 @@ func badPointer(s *mspan, p, refBase, refOff uintptr) {
 //go:nosplit
 func findObject(p, refBase, refOff uintptr) (base uintptr, s *mspan, objIndex uintptr) {
 	if zgcCycleEnabled() {
-		p = zgcCanonical(p)
+		// Nosplit-safe canonicalization only (single upstream hook; the
+		// splitting zgcCanonical locks and may grow the stack, which is
+		// exactly the user-stack system-stack fatal).
+		p = logosZgcFindObjectPtr(p)
 	}
 	s = spanOf(p)
 	// If s is nil, the virtual address has never been part of the heap.

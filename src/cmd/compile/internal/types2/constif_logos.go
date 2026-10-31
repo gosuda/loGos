@@ -49,14 +49,23 @@ func (check *Checker) logosConstIfLive(s *syntax.ConstIfStmt) int {
 	deferred := check.logosPred.calls
 	check.logosPred = outer
 	switch {
+	// Invariant (invalid): a broken condition still checks both branches with no dead proof.
 	case !x.isValid():
+	// Invariant (per-instantiation): deferred comptime predicates keep
+	// the condition unmarked so copies answer per instantiation.
 	case x.val == nil && check.logosPredOnly(s.Cond, deferred):
+	// Invariant (constant obligation): a live non-constant condition
+	// fails without weakening the diagnostic text.
 	case x.val == nil:
 		check.errorf(s.Cond, InvalidCond, "%s const if condition is not constant", logosNotConstant)
+	// Invariant (boolean obligation): a constant non-boolean condition
+	// keeps the upstream non-boolean diagnostic.
 	case !allBoolean(x.typ()):
 		check.error(s.Cond, InvalidCond, "non-boolean condition in const if statement")
+	// Invariant (live then): a constant true condition keeps Then.
 	case constant.BoolVal(x.val):
 		return 0
+	// Invariant (live else): a constant false condition keeps Else.
 	default:
 		return 1
 	}
@@ -83,22 +92,26 @@ func (check *Checker) logosMarkConstIfDead(s *syntax.ConstIfStmt, live int) {
 // live branch decides when the condition is constant, and both branches
 // must terminate otherwise.
 func (check *Checker) logosTerminatingConstIf(s *syntax.ConstIfStmt) bool {
+	// Invariant (recorded proof): the constant value is re-read from the
+	// recorded type information, never a Checker transient.
 	if v, ok := check.constIfValue(s.Cond); ok {
+		// Invariant (live decides): a constant condition terminates iff the live branch does.
 		if v {
 			return check.isTerminating(s.Then, "")
 		}
 		return s.Else != nil && check.isTerminating(s.Else, "")
 	}
+	// Invariant (undecided): without a constant proof both branches must terminate.
 	return s.Else != nil && check.isTerminating(s.Then, "") && check.isTerminating(s.Else, "")
 }
 
 // constIfValue reads the constant boolean value of a checked condition.
 func (check *Checker) constIfValue(e syntax.Expr) (bool, bool) {
-	tv, ok := check.Info.Types[e]
-	if !ok || tv.Value == nil || tv.Value.Kind() != constant.Bool {
+	_, val, ok := check.logosChecked(e)
+	if !ok || val == nil || val.Kind() != constant.Bool {
 		return false, false
 	}
-	return constant.BoolVal(tv.Value), true
+	return constant.BoolVal(val), true
 }
 
 // logosHasBreakConstIf reports whether a `const if` contains a break

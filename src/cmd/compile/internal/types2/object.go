@@ -396,9 +396,18 @@ func (*Var) isDependency() {} // a variable may be a dependency of an initializa
 // An abstract method may belong to many interfaces due to embedding.
 type Func struct {
 	object
-	origin      *Func // if non-nil, the Func from which this one was instantiated
-	hasPtrRecv_ bool  // only valid for methods that don't have a type yet; use hasPtrRecv() to read
-	nointerface bool
+	origin        *Func // if non-nil, the Func from which this one was instantiated
+	hasPtrRecv_   bool  // only valid for methods that don't have a type yet; use hasPtrRecv() to read
+	nointerface   bool
+	logosReadonly bool // loGo/s: readonly obligation for abstract methods, proven capability for concrete methods
+
+	// logosAssert holds the loGo/s generic assertion effects (which type
+	// parameters flow into an assertion or type-switch target of the
+	// declaration body) as one optional immutable payload; nil means
+	// unknown and consumers fail closed. Kept as a single pointer so
+	// Func's footprint grows by one word; known-zero declarations share
+	// the logosAssertZero singleton.
+	logosAssert *logosAssertEffects
 }
 
 // NewFunc returns a new function with the given signature, representing
@@ -413,7 +422,7 @@ func NewFunc(pos syntax.Pos, pkg *Package, name string, sig *Signature) *Func {
 		// as this would violate object.{Type,color} invariants.
 		// TODO(adonovan): propose to disallow NewFunc with nil *Signature.
 	}
-	return &Func{object{nil, pos, pkg, name, typ, 0, nopos}, nil, false, false}
+	return &Func{object{nil, pos, pkg, name, typ, 0, nopos}, nil, false, false, false, nil}
 }
 
 // Signature returns the signature (type) of the function or method.
@@ -457,6 +466,93 @@ func (obj *Func) Origin() *Func {
 		return obj.origin
 	}
 	return obj
+}
+
+// LogosReadonly reports whether obj carries the loGo/s readonly qualifier.
+// For an abstract interface method it is the declared obligation
+// (`interface { const Name() string }` via syntax.Field.Const); for a
+// concrete method it is a checked capability, never a speculative promise.
+// Abstract obligations survive instantiation via Origin: clones copy the bit
+// at subst time and the getter also consults the canonical Func, so clones
+// made before the bit was set still observe it. Concrete capabilities are
+// per-Func: Set writes only the receiver so proving one instantiation never
+// marks its siblings; callers must not treat a concrete bit as shared.
+func (obj *Func) LogosReadonly() bool {
+	if obj == nil {
+		return false
+	}
+	if obj.logosReadonly {
+		return true
+	}
+	if o := obj.origin; o != nil && o != obj {
+		return o.logosReadonly
+	}
+	return false
+}
+
+// LogosAssertEffects reports the generic assertion-effect masks for obj:
+// which of obj's declaration type parameters (tp, indexing
+// Signature.TypeParams) and receiver type parameters (rtp, indexing
+// Signature.RecvTypeParams) flow into a type assertion or type switch
+// target of the declaration body, directly, nested in a composite target,
+// through closures, or through transitively instantiated generic callees
+// or generic receiver types. Masks are arbitrary-arity bitsets: bit i is
+// m[i/8]>>(i%8)&1; there is no 64-parameter limit. known is false when
+// the effects are unknown (never analyzed, or imported without verified
+// facts); consumers must then fail closed for type arguments that could
+// manufacture a qualified value at the affected positions.
+//
+// The lookup is origin-first-when-known: an instantiated clone reflects
+// the current declaration-level truth of its Origin, because the
+// package-end fixpoint may finish after clones were made; but a clone
+// annotated by the facts importer keeps its own effects when its Origin
+// chain reaches an unannotated graph. Declaration effects are shared:
+// they hold for every instantiation of the declaration.
+func (obj *Func) LogosAssertEffects() (tp, rtp []byte, known bool) {
+	if obj == nil {
+		return nil, nil, false
+	}
+	if o := obj.origin; o != nil && o != obj {
+		if otp, ortp, ok := o.LogosAssertEffects(); ok {
+			return otp, ortp, ok
+		}
+	}
+	if p := obj.logosAssert; p != nil {
+		return p.tp, p.rtp, true
+	}
+	return nil, nil, false
+}
+
+// SetLogosAssertEffects sets the generic assertion-effect masks on obj
+// only. Callers: the package-end fixpoint on local declarations, and the
+// facts importer on cloned Funcs after a verified record; never
+// speculatively. It does not propagate to Origin or sibling clones.
+func (obj *Func) SetLogosAssertEffects(tp, rtp []byte, known bool) {
+	if obj == nil {
+		return
+	}
+	if !known {
+		obj.logosAssert = nil
+		return
+	}
+	if len(tp) == 0 && len(rtp) == 0 {
+		obj.logosAssert = logosAssertZero
+		return
+	}
+	obj.logosAssert = &logosAssertEffects{tp: tp, rtp: rtp}
+}
+
+// SetLogosReadonly sets the loGo/s readonly bit on obj only (no Origin
+// propagation). Callers: interfaceType sets abstract obligations from
+// syntax.Field.Const before any instantiation (clones inherit via copy,
+// late clones via the Origin fallback in the getter); the importer (or
+// concrete proof finalizer) sets proven concrete capabilities only after
+// an actual proof (body scan or trusted fact) on the exact Func proven.
+func (obj *Func) SetLogosReadonly(readonly bool) {
+	if obj == nil {
+		return
+	}
+	obj.logosReadonly = readonly
 }
 
 // Pkg returns the package to which the function belongs.

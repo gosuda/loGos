@@ -1,6 +1,6 @@
 # loGo/s
 
-Go with compiler-checked error handling, closed variants, and clean ejection to standard Go.
+Go whose errors the compiler checks, closed variants, and an exit to plain Go.
 
 ---
 
@@ -19,6 +19,9 @@ Why the extra syntax:
 * **File extensions**: `.lgo` for loGo/s source packages; `.go` for plain Go packages.
 * **Module boundaries**: One language per module; Go and loGo/s modules interoperate across imports.
 * **Ejection**: `logos eject [-o DIR]` emits an upstream-compatible Go 1.27 module tree.
+* **Plain Go underneath**: ejected output matches the compiler's lowering, proven by `TestEjectMatchesLowering` in [src/cmd/compile/internal/logos/eject_test.go](src/cmd/compile/internal/logos/eject_test.go).
+* **Go keeps its meaning**: plain `go` retains upstream language semantics and command text, proven by the `run.bash` regression gate ([src/run.bash](src/run.bash)).
+* **Imports cross kinds, one kind per module**: Go and loGo/s packages import each other, and a module holds one language, proven by the `logos_interop.txt` script test ([src/cmd/go/testdata/script/logos_interop.txt](src/cmd/go/testdata/script/logos_interop.txt)).
 * **Diagnostics**: `logos lint` provides in-compiler analysis for main-module packages without building binaries.
 * **License**: BSD-3-Clause (see [LICENSE](LICENSE)).
 
@@ -555,6 +558,29 @@ logos lint [build flags] [--pedantic] [--json-diagnostics] [packages]
 For the normative rule set design and individual rule definitions, see:
 - [logos-docs/LINT-RULESET.md](logos-docs/LINT-RULESET.md): Proposed normative lint design for Go and loGo/s.
 - [logos-docs/LINT-RULES.md](logos-docs/LINT-RULES.md): Detailed reference catalog of in-compiler rules.
+
+## Language
+
+One row per shipped form, with milestone IDs from [logos-docs/IMPLEMENTATION.md](logos-docs/IMPLEMENTATION.md). The full language definition is in [logos-docs/SPEC.md](logos-docs/SPEC.md).
+
+| Milestone | Form | Summary |
+|---|---|---|
+| M1 | `?`, `errdefer`, eject | Checked error propagation with early return, failure-only cleanup, and error traces; `logos eject` writes standard Go. |
+| M2 | Closed unions | Fixed variant sets with exhaustive type switches. |
+| M7 | `const if`, `const for`, `const switch T`, `comptime.ViewAs` | Compile-time branching, field unrolling, type dispatch, and read-only views. |
+| M8 | `go group (ctx, limit = N)` | Structured concurrency with automatic joins, cancellation, and a concurrency cap. |
+| M9 | `logos lint`, `--json-diagnostics` | In-compiler checks that stop before code generation, with one JSON object per diagnostic. |
+| M10 | `logos next`, `logos context` | Rewrites a Go module toward loGo/s; prints the declaration and signatures for one symbol. |
+| M11 | Generated `MarshalJSON` / `UnmarshalJSON` | Static JSON methods on tagged structs with `encoding/json`-matching output. |
+| M13 | `-O` | Optimization tiers from `-O=0` to `-O=3` plus `Os` and `Oz`, synthetic PGO, clone specialization, and identical code folding. Every backend, runtime, and tooling improvement that ships applies to Go packages as well as loGo/s packages under `logos` and plain `go`. |
+| M14 | Fixed-array SIMD | Element-wise operators and reductions on small fixed-size arrays behind `GOEXPERIMENT=simd`. |
+| M16 | WASM profile | Flag or directive only: `--wasm-features=stack-switching`, `--wasm-loader`, and the `//logos:wasmimport` / `//logos:wasmexport` directives. |
+| M17 | Smart stack | Flag only: `GOEXPERIMENT=logosstack` starts goroutines at per-call-site sizes. |
+| M18 | Arena and bump allocation | Flag only: `GOEXPERIMENT=logosarena`, or `[build] arena = true` in `logos.toml`. |
+| M19 | GC modes | Flag only: `-gc=` with `greentea`, `immix`, `zgc`, `wasm`, `batch`, or `epsilon`. |
+| M20 | Fast-CGo | Directive and flag only: `//logos:cgo_fastcall` (or `#cgo noescape` with `#cgo nocallback`) behind `GOEXPERIMENT=logosfastcgo`. |
+| M21 | `logos lsp` | Editor setup: gopls proxy mapping `.lgo` positions, with inlay hints, hover, and code actions. |
+| M22 | Verification suites | Directive only: `//logos:zeroalloc` rejects any heap allocation in the marked function. |
 
 ## Agent skills
 

@@ -30,7 +30,10 @@ import (
 // can never deadlock against the relocation finish hook.
 
 // zgcSetSmallBits stores the pointer bitmap bits for the object slot at
-// x. It mirrors the write at the end of writeHeapBitsSmall.
+// x. It mirrors the write at the end of writeHeapBitsSmall. The write is
+// a plain read-modify-write of a bitmap word that adjacent slots share,
+// so it must run under the page mutex of the span's page state; the
+// caller is zgcClaimSlotBitsUnder.
 func (span *mspan) zgcSetSmallBits(x, src uintptr) {
 	dstBase, _ := spanHeapBitsRange(span.base(), span.npages*pageSize, span.elemsize)
 	dst := unsafe.Pointer(dstBase)
@@ -51,47 +54,30 @@ func (span *mspan) zgcSetSmallBits(x, src uintptr) {
 	*d = (*d)&^(((1<<bits)-1)<<j) | (src << j)
 }
 
-// zgcClaimSlotBits makes slot di of ds a live, allocated object: it is
-// marked like an object allocated black. The page mutex is held.
-// A slot that no allocation had counted joins allocBits and allocCount,
-// so the sweep neither reports a zombie nor loses track of it, and
-// zgcClaimSlotBits reports fresh. A slot that an earlier allocation
-// counted and that the mark found dead is already in both, and
-// zgcClaimSlotBits reports taken.
-//
-// Moving an object allocates and frees nothing, so MemStats must not
-// change. The sweep adds allocCount-popcount(marks) of each span to
-// Frees, and every allocation is already in Mallocs. A move into a
-// counted dead slot leaves the sweep's total alone: the source slot
-// counts as freed and the destination slot no longer does. A move into
-// an uncounted slot raises the destination's allocCount, and the caller
-// lowers the source's by the same one, so the sweep frees exactly the
-// objects that died and Mallocs needs no credit.
-func zgcClaimSlotBits(ds *mspan, di uintptr) (fresh bool) {
-	ds.markBitsForIndex(di).setMarkedNonAtomic()
-	if gcUsesSpanInlineMarkBits(ds.elemsize) {
-		ds.scannedBitsForIndex(di).setMarkedNonAtomic()
-	}
-	if di >= uintptr(ds.freeindex) && !ds.allocBitsForIndex(di).isMarked() {
-		ds.allocBitsForIndex(di).setMarkedNonAtomic()
-		ds.allocCount++
-		fresh = true
-	}
-	arena, pageIdx, pageMask := pageIndexOf(ds.base())
-	if arena.pageMarks[pageIdx]&pageMask == 0 {
-		atomic.Or8(&arena.pageMarks[pageIdx], pageMask)
-	}
-	return fresh
-}
-
 // zgcReserveToSpace reserves a to-space span of class sc with at least
 // need bytes free. Failure returns nil and the page is skipped.
+// The reservation feeds the per-span ledger (see logos_zgc_quarantine.go):
+// one reserve per mheap grant, recorded past the allocation holding no
+// lock, so the leaf ledger lock never nests.
 func zgcReserveToSpace(sc spanClass, need uintptr) *mspan {
 	npages := uintptr(1)
 	if need > pageSize {
 		npages = divRoundUp(need, pageSize)
 	}
-	return mheap_.alloc(npages, sc)
+	ns := mheap_.alloc(npages, sc)
+	if ns != nil {
+		// The same initialization mcentral.grow gives a fresh span:
+		// the method's own class guards skip noscan and large
+		// (malloc-header) spans, and greentea spans get their inline
+		// mark bits cleared. To-space slots claim against this bitmap
+		// before any allocation lands in it, so stale words from a
+		// recycled page must not survive the reservation.
+		ns.initHeapBits()
+	}
+	if zgcSpanLedgerDebug && ns != nil {
+		zgcSpanLedgerReserve(ns)
+	}
+	return ns
 }
 
 // zgcEvacuateObject copies the marked object at (s, i) into a to-space
@@ -107,51 +93,133 @@ func zgcEvacuateObject(pg *zgcPage, s *mspan, i uintptr) uintptr {
 	return zgcCopyOne(pg, s, src, size)
 }
 
-// zgcCopyOne claims a to-space slot of the source's class, copies the
-// size-byte object at src, and publishes it. The claim holds the page
-// mutex; the copy and the publication run outside it.
-func zgcCopyOne(pg *zgcPage, s *mspan, src, size uintptr) uintptr {
+// zgcCopyOneResult claims a to-space slot of the source's class and commits
+// it through the single authoritative zgcRelocateObject commit, reporting the
+// typed outcome. Claiming and slot finishing — the pointer bitmap
+// included — are preparation outside the gate and may allocate or
+// safepoint; the commit revalidates under
+// the gate, performs the one memmove, and publishes forwarding, identity and
+// accounting. Any outside pre-check is racy.
+//
+// Claim failure reports only NoMemory observed at the allocator: the
+// reservation returned nil. Commit 0 reports Refused observed under the gate:
+// a frozen (pinned or exposed) source, or a concurrent unregister/holds race
+// that also leaves the source stable. A lost publication race unclaims its
+// slot and reports Done with the winner. Geometry and the private claim
+// protocol are unchanged.
+//
+// Copy veto for durable pins: refuse when the source object carries a pin
+// bit or its span carries the sticky flag, so a worker or barrier does not
+// copy a source after its exposure ends and the pin has committed. This
+// closes the post-exposure hole for the in-place pin below; the narrow
+// claim-then-commit race (claim before a concurrent pin sets its bits,
+// commit after) stays open because the check is outside the gate. The exact
+// gate-held pin-bit recheck belongs in zgcRelocateObject
+// (logos_zgc_page.go) and is reported as remaining work, not pretended as
+// closed. Claim failure below is only NoMemory observed at the allocator;
+// commit 0 below is only Refused observed under the gate.
+//
+// The caller's lease on pg covers the whole attempt — state acquisition,
+// claim, refill allocation, NoMemory exit, commit, unclaim and the final
+// publication outcome — so no suspend point between them can strand the
+// state against a pool return: zgcPageForget is gated on refs==0 after
+// the acquisition domain drained. No per-call counter exists and none is
+// needed.
+func zgcCopyOneResult(pg *zgcPage, s *mspan, src, size uintptr) (uintptr, zgcRelocateStatus) {
+	if pg == nil || s == nil {
+		return 0, zgcRelocateNotHeap
+	}
+	if s.logosPinned.Load() || isPinned(unsafe.Pointer(src)) {
+		return 0, zgcRelocateRefused
+	}
 	st := zgcPageState(pg)
-	ds, di, claimed := zgcClaimOne(pg, st, s.spanclass)
+	ds, di, claimed := zgcClaimOne(st, s.spanclass, s.npages)
 	if !claimed {
-		return 0
+		return 0, zgcRelocateNoMemory
+	}
+	// One reservation per claimed slot, keyed by the source the slot was
+	// claimed for (see logos_zgc_quarantine.go). No lock held here.
+	if zgcSpanLedgerDebug {
+		zgcSpanLedgerSrcReserve(s)
 	}
 	dst := ds.base() + di*ds.elemsize
-	memmove(unsafe.Pointer(dst), unsafe.Pointer(src), size)
-	if !s.spanclass.noscan() && heapBitsInSpan(s.elemsize) {
-		ds.zgcSetSmallBits(dst, s.heapBitsSmallForAddr(src))
-	}
 	// Mirroring the immix claim: a fresh destination slot joins the
 	// destination count, and a published copy leaves the source count.
 	// The source keeps its own count because quarantine deliberately
 	// does not settle it: only the sweep frees, and it frees exactly
 	// the objects that died.
-	fresh := zgcClaimSlotBitsUnder(st, ds, di)
+	fresh := zgcClaimSlotBitsUnder(st, ds, di, s, src)
 	won := zgcRelocateObject(pg, src, size, dst)
 	if won != dst {
 		zgcUnclaimOne(pg, st, ds, di)
-		return won
+		// The claim resolved by release; closes the source reservation
+		// whether the loss was a race or a refusal. No lock held here.
+		if zgcSpanLedgerDebug {
+			zgcSpanLedgerSrcUnclaim(s)
+		}
+		if won == 0 {
+			return 0, zgcRelocateRefused
+		}
+		return won, zgcRelocateDone
 	}
 	if fresh {
 		lock(&st.mu)
 		s.allocCount--
 		unlock(&st.mu)
 	}
+	// The claim resolved by publication; closes the source reservation
+	// whether or not the slot joined the count. No lock held here.
+	if zgcSpanLedgerDebug {
+		zgcSpanLedgerSrcCommit(s)
+	}
+	return won, zgcRelocateDone
+}
+
+// zgcCopyOne claims a to-space slot of the source's class and commits it
+// through the single authoritative zgcRelocateObject commit. It stays live
+// for evac workers and shares the Result implementation above, preserving
+// worker semantics: a winning copy returns its address (the loser unclaims),
+// any non-Done outcome returns 0 so the page stops for this pass and the
+// remaining sources are left for barrier relocation or a later pass.
+func zgcCopyOne(pg *zgcPage, s *mspan, src, size uintptr) uintptr {
+	won, st := zgcCopyOneResult(pg, s, src, size)
+	if st != zgcRelocateDone {
+		return 0
+	}
 	return won
 }
 
 // zgcClaimOne scans the page's to-space spans of class sc for a free
-// slot, refilling the reservation when exhausted. The reservation refill
-// allocates outside the page mutex. It reports whether a slot was
-// claimed; the claim bits are set before return.
-func zgcClaimOne(pg *zgcPage, st *zgcPageSpans, sc spanClass) (*mspan, uintptr, bool) {
+// slot, reserving a fresh span sized by the source (npages) when
+// exhausted. The reservation allocates outside the page mutex. It
+// reports whether a slot was claimed; the claim bits are set before
+// return. False means the heap allocation returned nil.
+func zgcClaimOne(st *zgcPageSpans, sc spanClass, npages uintptr) (*mspan, uintptr, bool) {
 	if ds, di, ok := zgcScanClaim(st, sc); ok {
 		return ds, di, true
 	}
-	if zgcRefillPToSpace(pg, sc) == nil {
+	return zgcRefillClaim(st, sc, npages)
+}
+
+// zgcRefillClaim reserves a fresh to-space span of class sc sized for
+// npages source pages and claims its slot 0 for the caller. The span is
+// still private, so the claim needs no CAS: the mark bit is set before
+// the span is appended under the page mutex, and the span is published
+// with the claim owned. Allocator, pointer and inline bits are set later
+// by zgcClaimSlotBitsUnder; a lost publication race unclaims through
+// zgcUnclaimOne. It returns false only when the heap allocation
+// returns nil.
+func zgcRefillClaim(st *zgcPageSpans, sc spanClass, npages uintptr) (*mspan, uintptr, bool) {
+	ns := zgcReserveToSpace(sc, npages*pageSize)
+	if ns == nil {
 		return nil, 0, false
 	}
-	return zgcScanClaim(st, sc)
+	lock(&st.mu)
+	ns.markBitsForIndex(0).setMarkedNonAtomic()
+	st.toSpace = append(st.toSpace, ns)
+	st.cursor = 1
+	unlock(&st.mu)
+	return ns, 0, true
 }
 
 // zgcScanClaim claims a free to-space slot of class sc. It takes the
@@ -176,11 +244,21 @@ func zgcScanClaimLocked(st *zgcPageSpans, sc spanClass) (*mspan, uintptr, bool) 
 				di = 0
 			}
 			next = di + 1
-			if !ds.markBitsForIndex(di).isMarked() {
-				ds.markBitsForIndex(di).setMarkedNonAtomic()
-				st.cursor = next
-				return ds, di, true
+			if ds.markBitsForIndex(di).isMarked() {
+				continue
 			}
+			// A slot below freeindex with a clear alloc bit is a hole
+			// left by an unclaimed copy: the sweep never handed it out,
+			// so marking it would count a live slot against no
+			// allocation and the quarantine vet would see more marks
+			// than allocations. Skip holes; the span refills when no
+			// allocatable slot is left.
+			if di < uintptr(ds.freeindex) && !ds.allocBitsForIndex(di).isMarked() {
+				continue
+			}
+			ds.markBitsForIndex(di).setMarkedNonAtomic()
+			st.cursor = next
+			return ds, di, true
 		}
 		next = 0
 	}
@@ -189,10 +267,25 @@ func zgcScanClaimLocked(st *zgcPageSpans, sc spanClass) (*mspan, uintptr, bool) 
 }
 
 // zgcClaimSlotBitsUnder finishes a scanned claim: scanned mark bits are
-// already set by the scan; this sets the inline, alloc, and accounting
-// state. It reports fresh as zgcClaimSlotBits does.
-func zgcClaimSlotBitsUnder(st *zgcPageSpans, ds *mspan, di uintptr) (fresh bool) {
+// already set by the scan; this sets the mark, inline, alloc, and
+// accounting state, and copies the source pointer bitmap into the
+// destination slot. s and src name the source object the slot was
+// claimed for; when its class keeps pointers in the span bitmap, the
+// destination slot's bits are written from the source bits here, under
+// the page mutex. The bitmap write rides this critical section because
+// zgcSetSmallBits is a plain read-modify-write of a word that adjacent
+// slots share: two concurrent claims of neighbouring slots racing
+// outside the mutex lose each other's bits. It reports whether the slot
+// joined the count (fresh). The mark bit is set here as well as by the
+// scan: a pause-time publication scrub may clear a mark claimed but not
+// yet finished, so the finishing claim re-marks its slot before
+// committing.
+func zgcClaimSlotBitsUnder(st *zgcPageSpans, ds *mspan, di uintptr, s *mspan, src uintptr) (fresh bool) {
 	lock(&st.mu)
+	if !s.spanclass.noscan() && heapBitsInSpan(s.elemsize) {
+		ds.zgcSetSmallBits(ds.base()+di*ds.elemsize, s.heapBitsSmallForAddr(src))
+	}
+	ds.markBitsForIndex(di).setMarkedNonAtomic()
 	if gcUsesSpanInlineMarkBits(ds.elemsize) {
 		ds.scannedBitsForIndex(di).setMarkedNonAtomic()
 	}
@@ -206,6 +299,12 @@ func zgcClaimSlotBitsUnder(st *zgcPageSpans, ds *mspan, di uintptr) (fresh bool)
 		atomic.Or8(&arena.pageMarks[pageIdx], pageMask)
 	}
 	unlock(&st.mu)
+	// Past the page mutex, holding no lock: the leaf ledger lock never
+	// nests. Only fresh finishes move the running count, so only they
+	// enter the committed tally.
+	if zgcSpanLedgerDebug && fresh {
+		zgcSpanLedgerCommit(ds)
+	}
 	return fresh
 }
 
@@ -213,6 +312,7 @@ func zgcClaimSlotBitsUnder(st *zgcPageSpans, ds *mspan, di uintptr) (fresh bool)
 // the publication race: the slot holds no published object, so it must
 // read free again instead of leaking as permanently marked.
 func zgcUnclaimOne(pg *zgcPage, st *zgcPageSpans, ds *mspan, di uintptr) {
+	dropped := false
 	lock(&st.mu)
 	ds.markBitsForIndex(di).clearMarked()
 	if gcUsesSpanInlineMarkBits(ds.elemsize) {
@@ -221,13 +321,36 @@ func zgcUnclaimOne(pg *zgcPage, st *zgcPageSpans, ds *mspan, di uintptr) {
 	if ds.allocBitsForIndex(di).isMarked() {
 		ds.allocBitsForIndex(di).clearMarked()
 		ds.allocCount--
+		dropped = true
 	}
 	unlock(&st.mu)
+	// Past the page mutex, holding no lock: the leaf ledger lock never
+	// nests. Only unclaims that drop an allocation move the running
+	// count, so only they enter the unclaimed tally.
+	if zgcSpanLedgerDebug && dropped {
+		zgcSpanLedgerUnclaim(ds)
+	}
 }
 
 // zgcEvacuatePage copies every marked object of the page's spans and
 // publishes their forwarding entries. It reports whether every live
 // byte of the page won a published copy.
+//
+// There is no page-level foreign exclusion here: the exact commit in
+// zgcRelocateObject is authoritative. A source object currently exposed to
+// foreign code commits to 0, its claimed slot is unclaimed and this pass
+// stops there; the remaining sources are copied by barrier relocation or a
+// later pass once the exposure ends. A foreign exposure of some other
+// object in the region (a gap object, a to-space copy) is not a source and
+// does not stop any source from moving. Release stays gated on the region
+// query (zgcReleasePage), so such a pin only delays release.
+//
+// Lease ownership: the caller owns the page lease. The relocation worker
+// holds the ref zgcNextUnfinishedPage gained under the registry lock and
+// releases it after the attempt; the stop-the-world finish hook and the
+// test seams call in under the world stop, where reclamation is excluded
+// by the pause itself. zgcEvacuatePage neither gains nor drops a ref on
+// any path.
 func zgcEvacuatePage(pg *zgcPage) bool {
 	if !zgcCycleEnabled() {
 		return false

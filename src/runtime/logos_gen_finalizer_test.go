@@ -32,7 +32,7 @@ import (
 func TestLogosGenFinalizerKeepsYoungChildAlive(t *testing.T) {
 	genQuiet(t)
 	if !runtime.LogosGenActive() {
-		t.Fatal("logosgen is built in but the collector is not generational")
+		t.Fatal("generational collector is not active on the amd64 GreenTeaGC default")
 	}
 
 	started := make(chan struct{})

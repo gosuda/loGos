@@ -244,6 +244,10 @@ func addLogosRTXTestImport(ld *modload.Loader, ctx context.Context, opts Package
 	}
 	for _, q := range pxtest.Internal.Imports {
 		if q.ImportPath == LogosRTPkg {
+			addLogosInterpXTestImport(ld, ctx, opts, pre, pxtest)
+			addLogosSimdXTestImport(ld, ctx, opts, pre, pxtest)
+			addLogosJSONXTestImport(ld, ctx, opts, pre, pxtest)
+			addLogosBinaryXTestImport(ld, ctx, opts, pre, pxtest)
 			return
 		}
 	}
@@ -259,6 +263,8 @@ func addLogosRTXTestImport(ld *modload.Loader, ctx context.Context, opts Package
 	pxtest.Internal.CompiledImports = append(pxtest.Internal.CompiledImports, p1.ImportPath)
 	addLogosInterpXTestImport(ld, ctx, opts, pre, pxtest)
 	addLogosSimdXTestImport(ld, ctx, opts, pre, pxtest)
+	addLogosJSONXTestImport(ld, ctx, opts, pre, pxtest)
+	addLogosBinaryXTestImport(ld, ctx, opts, pre, pxtest)
 }
 
 // addLogosSimdXTestImport loads the implicit simd/archsimd import for
@@ -295,6 +301,74 @@ func addLogosInterpXTestImport(ld *modload.Loader, ctx context.Context, opts Pac
 		return
 	}
 	for _, path := range []string{"strconv", "unsafe"} {
+		present := false
+		for _, q := range pxtest.Internal.Imports {
+			if q.ImportPath == path {
+				present = true
+				break
+			}
+		}
+		if present {
+			continue
+		}
+		stk := ImportStack{{Pkg: pxtest.ImportPath}}
+		p1, err := loadImport(ld, ctx, opts, pre, path, pxtest.Dir, pxtest, &stk, nil, ResolveImport)
+		if err != nil && pxtest.Error == nil {
+			pxtest.Error = err
+		}
+		if err != nil || p1.Incomplete {
+			pxtest.Incomplete = true
+		}
+		pxtest.Internal.Imports = append(pxtest.Internal.Imports, p1)
+		pxtest.Internal.CompiledImports = append(pxtest.Internal.CompiledImports, p1.ImportPath)
+	}
+}
+
+// needsLogosBinary reports whether p needs the implicit binary-helper
+// imports: every logos package, mirroring needsLogosJSON. The nojsonv2
+// fallback synthesizes MarshalBinary helpers that directly import fmt,
+// encoding/binary, math and slices (json_binary.go binaryImportTable);
+// unsafe already rides the interp edge. jsonv2 mode leaves them unused
+// and harmless. Plain Go packages never take this path.
+func needsLogosBinary(p *Package) bool {
+	return p.IsLogos()
+}
+
+// addLogosJSONXTestImport loads the implicit logos/rt/json import for
+// the external test package of a logos package (M11), mirroring
+// addLogosRTXTestImport: generated static-JSON methods in external
+// test files need the same archive. Plain Go packages never take it.
+func addLogosJSONXTestImport(ld *modload.Loader, ctx context.Context, opts PackageOpts, pre *preload, pxtest *Package) {
+	if pxtest == nil || !needsLogosJSON(pxtest) {
+		return
+	}
+	for _, q := range pxtest.Internal.Imports {
+		if q.ImportPath == LogosJSONPkg {
+			return
+		}
+	}
+	stk := ImportStack{{Pkg: pxtest.ImportPath}}
+	p1, err := loadImport(ld, ctx, opts, pre, LogosJSONPkg, pxtest.Dir, pxtest, &stk, nil, ResolveImport)
+	if err != nil && pxtest.Error == nil {
+		pxtest.Error = err
+	}
+	if err != nil || p1.Incomplete {
+		pxtest.Incomplete = true
+	}
+	pxtest.Internal.Imports = append(pxtest.Internal.Imports, p1)
+	pxtest.Internal.CompiledImports = append(pxtest.Internal.CompiledImports, p1.ImportPath)
+}
+
+// addLogosBinaryXTestImport loads the implicit binary-helper imports
+// for the external test package of a logos package, mirroring
+// addLogosRTXTestImport: synthesized nojsonv2 MarshalBinary helpers in
+// external test files need the same archives. Plain Go packages never
+// take it.
+func addLogosBinaryXTestImport(ld *modload.Loader, ctx context.Context, opts PackageOpts, pre *preload, pxtest *Package) {
+	if pxtest == nil || !needsLogosBinary(pxtest) {
+		return
+	}
+	for _, path := range []string{"fmt", "encoding/binary", "math", "slices"} {
 		present := false
 		for _, q := range pxtest.Internal.Imports {
 			if q.ImportPath == path {

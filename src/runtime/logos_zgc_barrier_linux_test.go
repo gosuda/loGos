@@ -33,14 +33,32 @@ func TestLogosZgcCompiledBarrier(t *testing.T) {
 	if !slices.Contains(strings.Split(exp, ","), "logosgcmoving") {
 		exp = strings.TrimPrefix(exp+",logosgcmoving", ",")
 	}
-	cmd := exec.Command(testenv.GoToolPath(t), "test", "-count=1", "-gcflags=runtime=-lb",
-		"-run=^(TestLogosZgcCompiledBarrierInner|TestLogosZgcCompiledIdentityInner)$", "-v", "runtime")
+	// -ldflags=-X=runtime.logosGCMode=zgc is required: without zgc mode
+	// the heap is not restricted to the low window and heap objects can
+	// land above the 4 TB granule range, where zgcNewPage throws instead
+	// of registering the fixture's pages. Colors and identity are still
+	// driven by the tests themselves (LogosZgcReset/
+	// LogosZgcSelectSoftware, LogosZgcIdentityKeysOn).
+	cmd := exec.Command(testenv.GoToolPath(t), "test", "-count=1", "-gcflags=all=-lb",
+		"-ldflags=-X=runtime.logosGCMode=zgc",
+		"-run=^(TestLogosZgcCompiledBarrierInner|TestLogosZgcCompiledIdentityInner|TestLogosZgcCompiledReflectcallArgInner|TestLogosZgcCompiledCallRetResultInner|TestLogosZgcCompiledDeferRecordInner)$", "-v", "runtime")
 	cmd = testenv.CleanCmdEnv(cmd)
 	cmd.Env = append(cmd.Env, "LOGOS_ZGC_INNER=1", "GOGC=off", "GOEXPERIMENT="+exp)
 	out, err := cmd.CombinedOutput()
-	for _, name := range []string{"TestLogosZgcCompiledBarrierInner", "TestLogosZgcCompiledIdentityInner"} {
+	// The loop below checks names in list order, so a whole-binary crash
+	// would otherwise always be reported against BarrierInner. Report the
+	// last "=== RUN" line too: with -v that names the inner test that was
+	// actually running when the binary died (empty when it died before the
+	// first test started, e.g. in runtime or package init).
+	lastRun := ""
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if name, ok := strings.CutPrefix(line, "=== RUN   "); ok {
+			lastRun = name
+		}
+	}
+	for _, name := range []string{"TestLogosZgcCompiledBarrierInner", "TestLogosZgcCompiledIdentityInner", "TestLogosZgcCompiledReflectcallArgInner", "TestLogosZgcCompiledCallRetResultInner", "TestLogosZgcCompiledDeferRecordInner"} {
 		if err != nil || !strings.Contains(string(out), "--- PASS: "+name) {
-			t.Fatalf("inner run of %s under -lb: %v\n%s", name, err, out)
+			t.Fatalf("inner run of %s under -lb (last started inner test %q): %v\n%s", name, lastRun, err, out)
 		}
 	}
 }
@@ -94,9 +112,25 @@ func TestLogosZgcCompiledIdentityInner(t *testing.T) {
 	logosZgcSink = []any{src, dst, others, byPtr, byPair, byArr, byInner, byRef.Interface()}
 	defer func() { logosZgcSink = nil }()
 
-	pages := make(map[uintptr]*LogosZgcPage)
 	a, d := logosZgcAddrOf(src), logosZgcAddrOf(dst)
-	if got := LogosZgcRelocate(logosZgcPageOf(t, pages, a), a, unsafe.Sizeof(*src), d); got != d {
+	// Register the source granule explicitly: the page base must be one
+	// aligned granule inside the 4 TB range (heap-derived starts are only
+	// registrable when the heap itself sits low, i.e. with zgc mode
+	// linked). Fail loud here with the test's context instead of tripping
+	// the runtime throw mid-fixture. A mapped raw page cannot stand in:
+	// the identity hasher resolves keys through heap spans, and a
+	// non-span word falls back to address hashing, so only the heap
+	// granule holding the key objects preserves the contract below.
+	start := a &^ (LogosZgcPageSize - 1)
+	if start&(LogosZgcPageSize-1) != 0 {
+		t.Fatalf("identity source granule %#x misaligned: want 2 MB alignment", start)
+	}
+	if start > uintptr(LogosZgcAddrMask)-(LogosZgcPageSize-1) {
+		t.Fatalf("identity source granule %#x outside the 4 TB range: heap not low (need zgc mode)", start)
+	}
+	pg := LogosZgcNewPage(start, 0, 16)
+	t.Cleanup(func() { LogosZgcDropPage(pg) })
+	if got := LogosZgcRelocate(pg, a, unsafe.Sizeof(*src), d); got != d {
 		t.Fatalf("relocation published %#x, want %#x", got, d)
 	}
 
@@ -254,4 +288,207 @@ func logosZgcCheckSyscallUntag(t *testing.T, h *logosZgcHolder, pages map[uintpt
 	if n, err := syscall.Read(fds[0], got[:]); n != 8 || err != nil || got != *b {
 		t.Fatalf("read back %q (%d, %v), want %q", got[:n], n, err, b[:])
 	}
+}
+
+// TestLogosZgcCompiledReflectcallArgInner runs only inside
+// TestLogosZgcCompiledBarrier, which compiles this package with -lb: the
+// loads below take the compiler-emitted barrier, the real Go side of the
+// reflectcall argument-frame bypass (asm_amd64.s TEXT ·reflectcall CALLFN
+// copies the frame with REP MOVSB and dereferences fn with
+// MOVQ f+8(FP),DX / MOVQ (DX),R12; asm_arm64.s mirrors them). The test
+// stores a colored stale word into a heap source slot with a raw,
+// barrier-free store — never pre-canonicalized, so the regression input
+// survives — lets the compiler/load path (boxing into the reflect.Call
+// argument) feed the call, and compares the raw word the callee receives.
+// Every witness observation is a raw uintptr load: a typed read would take
+// the barrier and heal, hiding a regression. A colored word reaching the
+// asm frame fails the copy-address assertions.
+func TestLogosZgcCompiledReflectcallArgInner(t *testing.T) {
+	if os.Getenv("LOGOS_ZGC_INNER") == "" {
+		t.Skip("runs inside TestLogosZgcCompiledBarrier")
+	}
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	defer LogosZgcReset()
+	LogosZgcReset()
+
+	src, dst := &logosZgcNode{val: 1}, &logosZgcNode{val: 2}
+	var sawRaw uintptr
+	probe := func(p *logosZgcNode) uintptr {
+		sawRaw = *(*uintptr)(unsafe.Pointer(&p))
+		return sawRaw
+	}
+	logosZgcSink = []any{src, dst, probe}
+	defer func() { logosZgcSink = nil }()
+
+	pages := make(map[uintptr]*LogosZgcPage)
+	a, d := logosZgcAddrOf(src), logosZgcAddrOf(dst)
+	LogosZgcForwardInsert(logosZgcPageOf(t, pages, a), a, d)
+	logosZgcPageOf(t, pages, d)
+	LogosZgcSelectSoftware(LogosZgcRemapped)
+	good := uintptr(LogosZgcSoftBits(LogosZgcRemapped))
+
+	slot := new(*logosZgcNode)
+	*slot = src
+	logosZgcSink = append(logosZgcSink, slot)
+	for _, c := range []uint8{LogosZgcMark0, LogosZgcMark1, LogosZgcFinal} {
+		colored := LogosZgcColored(a, c)
+		logosZgcSetRaw(slot, colored)
+		if logosZgcRaw(slot) != colored {
+			t.Fatalf("color %#x did not stick in the source slot: setup lost the regression input", c)
+		}
+		// The Go-side supply is this compiled barrier load. fn stays
+		// canonical throughout: asm dereferences it raw (MOVQ (DX)),
+		// so a colored fn would fault, not fail — only the frame
+		// words take the regression input, and bare arg bytes never
+		// fault (REP MOVSB copies, the Go callee reads without
+		// dereferencing).
+		healedArg := *slot
+		if logosZgcAddrOf(healedArg) != d {
+			t.Fatalf("color %#x: barrier load %#x, want copy %#x (colored would reach the asm frame)", c, logosZgcAddrOf(healedArg), d)
+		}
+		if logosZgcRaw(slot) != d+good {
+			t.Fatalf("color %#x: source slot %#x, want healed %#x", c, logosZgcRaw(slot), d+good)
+		}
+		sawRaw = 0
+		out := reflect.ValueOf(probe).Call([]reflect.Value{reflect.ValueOf(healedArg)})
+		if sawRaw != d {
+			t.Fatalf("color %#x: callee raw word %#x, want copy %#x (asm frame corrupted the word)", c, sawRaw, d)
+		}
+		if out[0].Uint() != uint64(d) {
+			t.Fatalf("color %#x: scalar result %#x, want %#x", c, out[0].Uint(), d)
+		}
+	}
+	KeepAlive(src)
+	KeepAlive(dst)
+}
+
+// TestLogosZgcCompiledCallRetResultInner runs only inside
+// TestLogosZgcCompiledBarrier, which compiles this package with -lb: the
+// callee's return-value load takes the compiler-emitted barrier, the real
+// Go side feeding the callRet result path (asm_amd64.s TEXT callRet<>
+// shuffles the result registers into runtime·reflectcallmove, which copies
+// the result bytes; asm_arm64.s mirrors it). The test stores a colored
+// stale word into a heap source slot with a raw, barrier-free store —
+// never pre-canonicalized — lets the callee's typed return load feed the
+// result copy, and compares the raw word of the returned reflect.Value.
+// Every witness observation is raw: typed reads heal and hide regressions.
+// A colored word reaching the asm result copy fails the assertions.
+func TestLogosZgcCompiledCallRetResultInner(t *testing.T) {
+	if os.Getenv("LOGOS_ZGC_INNER") == "" {
+		t.Skip("runs inside TestLogosZgcCompiledBarrier")
+	}
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	defer LogosZgcReset()
+	LogosZgcReset()
+
+	src, dst := &logosZgcNode{val: 3}, &logosZgcNode{val: 4}
+	logosZgcSink = []any{src, dst}
+	defer func() { logosZgcSink = nil }()
+
+	pages := make(map[uintptr]*LogosZgcPage)
+	a, d := logosZgcAddrOf(src), logosZgcAddrOf(dst)
+	LogosZgcForwardInsert(logosZgcPageOf(t, pages, a), a, d)
+	logosZgcPageOf(t, pages, d)
+	LogosZgcSelectSoftware(LogosZgcRemapped)
+	good := uintptr(LogosZgcSoftBits(LogosZgcRemapped))
+
+	slot := new(*logosZgcNode)
+	*slot = src
+	logosZgcSink = append(logosZgcSink, slot)
+	for _, c := range []uint8{LogosZgcMark0, LogosZgcMark1, LogosZgcFinal} {
+		colored := LogosZgcColored(a, c)
+		logosZgcSetRaw(slot, colored)
+		if logosZgcRaw(slot) != colored {
+			t.Fatalf("color %#x did not stick in the source slot: setup lost the regression input", c)
+		}
+		mkret := func() *logosZgcNode { return *slot }
+		out := reflect.ValueOf(mkret).Call(nil)
+		if raw := uintptr(out[0].UnsafePointer()); raw != d {
+			t.Fatalf("color %#x: returned raw word %#x, want copy %#x (colored reached the asm result copy)", c, raw, d)
+		}
+		if logosZgcRaw(slot) != d+good {
+			t.Fatalf("color %#x: source slot %#x, want healed %#x", c, logosZgcRaw(slot), d+good)
+		}
+	}
+	KeepAlive(src)
+	KeepAlive(dst)
+}
+
+// TestLogosZgcCompiledDeferRecordInner runs only inside
+// TestLogosZgcCompiledBarrier, which compiles this package with -lb. Its
+// subjects are the heap defer record's words: panic.go nextDefer returns
+// d.fn from the record, and the recorded call arguments travel in the
+// record beside it; evacuation-time readers take such words without a
+// barrier (pinGoroutine P8 pins the referents as mitigation). A real defer
+// statement carries both words into the record. The regression inputs are
+// raw, barrier-free colored stores — never pre-canonicalized — and every
+// witness observation is a raw uintptr load, since typed reads heal and
+// hide regressions. The fn word is checked raw BEFORE the deferred call
+// runs, so a healing regression fails safely here instead of faulting
+// later at the raw fn dereference; the arg word travels into the record
+// through the defer statement's own capture load with no prior check and
+// is observed raw at the callee, so a capture regression fails there
+// (never faults: record bytes are copied, never dereferenced). A colored
+// word reaching the record fails the assertions.
+func TestLogosZgcCompiledDeferRecordInner(t *testing.T) {
+	if os.Getenv("LOGOS_ZGC_INNER") == "" {
+		t.Skip("runs inside TestLogosZgcCompiledBarrier")
+	}
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	defer LogosZgcReset()
+	LogosZgcReset()
+
+	src, dst := &logosZgcNode{val: 5}, &logosZgcNode{val: 6}
+	var sawRaw uintptr
+	probe := func(p *logosZgcNode) {
+		sawRaw = *(*uintptr)(unsafe.Pointer(&p))
+	}
+	fnslot := new(func(*logosZgcNode))
+	*fnslot = probe
+	logosZgcSink = []any{src, dst, probe, fnslot}
+	defer func() { logosZgcSink = nil }()
+
+	fvCanon := *(*uintptr)(unsafe.Pointer(fnslot))
+	pages := make(map[uintptr]*LogosZgcPage)
+	a, d := logosZgcAddrOf(src), logosZgcAddrOf(dst)
+	LogosZgcForwardInsert(logosZgcPageOf(t, pages, a), a, d)
+	logosZgcPageOf(t, pages, d)
+	logosZgcPageOf(t, pages, fvCanon)
+	LogosZgcSelectSoftware(LogosZgcRemapped)
+	good := uintptr(LogosZgcSoftBits(LogosZgcRemapped))
+
+	slot := new(*logosZgcNode)
+	*slot = src
+	logosZgcSink = append(logosZgcSink, slot)
+	for _, c := range []uint8{LogosZgcMark0, LogosZgcMark1, LogosZgcFinal} {
+		coloredFn := LogosZgcColored(fvCanon, c)
+		*(*uintptr)(unsafe.Pointer(fnslot)) = coloredFn
+		if got := *(*uintptr)(unsafe.Pointer(fnslot)); got != coloredFn {
+			t.Fatalf("color %#x did not stick in the fn source slot: setup lost the regression input", c)
+		}
+		fn := *fnslot
+		if got := *(*uintptr)(unsafe.Pointer(&fn)); got != fvCanon {
+			t.Fatalf("color %#x: barrier fn load %#x, want canonical %#x (colored would reach the defer record)", c, got, fvCanon)
+		}
+		if got := *(*uintptr)(unsafe.Pointer(fnslot)); got != fvCanon+good {
+			t.Fatalf("color %#x: fn source slot %#x, want recolored %#x", c, got, fvCanon+good)
+		}
+		coloredArg := LogosZgcColored(a, c)
+		logosZgcSetRaw(slot, coloredArg)
+		if logosZgcRaw(slot) != coloredArg {
+			t.Fatalf("color %#x did not stick in the arg source slot: setup lost the regression input", c)
+		}
+		sawRaw = 0
+		func() {
+			defer fn(*slot)
+		}()
+		if sawRaw != d {
+			t.Fatalf("color %#x: deferred callee raw word %#x, want copy %#x (colored reached the defer record)", c, sawRaw, d)
+		}
+		if logosZgcRaw(slot) != d+good {
+			t.Fatalf("color %#x: arg source slot %#x, want healed %#x", c, logosZgcRaw(slot), d+good)
+		}
+	}
+	KeepAlive(src)
+	KeepAlive(dst)
 }

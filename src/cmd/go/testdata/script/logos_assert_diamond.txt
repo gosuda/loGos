@@ -1,0 +1,139 @@
+# T-201 generic assertion effects: import-boundary nominal identity.
+# A Go package with exported generics (p) carries an assert-only
+# __.LOGOS member (HasAssert records, proven-zero included). Declaration-
+# only members must stamp per-Func metadata in place on the canonical
+# imported objects: no package clone, no packages[path] replacement. RED
+# on the clone fan-out: q decodes first and captures p's placeholder
+# nominals, the later direct import of p replaces packages[p] with a
+# clone, and r fails with "cannot use q.Take (variable of type
+# func(*p.Box[int])) as func(*p.Box[int])" -- identical spellings,
+# distinct *types2.Named. GREEN after the in-place repair: p.Box and
+# p.New are pointer-identical through both import orders and the build
+# succeeds; the metadata still lands (the unsafe and known-zero
+# instantiation semantics are pinned by logos_const_interface_generic_assert).
+# Case F imports q before p (placeholder-then-clone order); case R
+# imports p before q (order independence).
+
+env GOPROXY=off
+env GOTOOLCHAIN=local
+
+cd f/r
+go build -o diamond$GOEXE .
+exec ./diamond$GOEXE
+! stderr 'cannot use'
+cd ../..
+
+cd r2/r
+go build -o diamond$GOEXE .
+exec ./diamond$GOEXE
+! stderr 'cannot use'
+cd ../..
+
+-- p/go.mod --
+module example.com/p
+
+go 1.27
+
+-- p/p.go --
+package p
+
+// Box and New guarantee a verified HasAssert record (proven zero) in
+// p's facts member, exercising the declaration-only import path.
+type Box[T any] struct{ V T }
+
+func New[T any](v T) Box[T] { return Box[T]{V: v} }
+
+// An own-type-parameter method has a lazy export pseudo-object. It must
+// be decoded through Box, never through package Scope.Lookup("Box.Echo").
+func (b Box[T]) Echo[U any](v U) U { return v }
+
+type hidden[T any] struct{ V T }
+
+func (h hidden[T]) Get() T { return h.V }
+
+func MakeHidden[T any](v T) hidden[T] { return hidden[T]{V: v} }
+
+
+-- q/go.mod --
+module example.com/q
+
+go 1.27
+
+require example.com/p v0.0.0
+
+replace example.com/p => ../p
+
+-- q/q.go --
+package q
+
+import "example.com/p"
+
+var Take func(*p.Box[int])
+
+func ThroughMethod(v int) int { return p.Box[int]{}.Echo[int](v) }
+
+-- f/r/go.mod --
+module example.com/fr
+
+go 1.27
+
+require (
+	example.com/p v0.0.0
+	example.com/q v0.0.0
+)
+
+replace example.com/p => ../../p
+
+replace example.com/q => ../../q
+
+-- f/r/main.go --
+package main
+
+import (
+	"example.com/q"
+	"example.com/p"
+)
+
+func main() {
+	var take func(*p.Box[int]) = q.Take
+	b := p.New(1)
+	if q.ThroughMethod(b.V) != 1 || p.MakeHidden(b.V).Get() != 1 {
+		panic("lazy generic method metadata mismatch")
+	}
+	if take != nil && b.V != 1 {
+		panic("diamond mismatch")
+	}
+}
+
+-- r2/r/go.mod --
+module example.com/r2r
+
+go 1.27
+
+require (
+	example.com/p v0.0.0
+	example.com/q v0.0.0
+)
+
+replace example.com/p => ../../p
+
+replace example.com/q => ../../q
+
+-- r2/r/main.go --
+package main
+
+import (
+	"example.com/p"
+	"example.com/q"
+)
+
+func main() {
+	var take func(*p.Box[int]) = q.Take
+	b := p.New(1)
+	if q.ThroughMethod(b.V) != 1 || p.MakeHidden(b.V).Get() != 1 {
+		panic("lazy generic method metadata mismatch")
+	}
+	if take != nil && b.V != 1 {
+		panic("diamond mismatch")
+	}
+}

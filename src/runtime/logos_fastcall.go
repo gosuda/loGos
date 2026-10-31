@@ -19,12 +19,14 @@ import (
 // (reentersyscall around asmcgocall, exitsyscall on return), so sysmon
 // retakes the P under the same rule and threshold, and it keeps the
 // profiling state (syscallpc, syscallsp, ncgo) so SIGPROF and CPU
-// profiles attribute C time to the Go call site. It records fast-call
-// diagnostics on the original M: m.inFastCall, the argument frame in
-// m.fastCgoFrame[0], and the call start in m.fastCallEnterNano.
-// The slots hold plain uintptr and are informational only: the
-// argument frame stays valid through the ordinary goroutine stack
-// scan, nothing in the tree reads them, and they are not pins.
+// profiles attribute C time to the Go call site. It records the
+// fast-call state on the original M: m.inFastCall and the argument
+// frame in m.fastCgoFrame[0]. The frame word is a moving-GC root,
+// pinned during evacuation (logos_evac_pin.go); elsewhere the ordinary
+// goroutine stack scan plus KeepAlive keep the frame live.
+// m.fastCallEnterNano is diagnostic-only: the production path records
+// zero and performs no per-call clock read; only the test helper
+// exercises the timestamp.
 //
 // Until the M20 gate passes the path stays behind GOEXPERIMENT
 // logosfastcgo and falls back to cgocall otherwise.
@@ -50,7 +52,8 @@ func logosCgocallFast(fn, arg unsafe.Pointer) int32 {
 	// behavior; foreign words pass through. The nested typed graph is
 	// canonicalized at the generated call site (the W2 emission), not
 	// here: this nosplit path cannot walk types.
-	arg = logosZgcUntagArg(arg)
+	arg = logosZgcForeignArg(arg)
+	logosZgcForeignHoldEnter(getg(), uintptr(arg))
 
 	mp := getg().m
 	if raceenabled {
@@ -61,7 +64,14 @@ func logosCgocallFast(fn, arg unsafe.Pointer) int32 {
 	if mp.cgoCallers != nil {
 		mp.cgoCallers[0] = 0
 	}
-	logosRecordFastCall(mp, arg, int64(nanotime()))
+	// fastCallEnterNano is diagnostic-only: tree-wide only the test
+	// helper reads it (export_logos_test.go), no correctness path does.
+	// The per-call nanotime() read that fed it was the only fast-only
+	// time source versus plain cgocall, so record zero and skip the
+	// clock. fastCgoFrame[0] and inFastCall stay: the frame word is a
+	// moving-GC root pinned in logos_evac_pin.go, and the flag drives
+	// the nocallback-violation panic in cgocallbackg.
+	logosRecordFastCall(mp, arg, 0)
 
 	// N.B. getcallerfp cannot be written directly as an argument for
 	// the same spilling reason stated on entersyscall.
@@ -85,6 +95,7 @@ func logosCgocallFast(fn, arg unsafe.Pointer) int32 {
 	winsyscall := mp.winsyscall
 
 	exitsyscall()
+	logosZgcForeignHoldExit(getg())
 
 	getg().m.winsyscall = winsyscall
 
@@ -122,7 +133,7 @@ func logosCgocallFast(fn, arg unsafe.Pointer) int32 {
 //
 //go:nosplit
 func logosRecordFastCall(mp *m, arg unsafe.Pointer, now int64) {
-	mp.fastCgoFrame = [4]uintptr{uintptr(arg), 0, 0, 0}
+	mp.fastCgoFrame[0] = uintptr(arg)
 	mp.fastCallEnterNano = now
 	mp.inFastCall = true
 }
@@ -135,5 +146,5 @@ func logosRecordFastCall(mp *m, arg unsafe.Pointer, now int64) {
 func logosClearFastCall(mp *m) {
 	mp.inFastCall = false
 	mp.fastCallEnterNano = 0
-	mp.fastCgoFrame = [4]uintptr{}
+	mp.fastCgoFrame[0] = 0
 }

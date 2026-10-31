@@ -20,11 +20,6 @@ type zgcPage struct {
 	_ [0]func()
 }
 
-type zgcPToSpaceCache struct {
-	span *mspan
-	next uintptr
-}
-
 func zgcGCStartHook() {}
 
 func zgcMarkTerminationHook() {}
@@ -51,21 +46,13 @@ func zgcRelocationWorker() {}
 
 func zgcBarrierMark(target uintptr) {}
 
-func zgcBarrierRelocate(pg *zgcPage, addr uintptr) (uintptr, bool) { return 0, false }
-
-func zgcRelocateOneLocked(pg *zgcPage, addr uintptr) (uintptr, bool) { return 0, false }
-
 func zgcRelocateLargeLocked(pg *zgcPage, s *mspan) (uintptr, bool) { return 0, false }
 
 func zgcReservePageToSpace(pg *zgcPage) bool { return false }
 
 func zgcAbandonPage(pg *zgcPage) {}
 
-func zgcDeepRelocate(pg *zgcPage, addr uintptr) bool { return false }
-
 func zgcCanRelocateDeep() bool { return false }
-
-func zgcRefillPToSpace(pg *zgcPage, sc spanClass) *zgcPToSpaceCache { return nil }
 
 func zgcSelectPages(budget uintptr) int { return 0 }
 
@@ -76,8 +63,6 @@ func zgcEvacuateObject(pg *zgcPage, s *mspan, i uintptr) uintptr { return 0 }
 func zgcCopyOne(pg *zgcPage, s *mspan, src, size uintptr) uintptr { return 0 }
 
 func zgcPublishToSpace(pg *zgcPage) {}
-
-func zgcClaimSlotBits(ds *mspan, di uintptr) (fresh bool) { return false }
 
 func zgcReserveToSpace(sc spanClass, need uintptr) *mspan { return nil }
 

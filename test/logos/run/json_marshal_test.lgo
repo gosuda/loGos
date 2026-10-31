@@ -481,3 +481,43 @@ func TestOutputIsCompact(t *testing.T) {
 		t.Fatalf("output is not already compact: %s", got)
 	}
 }
+
+// PRRT_kwDOVOeymc6wGfHR (r4373037368) end to end: a named int carrying
+// only IsZero() bool still classifies as a plain scalar, so the string
+// option quotes it and omitzero consults IsZero: IsZero() { z == 42 }
+// overrides the default zero, so only 42 omits and the naive zero 0
+// stays. Custom-marshal
+// precedence (MarshalJSON, MarshalText, json.Number) stays covered by
+// the Every matrix above.
+type ZInt int64
+
+func (z ZInt) IsZero() bool { return z == 42 }
+
+type IsZeroTwo struct {
+	V ZInt `json:"v,string"`
+	W ZInt `json:"w,string,omitzero"`
+}
+
+type isZeroTwoMirror IsZeroTwo
+
+func TestNamedIntIsZeroQuotedAndOmitZero(t *testing.T) {
+	for _, c := range []struct {
+		v    IsZeroTwo
+		want string
+	}{
+		{IsZeroTwo{V: 7, W: 7}, `{"v":"7","w":"7"}`},
+		{IsZeroTwo{V: 7, W: 42}, `{"v":"7"}`},
+		{IsZeroTwo{}, `{"v":"0","w":"0"}`},
+	} {
+		want := must(json.Marshal(isZeroTwoMirror(c.v)))
+		if string(want) != c.want {
+			t.Fatalf("reflective oracle: got %s, want %s", want, c.want)
+		}
+		if got := must(c.v.MarshalJSON()); !bytes.Equal(got, want) {
+			t.Fatalf("MarshalJSON\n got %s\nwant %s", got, want)
+		}
+		if via := must(json.Marshal(c.v)); !bytes.Equal(via, want) {
+			t.Fatalf("json.Marshal(v)\n got %s\nwant %s", via, want)
+		}
+	}
+}
