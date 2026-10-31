@@ -21,6 +21,7 @@ import (
 
 	"cmd/compile/internal/abi"
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/escape"
 	"cmd/compile/internal/inline"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/liveness"
@@ -363,7 +364,7 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 	if fn.Pragma&ir.Nosplit != 0 {
 		s.f.NoSplit = true
 	}
-	if ssa.LogosNoLBFile(base.Ctxt.PosTable.Pos(fn.Pos()).Filename()) || ssa.LogosNoLBFunc(base.Ctxt.Pkgpath, fn.Sym().Name) {
+	if base.LogosNoLB(base.Ctxt.Pkgpath, base.Ctxt.PosTable.Pos(fn.Pos()).Filename(), fn.Sym().Name) {
 		s.f.LogosNoLB = true
 	}
 	s.f.ABI0 = ssaConfig.ABI0
@@ -1070,6 +1071,9 @@ type state struct {
 	arenaMarkScan   *ssa.Value
 	hasArenaSave    bool
 
+	arenaLoopMarks map[ir.Node][3]*ssa.Value
+	arenaLoopStack []arenaLoopEntry
+
 	// line number stack. The current line number is top of stack
 	line []src.XPos
 	// the last line number processed; it may have been popped
@@ -1140,6 +1144,22 @@ type ssaLabel struct {
 	target         *ssa.Block // block identified by this label
 	breakTarget    *ssa.Block // block to break to in control flow node identified by this label
 	continueTarget *ssa.Block // block to continue to in control flow node identified by this label
+	// Arena loop stack depth recorded when the labeled target was
+	// installed; the exited suffix is [depth, len(arenaLoopStack)).
+	// Read only when the matching Target field resolves non-nil, so
+	// zero (exit everything) needs no sentinel.
+	breakArenaDepth    int
+	continueArenaDepth int
+}
+
+// arenaLoopEntry tracks one enclosing OFOR for loop-mark emission.
+// Every OFOR pushes an entry (eligible or not) so labeled targets
+// resolving into an ineligible outer loop still name the exact exited
+// suffix; emission restores only entries with a saved eligible mark.
+type arenaLoopEntry struct {
+	loop       ir.Node
+	breakTo    *ssa.Block
+	continueTo *ssa.Block
 }
 
 // label returns the label associated with sym, creating it if necessary.
@@ -2022,6 +2042,7 @@ func (s *state) stmt(n ir.Node) {
 	case ir.OCONTINUE, ir.OBREAK:
 		n := n.(*ir.BranchStmt)
 		var to *ssa.Block
+		arenaDepth := -1
 		if n.Label == nil {
 			// plain break/continue
 			switch n.Op() {
@@ -2036,12 +2057,46 @@ func (s *state) stmt(n ir.Node) {
 			lab := s.label(sym)
 			switch n.Op() {
 			case ir.OCONTINUE:
-				to = lab.continueTarget
+				if to = lab.continueTarget; to != nil {
+					arenaDepth = lab.continueArenaDepth
+				}
 			case ir.OBREAK:
-				to = lab.breakTarget
+				if to = lab.breakTarget; to != nil {
+					arenaDepth = lab.breakArenaDepth
+				}
 			}
 		}
 
+		// Emit loop-mark restores for the exact exited suffix,
+		// innermost first, before the jump so the restore dominates
+		// the edge. Labeled targets restore the recorded stack suffix,
+		// which reaches enclosing switch/select targets that block
+		// identity cannot name. Unlabeled branches keep the block
+		// identity scan: switch/select interior breaks resolve to the
+		// switch bEnd, which matches no loop entry and stays silent.
+		// Targets into an ineligible outer loop still walk the full
+		// suffix; entries without a saved mark restore nothing.
+		if arenaDepth >= 0 {
+			s.logosArenaLoopRestoreDepth(arenaDepth)
+		} else if to != nil && len(s.arenaLoopStack) > 0 {
+			idx := -1
+			for i := len(s.arenaLoopStack) - 1; i >= 0; i-- {
+				e := s.arenaLoopStack[i]
+				if n.Op() == ir.OCONTINUE && e.continueTo == to {
+					idx = i
+					break
+				}
+				if n.Op() == ir.OBREAK && e.breakTo == to {
+					idx = i
+					break
+				}
+			}
+			if idx >= 0 {
+				for i := len(s.arenaLoopStack) - 1; i >= idx; i-- {
+					s.logosArenaLoopRestore(s.arenaLoopStack[i].loop)
+				}
+			}
+		}
 		b := s.endBlock()
 		b.Pos = s.lastPos.WithIsStmt() // Do this even if b is an empty block.
 		b.AddEdgeTo(to)
@@ -2084,10 +2139,22 @@ func (s *state) stmt(n ir.Node) {
 			lab = s.label(sym)
 			lab.continueTarget = bIncr
 			lab.breakTarget = bEnd
+			lab.continueArenaDepth = len(s.arenaLoopStack)
+			lab.breakArenaDepth = len(s.arenaLoopStack)
 		}
 
-		// generate body
+		// Track every OFOR (eligible or not) so a labeled break or
+		// continue naming an ineligible outer loop still resolves the
+		// exact exited suffix by block identity. Only entries with a
+		// saved eligible mark restore.
+		s.arenaLoopStack = append(s.arenaLoopStack, arenaLoopEntry{loop: n, breakTo: bEnd, continueTo: bIncr})
+
+		// generate body; the save dominates every in-body edge and no
+		// cond-false edge (bCond->bEnd never passes through bBody).
 		s.startBlock(bBody)
+		if escape.LogosArenaLoopRestorable(s.curfn, n) {
+			s.logosArenaLoopSave(n)
+		}
 		s.stmtList(n.Body)
 
 		// tear down continue/break
@@ -2096,9 +2163,19 @@ func (s *state) stmt(n ir.Node) {
 		if lab != nil {
 			lab.continueTarget = nil
 			lab.breakTarget = nil
+			lab.continueArenaDepth = 0
+			lab.breakArenaDepth = 0
 		}
+		s.arenaLoopStack = s.arenaLoopStack[:len(s.arenaLoopStack)-1]
 
-		// done with body, goto incr
+		// done with body, goto incr; the fallthrough stays in the same
+		// iteration only for the innermost loop, so restore just it.
+		// Emit before endBlock while there is still a current block;
+		// the mark stays in arenaLoopMarks for sibling edges already
+		// emitted above, teardown only pops the target stack.
+		if s.curBlock != nil {
+			s.logosArenaLoopRestore(n)
+		}
 		if b := s.endBlock(); b != nil {
 			b.AddEdgeTo(bIncr)
 		}
@@ -2143,6 +2220,7 @@ func (s *state) stmt(n ir.Node) {
 			// labeled
 			lab = s.label(sym)
 			lab.breakTarget = bEnd
+			lab.breakArenaDepth = len(s.arenaLoopStack)
 		}
 
 		// generate body code
@@ -2151,6 +2229,7 @@ func (s *state) stmt(n ir.Node) {
 		s.breakTo = prevBreak
 		if lab != nil {
 			lab.breakTarget = nil
+			lab.breakArenaDepth = 0
 		}
 
 		// walk adds explicit OBREAK nodes to the end of all reachable code paths.

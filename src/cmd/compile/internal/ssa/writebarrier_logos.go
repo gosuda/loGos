@@ -15,7 +15,7 @@ import (
 const logosSlotTag = math.MinInt64
 
 // logosStoresSlot reports whether the pointer store of val needs a card
-// entry under GOEXPERIMENT=logosgen: storing nil creates no pointer.
+// entry on amd64 GreenTea: storing nil creates no pointer.
 func logosStoresSlot(val *Value) bool {
 	return val.Op != OpConstNil
 }

@@ -1043,6 +1043,47 @@ var IsIntrinsicCall = func(*CallExpr) bool { return false }
 // IsIntrinsicSym reports whether the compiler back end will treat a call to this symbol as an intrinsic operation.
 var IsIntrinsicSym = func(*types.Sym) bool { return false }
 
+// IsUintptrConv unwraps one unsafe.Pointer to uintptr conversion,
+// including elements of a variadic slice literal.
+func IsUintptrConv(n Node) bool {
+	switch n := n.(type) {
+	case *ConvExpr:
+		if n.Op() != OCONVNOP {
+			return false
+		}
+		if n.Type() == nil || !n.Type().IsUintptr() {
+			return false
+		}
+		return n.X != nil && n.X.Type() != nil && n.X.Type().IsUnsafePtr()
+	case *CompLitExpr:
+		for _, e := range n.List {
+			v := e
+			if k, ok := v.(*KeyExpr); ok {
+				v = k.Value
+			}
+			if IsUintptrConv(v) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// HasUintptrConv reports whether any call argument converts
+// unsafe.Pointer to uintptr, the escape-rewritten shape for syscall-like
+// targets.
+func HasUintptrConv(call *CallExpr) bool {
+	if call == nil {
+		return false
+	}
+	for _, arg := range call.Args {
+		if IsUintptrConv(arg) {
+			return true
+		}
+	}
+	return false
+}
+
 // SameSafeExpr checks whether it is safe to reuse one of l and r
 // instead of computing both. SameSafeExpr assumes that l and r are
 // used in the same statement or expression. In order for it to be

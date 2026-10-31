@@ -22,6 +22,11 @@ const tmpstringbufsize = 32
 
 func Walk(fn *ir.Func) {
 	ir.CurFunc = fn
+	installLogosArenaFrame(fn)
+	// The entry token lives only for this Walk: RetMake lowering and Chain
+	// consent read it while walking fn's body. Drop it on return so stale
+	// entries never accumulate across functions.
+	defer delete(logosArenaRetTok, fn)
 
 	// Build pre-walk analysis caches with a single AST traversal.
 	// (At some point, it might be worthwhile to have a walkState structure

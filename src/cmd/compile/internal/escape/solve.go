@@ -51,6 +51,8 @@ func (b *batch) walkAll() {
 	todo.pushFront(&b.mutatorLoc)
 	todo.pushFront(&b.calleeLoc)
 	todo.pushFront(&b.heapLoc)
+	// Invariant exact-makes-to-foreign: foreignLoc walks like the heap
+	// so its flows solve, but outlives still gates them on foreignBacking.
 	todo.pushFront(&b.foreignLoc)
 
 	b.mutatorLoc.queuedWalkAll = true
@@ -146,6 +148,8 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 		// that value flow for tagging the function
 		// later.
 		if l.param {
+			// Invariant exact-makes-to-foreign: params flowing to
+			// foreign record Foreign, never Heap, so -m keeps "does not escape".
 			if root == &b.foreignLoc {
 				l.paramEsc.AddForeign(derefs)
 			} else if b.outlives(root, l) {
@@ -285,6 +289,8 @@ func (b *batch) explainLoc(l *location) string {
 // outlives reports whether values stored in l may survive beyond
 // other's lifetime if stack allocated.
 func (b *batch) outlives(l, other *location) bool {
+	// Invariant exact-makes-to-foreign: foreign outlives a location only
+	// when foreignBacking sees a variable-capacity OMAKESLICE.
 	if l == &b.foreignLoc {
 		return foreignBacking(other)
 	}
@@ -296,6 +302,16 @@ func (b *batch) outlives(l, other *location) bool {
 	// Pseudo-locations that don't really exist.
 	if l == &b.mutatorLoc || l == &b.calleeLoc {
 		return false
+	}
+
+	// Caller-region shadow: only a result root gets the caller-region
+	// rule; ordinary leaking parameters keep the pessimistic heap rule
+	// below. A value returned by the function holding the allocation
+	// lives in that function's caller region, so its own result does not
+	// outlive the shadow. Loop-depth still guards iteration-local
+	// restores; foreign/heap dominance is already decided above.
+	if other.logosNoRet && l.paramOut {
+		return b.logosArenaRetOutlives(l, other)
 	}
 
 	// We don't know what callers do with returned values, so

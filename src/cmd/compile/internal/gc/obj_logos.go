@@ -88,19 +88,64 @@ func markUintptrForeignFuncs() {
 		return
 	}
 	const mask = ir.UintptrKeepAlive | ir.UintptrEscapes
-	foreign := make(map[*types.Sym]bool)
+	// Only declaration metadata authorizes a foreign target: the pragma
+	// lives on the declaration (explicitly, or implicitly on bodyless
+	// declarations via escape, which tags every bodyless function), and
+	// the Sym grouping below carries it to the generated ABIInternal
+	// wrapper that shares the declaration's Sym. Call-site shapes
+	// (kept-alive arguments, uintptr conversions) must never authorize a
+	// target: ordinary address consumers take such arguments without
+	// ever accepting foreign pointers, and the runtime treats the flag
+	// as a target property only.
+	views := make([]logosForeignFuncView, 0, len(typecheck.Target.Funcs))
 	for _, fn := range typecheck.Target.Funcs {
-		if fn.Pragma&mask != 0 {
-			foreign[fn.Sym()] = true
-		}
+		views = append(views, logosForeignFuncView{Sym: fn.Sym(), Pragma: fn.Pragma})
 	}
+	foreign := logosForeignMarkedSyms(views)
 	for sym := range foreign {
-		lsym := sym.LinksymABI(obj.ABIInternal)
-		if lsym == nil || lsym.Func() == nil {
-			continue
-		}
-		lsym.Func().FuncFlag |= abi.FuncFlagUintptrForeign
+		logosForeignApplyFlag(sym)
 	}
+}
+
+// logosForeignApplyFlag sets FuncFlagUintptrForeign on exactly the
+// ABIInternal flavor of sym: the symbol every function value references
+// (both OCFUNC lowering and WriteFuncSyms resolve through ABIInternal,
+// faulting otherwise). Raw ABI0 assembly bodies are never function-value
+// targets and stay unmarked, so the runtime indirect gate rejects
+// unmarked asm stubs. A symbol with no assembled TEXT (Func() == nil)
+// is skipped.
+func logosForeignApplyFlag(sym *types.Sym) {
+	lsym := sym.LinksymABI(obj.ABIInternal)
+	if lsym == nil || lsym.Func() == nil {
+		return
+	}
+	lsym.Func().FuncFlag |= abi.FuncFlagUintptrForeign
+}
+
+// logosForeignFuncView is the minimal input to the propagation
+// decision: the function's symbol group and its declaration pragma. A
+// generated ABIInternal wrapper shares its declaration's Sym but never
+// copies its pragma, so grouping by Sym is what carries the flag to the
+// wrapper.
+type logosForeignFuncView struct {
+	Sym    *types.Sym
+	Pragma ir.PragmaFlag
+}
+
+// logosForeignMarkedSyms returns the symbol groups authorized as foreign
+// targets: any group with a //go:uintptrescapes or
+// //go:uintptrkeepalive declaration pragma. Marking then writes exactly
+// the ABIInternal flavor of each group symbol, so bodyless wrappers
+// carry the flag while raw ABI0 assembly bodies stay unmarked.
+func logosForeignMarkedSyms(funcs []logosForeignFuncView) map[*types.Sym]bool {
+	const mask = ir.UintptrKeepAlive | ir.UintptrEscapes
+	foreign := make(map[*types.Sym]bool)
+	for _, fn := range funcs {
+		if fn.Sym != nil && fn.Pragma&mask != 0 {
+			foreign[fn.Sym] = true
+		}
+	}
+	return foreign
 }
 
 // logosForeignFlagEnabled reports whether the moving-GC foreign-target

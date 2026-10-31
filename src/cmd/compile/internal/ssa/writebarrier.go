@@ -451,10 +451,13 @@ func writebarrier(f *Func) {
 					i++
 				}
 				var n *Value
+				// Fresh per-emission constant, not f.ConstInt*: the cached
+				// value is created in f.Entry and this pass's tail moves can
+				// relocate it into a successor that does not dominate this call.
 				if f.Config.PtrSize == 8 {
-					n = f.ConstInt64(f.Config.Types.Uintptr, size)
+					n = b.NewValue0I(w.Pos, OpConst64, f.Config.Types.Uintptr, size)
 				} else {
-					n = f.ConstInt32(f.Config.Types.Uintptr, int32(size))
+					n = b.NewValue0I(w.Pos, OpConst32, f.Config.Types.Uintptr, int64(int32(size)))
 				}
 				mem = wbcall(w.Pos, b, immixStore, sp, mem, dst, n)
 			}

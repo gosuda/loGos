@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/escape"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/ssagen"
@@ -47,6 +48,7 @@ func walkRange(nrange *ir.RangeStmt) ir.Node {
 	nfor := ir.NewForStmt(nrange.Pos(), nil, nil, nil, nil, nrange.DistinctVars)
 	nfor.SetInit(nrange.Init())
 	nfor.Label = nrange.Label
+	escape.LogosArenaTransferLoopRestore(ir.CurFunc, nrange, nfor)
 
 	// variable name conventions:
 	//	ohv1, hv1, hv2: hidden (old) val 1, 2

@@ -81,10 +81,16 @@ func (e *escape) stmt(n ir.Node) {
 	case ir.OFOR:
 		n := n.(*ir.ForStmt)
 		base.Assert(!n.DistinctVars) // Should all be rewritten before escape analysis
+		e.loopStack = append(e.loopStack, n)
 		e.loopDepth++
+		e.logosArenaCondPost++
 		e.discard(n.Cond)
+		e.logosArenaCondPost--
+		e.logosArenaCondPost++
 		e.stmt(n.Post)
+		e.logosArenaCondPost--
 		e.block(n.Body)
+		e.loopStack = e.loopStack[:len(e.loopStack)-1]
 		e.loopDepth--
 
 	case ir.ORANGE:
@@ -97,6 +103,7 @@ func (e *escape) stmt(n ir.Node) {
 		tmp := e.newLoc(nil, true)
 		e.expr(tmp.asHole(), n.X)
 
+		e.loopStack = append(e.loopStack, n)
 		e.loopDepth++
 		ks := e.addrs([]ir.Node{n.Key, n.Value})
 		if n.X.Type().IsArray() {
@@ -107,6 +114,7 @@ func (e *escape) stmt(n ir.Node) {
 		e.reassigned(ks, n)
 
 		e.block(n.Body)
+		e.loopStack = e.loopStack[:len(e.loopStack)-1]
 		e.loopDepth--
 
 	case ir.OSWITCH:
@@ -201,11 +209,13 @@ func (e *escape) stmts(l ir.Nodes) {
 	}
 }
 
-// block is like stmts, but preserves loopDepth.
+// block is like stmts, but preserves loopDepth and the loop identity stack.
 func (e *escape) block(l ir.Nodes) {
 	old := e.loopDepth
+	oldStack := len(e.loopStack)
 	e.stmts(l)
 	e.loopDepth = old
+	e.loopStack = e.loopStack[:oldStack]
 }
 
 func (e *escape) dcl(n *ir.Name) hole {

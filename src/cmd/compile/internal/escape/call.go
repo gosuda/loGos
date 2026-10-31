@@ -10,6 +10,7 @@ import (
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
+	"internal/buildcfg"
 	"strings"
 )
 
@@ -30,6 +31,8 @@ func (e *escape) call(ks []hole, call ir.Node) {
 	case ir.OCALLFUNC, ir.OCALLINTER:
 		call := call.(*ir.CallExpr)
 		typecheck.AssertFixedCall(call)
+		// Invariant cgo-frame: the cgo frame exposes every parameter,
+		// so flow params to foreign before uintptr rewriting.
 		e.foreignCgoFrame(call)
 
 		// Pick out the function callee(s), if statically known.
@@ -127,6 +130,11 @@ func (e *escape) call(ks []hole, call ir.Node) {
 				argument(e.mergedTagHole(ks, fns, i, len(fntype.Params())), args[i])
 			}
 		}
+		// Caller-region result modeling: records the static call result as a
+		// fresh allocation plus a no-return shadow so walk can consent via
+		// RetSet. Vetoes (defer/goto/loop/foreign/heap) stay in arena
+		// metadata; this only records flow.
+		e.logosArenaCall(ks, call, fns)
 
 	case ir.OINLCALL:
 		call := call.(*ir.InlinedCallExpr)
@@ -274,6 +282,12 @@ func (e *escape) rewriteArgument(arg ir.Node, call *ir.CallExpr, fns []*ir.Name)
 			pragma |= fn.Func.Pragma
 		}
 	}
+	// For dynamic callees under the moving collector on supported architectures,
+	// keep pointer operands alive across the call so the indirect syscall admission
+	// lane can inspect the target at runtime and pin any foreign referents.
+	if len(fns) == 0 && ir.IsUintptrConv(arg) && buildcfg.Experiment.LogosGCMoving && (buildcfg.GOARCH == "amd64" || buildcfg.GOARCH == "arm64") {
+		pragma |= ir.UintptrKeepAlive
+	}
 	if pragma&(ir.UintptrKeepAlive|ir.UintptrEscapes) == 0 {
 		return
 	}
@@ -410,6 +424,8 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 	if x := esc.Callee(); x >= 0 {
 		tagKs = append(tagKs, e.calleeHole().shift(x))
 	}
+	// Invariant foreign-tag: a callee Foreign leak flows caller args to
+	// foreignLoc at the tagged depth, never to the heap.
 	if x := esc.Foreign(); x >= 0 {
 		tagKs = append(tagKs, e.foreignLoc.asHole().shift(x))
 	}
