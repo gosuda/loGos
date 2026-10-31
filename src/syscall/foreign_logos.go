@@ -27,10 +27,15 @@ import "unsafe"
 //     This canonicalizes the cells the parent path reuses.
 //   - Inner: forkAndExecInChild1 admits every derived buffer plus
 //     its own cells immediately before runtime_BeforeFork, and ends
-//     in the parent after the mapPipe sync. The token travels
-//     through forkAndExecInChild1's results. The inner frame never
-//     Value-roots a slot inside outer-exposed heap (fail-loud); those
-//     cells are already canonical from the outer frame.
+//     in the parent after the mapPipe sync. The token is written
+//     through a pointer into forkAndExecInChild's frame, not
+//     returned in forkAndExecInChild1's results: under
+//     CLONE_VM|CLONE_VFORK the child runs the callee's frame, so a
+//     token stored there can be clobbered by the child's own spills
+//     and the parent's End would then validate a foreign generation.
+//     The inner frame never Value-roots a slot inside outer-exposed
+//     heap (fail-loud); those cells are already canonical from the
+//     outer frame.
 //   - The child never Begins or Ends: it only issues RawSyscall-class
 //     calls and plain reads of admitted cells.
 //
@@ -48,9 +53,15 @@ import "unsafe"
 // bit-identical. Stack scalars (lim, mapPipe, pidfd local, counters)
 // live in address-stable stack memory and need no root. Globals (none,
 // slash tables) never relocate. doCheckClonePidfd's child reads no
-// memory (immediate EXIT_GROUP), so it needs no admission; the three
-// fork functions are excluded from compiler instrumentation because this
-// source preflight covers the window.
+// memory (immediate EXIT_GROUP), so it needs no admission.
+//
+// The preflight does not exempt the fork functions from compiler
+// instrumentation: base.LogosNoLB suppresses the load barrier only for
+// runtime-package files and a fixed list of runtime functions, so a
+// -lb build of package syscall does instrument forkAndExecInChild1.
+// The bracket must therefore hold under instrumented code, which is
+// why the token lives outside the child-shared frame rather than
+// relying on that frame surviving the child untouched.
 //
 // Root inventory. Outer (max 15: 7 Value + 8 Whole) names forkExec's
 // cells: Value over argv0, argv, envv, chroot, dir, attr, sys; Whole
@@ -285,6 +296,12 @@ func logosZgcForeignEnd(t logosForeignToken)
 // forkAndExecInChild1 after all derived buffers exist and immediately
 // before runtime_BeforeFork; pair the token with logosForkEnd after
 // runtime_AfterFork in the parent. Never call in the child.
+//
+// The caller must store the returned token outside the vfork child's
+// frame (forkAndExecInChild1 writes it through a pointer into
+// forkAndExecInChild). A token kept in the child-shared frame can be
+// overwritten by the child's own spills, leaving the parent's End with
+// a Frame/Gen pair that never matched its Begin.
 func logosForkBegin(c *logosForkCells) logosForeignToken {
 	if c == nil {
 		return logosForeignToken{}

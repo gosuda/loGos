@@ -111,6 +111,38 @@ func zgcSyscallAdmit(rows unsafe.Pointer, n uintptr) (frame unsafe.Pointer, gen 
 	if rows == nil {
 		throw("logos zgc: syscall admit with nil rows")
 	}
+	var wsec unsafe.Pointer
+	var wnw uintptr
+	if logosSyscallWholeSextuples(n) {
+		n0 := n &^ logosSyscallWholeVersion
+		if n0 > zgcSyscallMaxPairs {
+			throw("logos zgc: syscall admit row count overflows the address space")
+		}
+		if n0 > (^uintptr(0)/unsafe.Sizeof(uintptr(0))-1)/2 {
+			throw("logos zgc: syscall admit row range overflows the address space")
+		}
+		sec := zgcSyscallWholeSecAt(rows, n0)
+		if sec == nil {
+			throw("logos zgc: syscall admit with nil integer section")
+		}
+		m := zgcSyscallWholeIntAt(sec, 0)
+		if m > zgcSyscallMaxPairs {
+			throw("logos zgc: syscall admit iovec count overflows the address space")
+		}
+		if m > (^uintptr(0)/unsafe.Sizeof(uintptr(0))-(2*n0+1))/2 {
+			throw("logos zgc: syscall admit iovec range overflows the address space")
+		}
+		if m > (^uintptr(0)/unsafe.Sizeof(uintptr(0))-1)/4 {
+			throw("logos zgc: syscall admit integer section overflows the address space")
+		}
+		n = n0
+		wnw = m
+		wsec = sec
+		zgcSyscallValidateWhole(rows, n0, sec, m)
+		for i := uintptr(0); i < wnw; i++ {
+			getGCMask((*_type)(zgcSyscallWholePtrAt(rows, n0, 2*i+1)))
+		}
+	}
 	if n > zgcSyscallMaxPairs {
 		throw("logos zgc: syscall admit row count overflows the address space")
 	}
@@ -141,6 +173,8 @@ func zgcSyscallAdmit(rows unsafe.Pointer, n uintptr) (frame unsafe.Pointer, gen 
 	zgcSyscallSTWArgs.gp = gp
 	zgcSyscallSTWArgs.rows = rows
 	zgcSyscallSTWArgs.n = n
+	zgcSyscallSTWArgs.wsec = wsec
+	zgcSyscallSTWArgs.wnw = wnw
 	zgcSyscallSTWArgs.pc = sys.GetCallerPC()
 	zgcSyscallSTWArgs.sp = sys.GetCallerSP()
 	zgcSyscallSTWArgs.tok = logosForeignInvalidToken
@@ -152,6 +186,7 @@ func zgcSyscallAdmit(rows unsafe.Pointer, n uintptr) (frame unsafe.Pointer, gen 
 	ok := zgcSyscallSTWArgs.ok
 	zgcSyscallSTWArgs.gp = nil
 	zgcSyscallSTWArgs.rows = nil
+	zgcSyscallSTWArgs.wsec = nil
 	startTheWorld(w)
 	if !ok {
 		throw("logos zgc: syscall admission exhausted off-heap storage")
@@ -180,15 +215,36 @@ var zgcSyscallSTWArgs struct {
 	roots uintptr
 	nr    uintptr
 	cr    uintptr
-	refs  uintptr
-	nw    uintptr
-	cw    uintptr
-	mods  uintptr
-	nm    uintptr
-	cm    uintptr
-	seenR zgcForeignSet
-	seenW zgcForeignSet
-	seenM zgcForeignSet
+	// Iovec section: the staged integer-section base and descriptor
+	// count plus the built per-element roots (Unknown over each Base
+	// field, Whole over each payload extent), fused into the single
+	// frame below.
+	wsec   unsafe.Pointer
+	wnw    uintptr
+	wroots uintptr
+	wnr    uintptr
+	wcr    uintptr
+	refs   uintptr
+	nw     uintptr
+	cw     uintptr
+	mods   uintptr
+	nm     uintptr
+	cm     uintptr
+	seenR  zgcForeignSet
+	seenW  zgcForeignSet
+	seenM  zgcForeignSet
+}
+
+// zgcSyscallRejectWholeVersion rejects a versioned buffer on the nosplit
+// leaf: sextuple expansion stops the world, which a nosplit stack can
+// never do. Nosplit producers emit no Whole section; reaching here with
+// the bit set is bad producer protocol.
+//
+//go:nosplit
+func zgcSyscallRejectWholeVersion(n uintptr) {
+	if logosSyscallWholeSextuples(n) {
+		throw("logos zgc: syscall nosplit admit with iovec section; producer preflight missing")
+	}
 }
 
 // zgcSyscallAdmitIndirect admits only when code carries the foreign
@@ -212,6 +268,37 @@ func zgcSyscallAdmitIndirect(code unsafe.Pointer, rows unsafe.Pointer, n uintptr
 		return nil, 0
 	}
 	return zgcSyscallAdmit(rows, n)
+}
+
+// zgcSyscallAdmitIndirectNoSplit is the nosplit caller's indirect entry
+// point. It applies the identical target-authorization gate as
+// zgcSyscallAdmitIndirect — cycle enabled, nonzero rows, non-nil code
+// word, findfunc-resolvable code carrying FuncFlagUintptrForeign — and
+// unmarked targets return the invalid token with strictly zero
+// mutation: no slot is read for retention and no cell is rewritten, and
+// no coverage scan runs. Flagged targets delegate to the pure NoSplit
+// coverage leaf verbatim, so its covered/OuterLive token-free returns
+// and the uncovered-heap and undiscoverable-referent throws are
+// preserved unchanged. Legal on no-P stacks: findfunc only
+// binary-searches static functab and the leaf takes no locks, allocates
+// nothing, stops no world, and grows no stack.
+//
+//go:nosplit
+func zgcSyscallAdmitIndirectNoSplit(code unsafe.Pointer, rows unsafe.Pointer, n uintptr) (frame unsafe.Pointer, gen uint64) {
+	if !zgcCycleEnabled() {
+		return nil, 0
+	}
+	if n == 0 {
+		return nil, 0
+	}
+	if code == nil {
+		return nil, 0
+	}
+	fi := findfunc(uintptr(code))
+	if !fi.valid() || fi._func.flag&abi.FuncFlagUintptrForeign == 0 {
+		return nil, 0
+	}
+	return zgcSyscallAdmitNoSplit(rows, n)
 }
 
 // zgcSyscallEnd releases exactly the invocation named by (frame, gen).
@@ -242,6 +329,7 @@ func zgcSyscallAdmitNoSplit(rows unsafe.Pointer, n uintptr) (frame unsafe.Pointe
 	if n == 0 {
 		return nil, 0
 	}
+	zgcSyscallRejectWholeVersion(n)
 	if rows == nil {
 		throw("logos zgc: syscall nosplit admit with nil rows")
 	}
@@ -567,6 +655,10 @@ func zgcSyscallWorkFree() {
 		sysFree(unsafe.Pointer(a.mods), a.cm*ptrSize, &memstats.other_sys)
 		a.mods, a.nm, a.cm = 0, 0, 0
 	}
+	if a.wcr != 0 {
+		sysFree(unsafe.Pointer(a.wroots), a.wcr*unsafe.Sizeof(logosForeignRoot{}), &memstats.other_sys)
+		a.wroots, a.wnr, a.wcr = 0, 0, 0
+	}
 	zgcForeignSetDestroy(&a.seenR)
 	zgcForeignSetDestroy(&a.seenW)
 	zgcForeignSetDestroy(&a.seenM)
@@ -626,8 +718,17 @@ func zgcSyscallOnSystemstack() {
 		a.ok = false
 		return
 	}
-	total := n + a.nr
-	if total < n {
+	if a.wnw != 0 {
+		zgcSyscallExpandWhole()
+	}
+	if !a.ok {
+		zgcSyscallFrameAbandon(gp, f)
+		zgcSyscallWorkFree()
+		a.ok = false
+		return
+	}
+	total := n + a.nr + a.wnr
+	if total < n || total < a.nr || total < a.wnr {
 		zgcSyscallFrameAbandon(gp, f)
 		zgcSyscallWorkFree()
 		a.ok = false
@@ -653,6 +754,9 @@ func zgcSyscallOnSystemstack() {
 	for j := uintptr(0); j < a.nr; j++ {
 		cell := *(*uintptr)(add(unsafe.Pointer(a.roots), j*unsafe.Sizeof(uintptr(0))))
 		*(*logosForeignRoot)(add(rbase, (n+j)*rsz)) = logosForeignRoot{Slot: unsafe.Pointer(cell), Kind: logosForeignRootUnknown}
+	}
+	for k := uintptr(0); k < a.wnr; k++ {
+		*(*logosForeignRoot)(add(rbase, (n+a.nr+k)*rsz)) = *(*logosForeignRoot)(add(unsafe.Pointer(a.wroots), k*rsz))
 	}
 	ok := zgcForeignAdmitSTW(f, (*logosForeignRoot)(rbase), total)
 	sysFree(rbase, total*rsz, &memstats.other_sys)
@@ -853,6 +957,146 @@ func zgcSyscallWalkMask(start, end uintptr, mask *byte) {
 			}
 			bits >>= 1
 			i += ptrSize
+		}
+	}
+}
+
+// Iovec-payload Whole expansion (versioned wire, single frame).
+//
+// See logos_foreign_types.go for the wire contract. The Unknown lane
+// owns the frame: the version bit in n reveals the sextuple section,
+// which expands here (world stopped, array frozen) to one Unknown root
+// over each element's Base field plus one Whole root over the payload
+// extent. Both join the single frame, so the one existing End releases
+// everything after the blocking call completes.
+// zgcSyscallWholeSecAt returns the integer-section base of a versioned
+// buffer: the [*]uintptr array whose first word counts the descriptors.
+//
+//go:nosplit
+func zgcSyscallWholeSecAt(rows unsafe.Pointer, n0 uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(add(rows, 2*n0*unsafe.Sizeof(uintptr(0))))
+}
+
+// zgcSyscallWholePtrAt returns pointer word d of the descriptor section:
+// ArraySlot at even d, ElemType at odd d. Genuine pointers live only
+// here, in unsafe.Pointer-typed memory.
+//
+//go:nosplit
+func zgcSyscallWholePtrAt(rows unsafe.Pointer, n0, d uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(add(rows, (2*n0+1+d)*unsafe.Sizeof(uintptr(0))))
+}
+
+// zgcSyscallWholeIntAt returns integer word k of the integer section:
+// the descriptor count at k == 0, then one [BaseOff, LenOff, IovSize,
+// Count] quad per descriptor. Raw metadata lives only here, in
+// uintptr-typed memory the collector never scans as pointers.
+//
+//go:nosplit
+func zgcSyscallWholeIntAt(sec unsafe.Pointer, k uintptr) uintptr {
+	return *(*uintptr)(add(sec, k*unsafe.Sizeof(uintptr(0))))
+}
+
+// zgcSyscallValidateWhole enforces the section shape before the world
+// stops (fail-loud producer contract): a known integer section,
+// bounded descriptor counts, known array cells, non-nil element types
+// of positive size, and sane field offsets within a positive stride.
+// Per-element Base/Size values are runtime memory and validate at
+// expansion; misalignment there fails the admission closed instead of
+// throwing inside the stop.
+func zgcSyscallValidateWhole(rows unsafe.Pointer, n0 uintptr, sec unsafe.Pointer, m uintptr) {
+	if sec == nil {
+		throw("logos zgc: syscall whole admit with nil integer section")
+	}
+	for i := uintptr(0); i < m; i++ {
+		if zgcSyscallWholePtrAt(rows, n0, 2*i) == nil {
+			throw("logos zgc: syscall whole admit with nil slot")
+		}
+		elem := zgcSyscallWholePtrAt(rows, n0, 2*i+1)
+		if elem == nil {
+			throw("logos zgc: syscall whole admit without element type")
+		}
+		if (*_type)(elem).Size_ == 0 {
+			throw("logos zgc: syscall whole admit with zero-sized element type")
+		}
+		baseOff := zgcSyscallWholeIntAt(sec, 1+4*i+0)
+		lenOff := zgcSyscallWholeIntAt(sec, 1+4*i+1)
+		iovSize := zgcSyscallWholeIntAt(sec, 1+4*i+2)
+		count := zgcSyscallWholeIntAt(sec, 1+4*i+3)
+		if iovSize < 8 {
+			throw("logos zgc: syscall whole admit with undersized iovec stride")
+		}
+		if baseOff > iovSize-8 || lenOff > iovSize-8 {
+			throw("logos zgc: syscall whole admit with out-of-range field offset")
+		}
+		if count > zgcSyscallMaxPairs {
+			throw("logos zgc: syscall whole admit count overflows the address space")
+		}
+	}
+}
+
+// zgcSyscallWholeAppendRoot records one built iovec root: an Unknown
+// root over a Base field (retaining the payload object) or a Whole root
+// over a payload extent (pinning it without rewriting C-observed cells).
+func zgcSyscallWholeAppendRoot(root logosForeignRoot) {
+	a := &zgcSyscallSTWArgs
+	rsz := unsafe.Sizeof(logosForeignRoot{})
+	if a.wnr >= a.wcr && !zgcSyscallGrow(&a.wroots, &a.wcr, a.wnr, rsz) {
+		a.ok = false
+		return
+	}
+	*(*logosForeignRoot)(add(unsafe.Pointer(a.wroots), a.wnr*rsz)) = root
+	a.wnr++
+}
+
+// zgcSyscallExpandWhole expands the staged sextuple section to built
+// roots. Every address the call will read is reclassified before any
+// load, so unmapped user pointers are skipped element-wise: they can
+// neither fault the stopped world nor reach the registry. A nil array
+// or a nil Base or zero Len admits nothing for that element, so the
+// kernel reports the error itself.
+func zgcSyscallExpandWhole() {
+	a := &zgcSyscallSTWArgs
+	gp, rows, n, sec, nw := a.gp, a.rows, a.n, a.wsec, a.wnw
+	for d := uintptr(0); d < nw && a.ok; d++ {
+		arraySlot := zgcSyscallWholePtrAt(rows, n, 2*d)
+		elem := zgcSyscallWholePtrAt(rows, n, 2*d+1)
+		baseOff := zgcSyscallWholeIntAt(sec, 1+4*d+0)
+		lenOff := zgcSyscallWholeIntAt(sec, 1+4*d+1)
+		iovSize := zgcSyscallWholeIntAt(sec, 1+4*d+2)
+		count := zgcSyscallWholeIntAt(sec, 1+4*d+3)
+		array := *(*uintptr)(arraySlot)
+		if array == 0 {
+			continue
+		}
+		if zgcSyscallClassify(gp, array) == zgcSyscallRefOther {
+			continue
+		}
+		if count != 0 && iovSize > ^uintptr(0)/count {
+			a.ok = false
+			break
+		}
+		if array > ^uintptr(0)-count*iovSize {
+			a.ok = false
+			break
+		}
+		for i := uintptr(0); i < count && a.ok; i++ {
+			eaddr := array + i*iovSize
+			if zgcSyscallClassify(gp, eaddr) == zgcSyscallRefOther {
+				continue
+			}
+			base := *(*uintptr)(unsafe.Pointer(eaddr + baseOff))
+			size := *(*uintptr)(unsafe.Pointer(eaddr + lenOff))
+			if base == 0 || size == 0 {
+				continue
+			}
+			if zgcSyscallClassify(gp, base) == zgcSyscallRefOther {
+				continue
+			}
+			zgcSyscallWholeAppendRoot(logosForeignRoot{Slot: unsafe.Pointer(eaddr + baseOff), Kind: logosForeignRootUnknown})
+			if !a.ok {
+				break
+			}
+			zgcSyscallWholeAppendRoot(logosForeignRoot{Slot: unsafe.Pointer(base), Type: elem, Size: size, Kind: logosForeignRootWhole})
 		}
 	}
 }

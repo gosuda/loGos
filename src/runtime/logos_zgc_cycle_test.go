@@ -66,9 +66,15 @@ func TestLogosZgcScanWordForeign(t *testing.T) {
 func TestLogosZgcHealScanSlotKeepsCanonical(t *testing.T) {
 	defer LogosZgcReset()
 	LogosZgcSelectSoftware(LogosZgcMark0)
-	x := new(uintptr)
-	*x = 7
-	addr := uintptr(unsafe.Pointer(x))
+	// The target must lie inside the 42-bit address field: the heal
+	// strips anything above it as a color, so a heap address cannot be
+	// canonical where the heap sits high (any mode but zgc). Use a
+	// mapped in-field page as the target; the slot itself stays a
+	// normal heap word so writability is unchanged, and the strip
+	// contract under test is identical.
+	base, free := logosZgcPlace(t)
+	defer free()
+	addr := base + 0x40
 	slot := new(uintptr)
 	*slot = addr
 	LogosZgcHealScanSlot(slot)
@@ -79,6 +85,18 @@ func TestLogosZgcHealScanSlotKeepsCanonical(t *testing.T) {
 	LogosZgcHealScanSlot(slot)
 	if *slot != addr {
 		t.Fatalf("colored slot healed to %#x, want uncolored %#x", *slot, addr)
+	}
+	// Every other stale color must strip too: the active mask covers the
+	// whole nibble, not just the good bit, so a word carrying any
+	// flip-active bit heals to the same canonical address. A good-only
+	// mask would keep bit 44 (mark1) here and fail exactly like the
+	// mark1 case above.
+	for _, c := range []uint8{LogosZgcRemapped, LogosZgcFinal} {
+		*slot = LogosZgcColored(addr, c)
+		LogosZgcHealScanSlot(slot)
+		if *slot != addr {
+			t.Fatalf("color %#x: slot healed to %#x, want uncolored %#x", c, *slot, addr)
+		}
 	}
 }
 

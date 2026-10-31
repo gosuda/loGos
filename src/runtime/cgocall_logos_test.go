@@ -54,8 +54,8 @@ func logosCgoCanonRequireHeap(t *testing.T, what string, v uintptr) {
 func TestLogosCgoCanonStructFields(t *testing.T) {
 	logosCgoCanonSetup(t)
 	type S struct {
-		A *int
-		B *int
+		A   *int
+		B   *int
 		Pad int
 	}
 	a, b := LogosCgoCanonHeapInt(1), LogosCgoCanonHeapInt(2)
@@ -63,8 +63,8 @@ func TestLogosCgoCanonStructFields(t *testing.T) {
 	logosCgoCanonRequireHeap(t, "struct field A", pa)
 	logosCgoCanonRequireHeap(t, "struct field B", pb)
 	v := S{A: a, B: b}
-	*(*uintptr)(unsafe.Pointer(&v.A)) = LogosCgoCanonBad(pa)
-	*(*uintptr)(unsafe.Pointer(&v.B)) = LogosCgoCanonBad(pb)
+	LogosCgoCanonStoreWord(unsafe.Pointer(&v.A), LogosCgoCanonBad(pa))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&v.B), LogosCgoCanonBad(pb))
 	LogosCgoCanonicalizeSlot(any(v), unsafe.Pointer(&v))
 	if got := uintptr(unsafe.Pointer(v.A)); got != pa {
 		t.Fatalf("struct field A = %#x, want %#x", got, pa)
@@ -87,15 +87,15 @@ func TestLogosCgoCanonSliceElements(t *testing.T) {
 	logosCgoCanonRequireHeap(t, "slice backing", plain)
 	logosCgoCanonRequireHeap(t, "slice element 0", pa)
 	logosCgoCanonRequireHeap(t, "slice element 1", pb)
-	*(*uintptr)(unsafe.Pointer(plain)) = LogosCgoCanonBad(pa)
-	*(*uintptr)(unsafe.Pointer(plain + unsafe.Sizeof(plain))) = LogosCgoCanonBad(pb)
-	sh.array = unsafe.Pointer(LogosCgoCanonBad(plain))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&s[0]), LogosCgoCanonBad(pa))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&s[1]), LogosCgoCanonBad(pb))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&sh.array), LogosCgoCanonBad(plain))
 	LogosCgoCanonicalizeSlot(any(s), unsafe.Pointer(&s))
 	if got := uintptr(sh.array); got != plain {
 		t.Fatalf("slice header = %#x, want %#x", got, plain)
 	}
-	got0 := *(*uintptr)(unsafe.Pointer(plain))
-	got1 := *(*uintptr)(unsafe.Pointer(plain + unsafe.Sizeof(got0)))
+	got0 := LogosZgcWord(plain)
+	got1 := LogosZgcWord(plain + unsafe.Sizeof(got0))
 	if got0 != pa || got1 != pb {
 		t.Fatalf("slice elements = %#x,%#x want %#x,%#x", got0, got1, pa, pb)
 	}
@@ -113,9 +113,9 @@ func TestLogosCgoCanonSliceSpareCapacity(t *testing.T) {
 	plain := uintptr(sh.array)
 	spare := uintptr(unsafe.Pointer(full[1]))
 	logosCgoCanonRequireHeap(t, "spare element", spare)
-	*(*uintptr)(unsafe.Pointer(plain + unsafe.Sizeof(plain))) = LogosCgoCanonBad(spare)
+	LogosCgoCanonStoreWord(unsafe.Pointer(&full[1]), LogosCgoCanonBad(spare))
 	LogosCgoCanonicalizeSlot(any(s), unsafe.Pointer(&s))
-	if got := *(*uintptr)(unsafe.Pointer(plain + unsafe.Sizeof(plain))); got != spare {
+	if got := LogosZgcWord(plain + unsafe.Sizeof(plain)); got != spare {
 		t.Fatalf("element in spare capacity = %#x, want %#x", got, spare)
 	}
 }
@@ -126,7 +126,7 @@ func TestLogosCgoCanonStringData(t *testing.T) {
 	ss := (*logosCgoStringHeader)(unsafe.Pointer(&v))
 	plain := uintptr(ss.str)
 	logosCgoCanonRequireHeap(t, "string backing", plain)
-	ss.str = unsafe.Pointer(LogosCgoCanonBad(plain))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&ss.str), LogosCgoCanonBad(plain))
 	LogosCgoCanonicalizeSlot(any(v), unsafe.Pointer(&v))
 	if got := uintptr(ss.str); got != plain {
 		t.Fatalf("string data = %#x, want %#x", got, plain)
@@ -148,9 +148,9 @@ func TestLogosCgoCanonInterfaceData(t *testing.T) {
 	pin := uintptr(unsafe.Pointer(inner))
 	logosCgoCanonRequireHeap(t, "interface data", pin)
 	logosCgoCanonRequireHeap(t, "interface referent", px)
-	*(*uintptr)(unsafe.Pointer(&inner.X)) = LogosCgoCanonBad(px)
+	LogosCgoCanonStoreWord(unsafe.Pointer(&inner.X), LogosCgoCanonBad(px))
 	dp := (*[2]unsafe.Pointer)(unsafe.Pointer(&v.W))
-	dp[1] = unsafe.Pointer(LogosCgoCanonBad(pin))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&dp[1]), LogosCgoCanonBad(pin))
 	LogosCgoCanonicalizeSlot(any(v), unsafe.Pointer(&v))
 	if got := uintptr(dp[1]); got != pin {
 		t.Fatalf("interface data word = %#x, want %#x", got, pin)
@@ -176,13 +176,13 @@ func TestLogosCgoCanonSliceInStruct(t *testing.T) {
 	plain := uintptr(sh.array)
 	logosCgoCanonRequireHeap(t, "nested backing", plain)
 	logosCgoCanonRequireHeap(t, "nested element", pa)
-	*(*uintptr)(unsafe.Pointer(plain)) = LogosCgoCanonBad(pa)
-	sh.array = unsafe.Pointer(LogosCgoCanonBad(plain))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&v.E[0]), LogosCgoCanonBad(pa))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&sh.array), LogosCgoCanonBad(plain))
 	LogosCgoCanonicalizeSlot(any(v), unsafe.Pointer(&v))
 	if got := uintptr(sh.array); got != plain {
 		t.Fatalf("slice-in-struct header = %#x, want %#x", got, plain)
 	}
-	if got := *(*uintptr)(unsafe.Pointer(plain)); got != pa {
+	if got := LogosZgcWord(plain); got != pa {
 		t.Fatalf("slice-in-struct element = %#x, want %#x", got, pa)
 	}
 	if *v.E[0] != 1 {
@@ -203,8 +203,8 @@ func TestLogosCgoCanonTransitiveUnknown(t *testing.T) {
 	pin := uintptr(unsafe.Pointer(in))
 	logosCgoCanonRequireHeap(t, "outer link", pin)
 	logosCgoCanonRequireHeap(t, "descendant", px)
-	*(*uintptr)(unsafe.Pointer(&out.In)) = LogosCgoCanonBad(pin)
-	*(*uintptr)(unsafe.Pointer(&in.P)) = LogosCgoCanonBad(px)
+	LogosCgoCanonStoreWord(unsafe.Pointer(&out.In), LogosCgoCanonBad(pin))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&in.P), LogosCgoCanonBad(px))
 	LogosCgoCanonicalizeUnknown(unsafe.Pointer(out))
 	if got := uintptr(unsafe.Pointer(out.In)); got != pin {
 		t.Fatalf("outer link = %#x, want %#x", got, pin)
@@ -231,8 +231,8 @@ func TestLogosCgoCanonCyclicUnknown(t *testing.T) {
 	LogosCgoCanonPin(b)
 	physical, pbn := uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(b))
 	logosCgoCanonRequireHeap(t, "cycle node", physical)
-	*(*uintptr)(unsafe.Pointer(&a.Next)) = LogosCgoCanonBad(pbn)
-	*(*uintptr)(unsafe.Pointer(&b.Next)) = LogosCgoCanonBad(physical)
+	LogosCgoCanonStoreWord(unsafe.Pointer(&a.Next), LogosCgoCanonBad(pbn))
+	LogosCgoCanonStoreWord(unsafe.Pointer(&b.Next), LogosCgoCanonBad(physical))
 	LogosCgoCanonicalizeUnknown(unsafe.Pointer(a))
 	if got := uintptr(unsafe.Pointer(a.Next)); got != pbn {
 		t.Fatalf("cycle forward link = %#x, want %#x", got, pbn)
@@ -259,10 +259,78 @@ func TestLogosCgoCanonStaleSourceForwards(t *testing.T) {
 	if !LogosCgoCanonStrippable(LogosCgoCanonBad(from)) {
 		t.Fatalf("source %#x is not strippable: the synthetic page is not registered", from)
 	}
-	v := S{A: (*int)(unsafe.Pointer(LogosCgoCanonBad(from)))}
+	var v S
+	defer func() { v.A = nil }()
+	LogosCgoCanonStoreWord(unsafe.Pointer(&v.A), LogosCgoCanonBad(from))
 	LogosCgoCanonicalizeSlot(any(v), unsafe.Pointer(&v))
 	if got := uintptr(unsafe.Pointer(v.A)); got != to {
 		t.Fatalf("stale source = %#x, want copy %#x", got, to)
+	}
+	if got := LogosZgcWord(to); got != 0x1111 {
+		t.Fatalf("relocated copy payload = %#x, want %#x", got, 0x1111)
+	}
+}
+
+func TestLogosCgoCanonUnsafePointerDirect(t *testing.T) {
+	logosCgoCanonSetup(t)
+	type Target struct {
+		Child *int
+		Value int
+	}
+	child := LogosCgoCanonHeapInt(42)
+	ref := &Target{Child: child, Value: 101}
+	LogosCgoCanonPin(ref)
+	pref := uintptr(unsafe.Pointer(ref))
+	pchild := uintptr(unsafe.Pointer(child))
+	logosCgoCanonRequireHeap(t, "unsafe.Pointer referent", pref)
+	logosCgoCanonRequireHeap(t, "referent child", pchild)
+
+	var p unsafe.Pointer = unsafe.Pointer(ref)
+	pSlot := uintptr(unsafe.Pointer(&p))
+	childSlot := uintptr(unsafe.Pointer(&ref.Child))
+
+	badRef := LogosCgoCanonBad(pref)
+	badChild := LogosCgoCanonBad(pchild)
+	LogosCgoCanonStoreWord(unsafe.Pointer(&p), badRef)
+	LogosCgoCanonStoreWord(unsafe.Pointer(&ref.Child), badChild)
+
+	beforeP := LogosZgcWord(pSlot)
+	beforeChild := LogosZgcWord(childSlot)
+	if beforeP != badRef {
+		t.Fatalf("parent unsafe.Pointer before = %#x, want bad %#x", beforeP, badRef)
+	}
+	if beforeChild != badChild {
+		t.Fatalf("referent child before = %#x, want bad %#x", beforeChild, badChild)
+	}
+
+	LogosCgoCanonicalizeSlot(any(p), unsafe.Pointer(&p))
+
+	afterP := LogosZgcWord(pSlot)
+	if afterP == beforeP {
+		t.Fatalf("parent unsafe.Pointer word did not change: %#x", afterP)
+	}
+	if afterP != pref {
+		t.Fatalf("parent unsafe.Pointer word = %#x, want canonical %#x", afterP, pref)
+	}
+	if got := uintptr(p); got != pref {
+		t.Fatalf("parent unsafe.Pointer = %#x, want %#x", got, pref)
+	}
+
+	afterChild := LogosZgcWord(childSlot)
+	if afterChild == beforeChild {
+		t.Fatalf("referent child word did not change: %#x", afterChild)
+	}
+	if afterChild != pchild {
+		t.Fatalf("referent child word = %#x, want canonical %#x", afterChild, pchild)
+	}
+	if got := uintptr(unsafe.Pointer(ref.Child)); got != pchild {
+		t.Fatalf("referent child pointer = %#x, want %#x", got, pchild)
+	}
+	if *ref.Child != 42 {
+		t.Fatalf("referent child does not name its object: got %d, want 42", *ref.Child)
+	}
+	if ref.Value != 101 {
+		t.Fatalf("referent payload corrupted: got %d, want 101", ref.Value)
 	}
 }
 

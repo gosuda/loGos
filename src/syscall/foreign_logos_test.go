@@ -68,6 +68,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 const (
@@ -413,5 +414,72 @@ func TestLogosExecLargeEnv(t *testing.T) {
 	}
 	if string(out) != want {
 		t.Fatalf("exec chain returned %d bytes, want %d exact bytes (argv/env corrupted across standalone Exec)", len(out), len(want))
+	}
+}
+
+// TestLogosForkAdmissionReleaseAcrossExec proves the parent-side fork
+// admission window: pointer-bearing inputs are admitted before
+// runtime_BeforeFork and their roots are released after
+// runtime_AfterFork. Admission is observed through a real fork/exec:
+// the child must echo large argv/env byte-exactly, which fails on a
+// moving collector if the C-string backings relocate between
+// conversion and clone. Release is observed through a parent cleanup
+// on the admitted SysProcAttr: after the last spawn drops every parent
+// reference, only a leaked (missing or mispaired End) admission frame
+// could still retain it, so the cleanup must fire promptly. No new
+// public API; the window is exercised purely through ForkExec.
+func TestLogosForkAdmissionReleaseAcrossExec(t *testing.T) {
+	exe := testenv.Executable(t)
+	argv := logosForkLargeArgv()[:64]
+	addEnv := logosForkLargeEnv()[:32]
+	want := logosForkRenderEcho(argv, addEnv)
+
+	stop := make(chan struct{})
+	var sink atomic.Uint64
+	for range 4 {
+		go logosForkChurn(stop, &sink)
+	}
+	defer close(stop)
+
+	attr := &syscall.SysProcAttr{}
+	released := make(chan struct{}, 1)
+	runtime.AddCleanup(attr, func(ch chan struct{}) { ch <- struct{}{} }, released)
+	for i := range 3 {
+		runtime.GC()
+		args := append([]string{"-test.run=^TestLogosForkEchoHelper$"}, argv...)
+		cmd := testenv.Command(t, exe, args...)
+		cmd.Env = append(cmd.Environ(), logosForkHelperEnv+"="+logosForkEchoMode)
+		cmd.Env = append(cmd.Env, addEnv...)
+		cmd.SysProcAttr = attr
+		out, err := cmd.CombinedOutput()
+		cmd.SysProcAttr = nil
+		if err != nil {
+			t.Fatalf("iter %d: spawn failed: %v\n%.500s", i, err, out)
+		}
+		if string(out) != want {
+			t.Fatalf("iter %d: child returned %d bytes, want %d exact bytes (fork inputs corrupted across fork/exec: admission missing before BeforeFork?)", i, len(out), len(want))
+		}
+	}
+	_ = sink.Load()
+	// Drop every parent reference to the admitted attr. After End ran
+	// in the parent after AfterFork, nothing retains it; a missing or
+	// mispaired End would leave the frame live and block the cleanup.
+	// The loop-scoped cmds no longer reference attr (each nils its
+	// field, including any t.Cleanup capture), so only a leaked frame
+	// can keep it alive past this point.
+	attr = nil
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		runtime.GC()
+		runtime.Gosched()
+		select {
+		case <-released:
+			return
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fork admission not released after AfterFork: SysProcAttr still retained 30s after the last spawn (End missing or mispaired?)")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

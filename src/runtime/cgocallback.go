@@ -5,6 +5,9 @@
 package runtime
 
 // These functions are called from C code via cgo/callbacks.go.
+// cgocallbackg forwards one opaque frame to generated code; nested
+// C-visible result words are healed there, next to _cgoCheckResult and
+// via cgoForeignResults, not by walking an untyped frame here.
 
 // Panic.
 

@@ -30,10 +30,15 @@ const (
 	zgcTagRegionMask = uintptr(0xFFFF) << 48
 	zgcColorShift    = 56
 	zgcColorMask     = uintptr(0xF) << zgcColorShift
-	zgcMark0Bit      = 42
-	zgcMark1Bit      = 44
-	zgcRemappedBit   = 45
-	zgcFinalBit      = 46
+	// zgcFlagMask covers the flag bits between the 42-bit address field
+	// and the hardware colour nibble: the software colour positions
+	// (mark0, mark1, remapped, final) and the reserved zero bits
+	// interleaved with them (bits 43 and 47).
+	zgcFlagMask    = (uintptr(0x3F) << zgcAddrBits)
+	zgcMark0Bit    = 42
+	zgcMark1Bit    = 44
+	zgcRemappedBit = 45
+	zgcFinalBit    = 46
 )
 
 // zgcColor is the four-bit color state: one bit per color, mark0 lowest.
@@ -130,10 +135,15 @@ func zgcFlip(good zgcColor) {
 // carry exactly the good color, and returns the canonical address.
 //
 // Only a word whose canonical address lies on a page of the zgc page
-// directory is a zgc heap word and heals. Any other word (nil, a pointer
-// to C or mmap memory, to read-only data, or to a goroutine stack) is
-// returned unchanged and its slot is left alone, because its high bits
-// are address bits, not colors.
+// directory is a zgc heap word and heals. A stale-colored word whose
+// canonical names ordinary span heap (no page, so no forwarding entry
+// can exist) strips to the canonical address without touching its slot
+// or counting a heal, because its high bits are colors, not address
+// bits, and the flag must not escape to the dereference. Any other word
+// (nil, a pointer to C or mmap memory, to read-only data, or to a
+// goroutine stack, i.e. a word whose canonical has no heap span behind
+// it) is returned unchanged and its slot is left alone, because its high
+// bits are address bits, not colors.
 // zgcOnSignalStack reports whether the current SP is on the M's signal
 // stack. sigtrampgo runs on the signal stack while getg() still names the
 // interrupted goroutine (setg(gp) until setg(gsignal) in signal_unix.go),
@@ -218,10 +228,46 @@ func zgcLoadBarrierSlow(slot *uintptr, v uintptr) uintptr {
 		return addr
 	}
 	if zgcNoSplitWindow() {
-		return zgcRemapNoSplit(addr)
+		// The remap miss path returns the already-stripped addr and
+		// never saw v, so it cannot fall back to the original word.
+		// Require the canonical to resolve — a registered relocation
+		// source or any heap span — before handing a masked address to
+		// the dereference; otherwise return the original word
+		// unchanged, mirroring the pg == nil block below and
+		// zgcUntagFast. Without this, a stale-colored word whose
+		// canonical names no page and no span is stripped here while
+		// the identical word on the preemptible path returns unchanged.
+		// Probe and remap share one transient domain and one probe,
+		// keeping this chain inside the nosplit budget.
+		zgcPageTransientEnter()
+		pg := zgcPageLookupTransient(addr)
+		if addr != v && pg == nil && (!zgcHeapArenaLive() || spanOfHeap(addr) == nil) {
+			zgcPageTransientLeave()
+			return v
+		}
+		result := zgcRemapNoSplitPage(addr, pg)
+		zgcPageTransientLeave()
+		return result
 	}
-	pg := zgcPageFor(addr)
+	zgcPageTransientEnter()
+	pg := zgcPageLookupTransient(addr)
+	zgcPageTransientLeave()
 	if pg == nil {
+		// Ordinary-heap stale color (e.g. the previous good color still
+		// on a word into to-space, which is heap but never a registered
+		// source): no forwarding entry can exist for addr, so there is
+		// nothing to heal, but the flag must not escape to the
+		// dereference the compiled barrier feeds. Strip to the canonical
+		// address without touching the slot or counting a heal,
+		// mirroring zgcAtomicLoadpSlow (which handles this case before
+		// delegating so the out-of-line arm64 path never hands asm a
+		// colored word) and the syscall classifier (which treats span
+		// heap as heap with no page required). Foreign words (no span)
+		// still return unchanged below, and addr is already known to be
+		// within the address field here.
+		if addr != v && zgcHeapArenaLive() && spanOfHeap(addr) != nil {
+			return addr
+		}
 		return v
 	}
 	if zgcOnSignalStack() || !zgcCanRelocateDeep() {
@@ -277,6 +323,7 @@ func zgcSelfHeal(slot *uintptr, old uintptr) uintptr {
 		return 0
 	}
 	zgcHeals.Add(1)
+	pg := zgcPageAcquire(zgcAddr(old))
 	for {
 		// Grey outside the gate: needs a P/gcw and may safepoint, so it
 		// never runs while the gate is held. Advisory only; the commit
@@ -303,30 +350,61 @@ func zgcSelfHeal(slot *uintptr, old uintptr) uintptr {
 		zgcForeignGateLock()
 		cur := atomic.Loaduintptr(slot)
 		if cur != old {
+			curSettled := cur == 0 || cur&atomic.Loaduintptr(&zgcColorMaskBits) == atomic.Loaduintptr(&zgcGoodMask)
+			var nextpg *zgcPage
+			if !curSettled {
+				nextpg = zgcPageAcquire(zgcAddr(cur))
+			}
 			zgcForeignGateUnlock()
 			releasem(mp)
-			old = cur
-			if old == 0 || old&atomic.Loaduintptr(&zgcColorMaskBits) == atomic.Loaduintptr(&zgcGoodMask) {
-				return zgcAddr(old)
+			if curSettled {
+				if pg != nil {
+					zgcPageRelease(pg)
+				}
+				return zgcAddr(cur)
 			}
+			if pg != nil {
+				zgcPageRelease(pg)
+			}
+			pg = nextpg
+			old = cur
 			continue
 		}
 		addr := zgcRemap(zgcAddr(old))
 		if zgcForeignObjectExposedLocked(uintptr(unsafe.Pointer(slot))) {
 			zgcForeignGateUnlock()
 			releasem(mp)
+			if pg != nil {
+				zgcPageRelease(pg)
+			}
 			return addr
 		}
 		won := atomic.Casuintptr(slot, old, addr+zgcGoodBits())
-		zgcForeignGateUnlock()
-		releasem(mp)
 		if won {
+			zgcForeignGateUnlock()
+			releasem(mp)
+			if pg != nil {
+				zgcPageRelease(pg)
+			}
 			return addr
 		}
-		old = atomic.Loaduintptr(slot)
-		if old == 0 || old&atomic.Loaduintptr(&zgcColorMaskBits) == atomic.Loaduintptr(&zgcGoodMask) {
-			return zgcAddr(old)
+		nextold := atomic.Loaduintptr(slot)
+		if nextold == 0 || nextold&atomic.Loaduintptr(&zgcColorMaskBits) == atomic.Loaduintptr(&zgcGoodMask) {
+			zgcForeignGateUnlock()
+			releasem(mp)
+			if pg != nil {
+				zgcPageRelease(pg)
+			}
+			return zgcAddr(nextold)
 		}
+		nextpg := zgcPageAcquire(zgcAddr(nextold))
+		zgcForeignGateUnlock()
+		releasem(mp)
+		if pg != nil {
+			zgcPageRelease(pg)
+		}
+		pg = nextpg
+		old = nextold
 	}
 }
 
@@ -338,18 +416,23 @@ func zgcSelfHeal(slot *uintptr, old uintptr) uintptr {
 // works after the source page is released. Memory without a span (a page
 // the tests map directly) has no extents, and only object starts remap.
 func zgcRemap(addr uintptr) uintptr {
-	pg := zgcPageFor(addr)
-	if pg == nil {
-		return addr
+	zgcPageTransientEnter()
+	result := addr
+	if pg := zgcPageLookupTransient(addr); pg != nil {
+		base := addr
+		// Before the arena map is live no span can exist; skip the lookup
+		// rather than faulting on the nil map. Live behavior unchanged.
+		if zgcHeapArenaLive() {
+			if s := spanOfHeap(addr); s != nil {
+				base = s.base() + s.objIndex(addr)*s.elemsize
+			}
+		}
+		if to, ok := pg.forward(base); ok {
+			result = to + (addr - base)
+		}
 	}
-	base := addr
-	if s := spanOfHeap(addr); s != nil {
-		base = s.base() + s.objIndex(addr)*s.elemsize
-	}
-	if to, ok := pg.forward(base); ok {
-		return to + (addr - base)
-	}
-	return addr
+	zgcPageTransientLeave()
+	return result
 }
 
 // zgcRemapNoSplit is the no-split-window twin of zgcRemap for the
@@ -368,72 +451,66 @@ func zgcRemap(addr uintptr) uintptr {
 
 //go:nosplit
 func zgcRemapNoSplit(addr uintptr) uintptr {
-	p := atomic.Loaduintptr(&zgcDirAddr)
-	if p == 0 || addr > zgcAddrMask {
-		return addr
-	}
-	v := (*zgcDirectory)(add(nil, p))[addr>>zgcPageShift].Load()
-	if v == 0 {
-		return addr
-	}
-	pg := (*zgcPage)(add(nil, v))
-	if !pg.holdsSource(addr) {
-		return addr
-	}
-	// Object start through span extents, mirroring zgcRemap.
-	ri := arenaIdx((addr - arenaBaseOffset) / heapArenaBytes)
-	var l1, l2 uint
-	if arenaL1Bits == 0 {
-		l2 = uint(ri)
-	} else {
-		l1 = uint(ri) >> arenaL1Shift
-		if l1 >= uint(len(mheap_.arenas)) {
-			return addr
+	zgcPageTransientEnter()
+	pg := zgcPageLookupTransient(addr)
+	result := zgcRemapNoSplitPage(addr, pg)
+	zgcPageTransientLeave()
+	return result
+}
+
+// zgcRemapNoSplitPage is the shared remap walk for no-split callers.
+// Precondition: an open transient read domain (zgcPageTransientEnter)
+// covers the call, and pg came from zgcPageLookupTransient inside it.
+
+//go:nosplit
+func zgcRemapNoSplitPage(addr uintptr, pg *zgcPage) uintptr {
+	result := addr
+	if pg != nil && zgcHeapArenaLive() {
+		// Object start through span extents, mirroring zgcRemap.
+		ri := arenaIdx((addr - arenaBaseOffset) / heapArenaBytes)
+		var l1, l2 uint
+		var ha *heapArena
+		if arenaL1Bits == 0 {
+			l2 = uint(ri)
+			if l2 < uint(len(mheap_.arenas[0])) {
+				ha = mheap_.arenas[0][l2]
+			}
+		} else {
+			l1 = uint(ri) >> arenaL1Shift
+			if l1 < uint(len(mheap_.arenas)) {
+				l2 = uint(ri) & (1<<arenaL2Bits - 1)
+				l2t := mheap_.arenas[l1]
+				if l2t != nil && l2 < uint(len(l2t)) {
+					ha = l2t[l2]
+				}
+			}
 		}
-		l2 = uint(ri) & (1<<arenaL2Bits - 1)
-	}
-	var ha *heapArena
-	if arenaL1Bits == 0 {
-		if l2 >= uint(len(mheap_.arenas[0])) {
-			return addr
+		if ha != nil {
+			s := ha.spans[(addr/pageSize)%pagesPerArena]
+			base := addr
+			if s != nil && s.state.s.Load() == uint8(mSpanInUse) && addr >= s.startAddr && addr < s.limit {
+				n := addr - s.startAddr
+				base = s.startAddr + uintptr((uint64(n)*uint64(s.divMul))>>32)*s.elemsize
+			}
+			// Forwarding-table walk mirroring (*zgcPage).forward.
+			if base >= pg.start && base-pg.start < pg.size {
+				idx := uint64((base - pg.start) >> zgcGranuleShift)
+				i := uintptr(idx * zgcFwdHashMul >> pg.fwdShift)
+				for range pg.fwdMask + 1 {
+					e := (*atomic.Uint64)(add(pg.fwd, i*8)).Load()
+					if e == 0 {
+						break
+					}
+					if e>>zgcFwdIndexShift&zgcFwdIndexMask == idx {
+						result = uintptr(e&zgcFwdToMask) + (addr - base)
+						break
+					}
+					i = (i + 1) & pg.fwdMask
+				}
+			}
 		}
-		ha = mheap_.arenas[0][l2]
-	} else {
-		l2t := mheap_.arenas[l1]
-		if l2t == nil {
-			return addr
-		}
-		if l2 >= uint(len(l2t)) {
-			return addr
-		}
-		ha = l2t[l2]
 	}
-	if ha == nil {
-		return addr
-	}
-	s := ha.spans[(addr/pageSize)%pagesPerArena]
-	base := addr
-	if s != nil && s.state.s.Load() == uint8(mSpanInUse) && addr >= s.startAddr && addr < s.limit {
-		n := addr - s.startAddr
-		base = s.startAddr + uintptr((uint64(n)*uint64(s.divMul))>>32)*s.elemsize
-	}
-	// Forwarding-table walk mirroring (*zgcPage).forward.
-	if base < pg.start || base-pg.start >= pg.size {
-		return addr
-	}
-	idx := uint64((base - pg.start) >> zgcGranuleShift)
-	i := uintptr(idx * zgcFwdHashMul >> pg.fwdShift)
-	for range pg.fwdMask + 1 {
-		e := (*atomic.Uint64)(add(pg.fwd, i*8)).Load()
-		if e == 0 {
-			return addr
-		}
-		if e>>zgcFwdIndexShift&zgcFwdIndexMask == idx {
-			return uintptr(e&zgcFwdToMask) + (addr - base)
-		}
-		i = (i + 1) & pg.fwdMask
-	}
-	return addr
+	return result
 }
 
 // zgcUntag clears every color and tag bit of p. Syscall and cgo entries

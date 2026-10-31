@@ -180,7 +180,18 @@ func zgcSelectPages(budget uintptr) int {
 				nObjects += uintptr(s.nelems)
 			}
 		}
-		pg := zgcNewPage(c.base, zgcPageSize, live, nObjects)
+		// A registered page or a pending descriptor owns this granule
+		// until its header is reclaimed. Skip it before allocating a
+		// candidate header, and keep the claim's false result as the
+		// authoritative race-safe fallback: this region can progress
+		// in a later cycle without throwing.
+		if zgcPageSlotOccupied(c.base) {
+			continue
+		}
+		pg, claimed := zgcClaimPage(c.base, zgcPageSize, live, nObjects)
+		if !claimed {
+			continue
+		}
 		st := zgcPageState(pg)
 		st.spans = append(st.spans[:0], spans...)
 		used += live

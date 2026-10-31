@@ -41,11 +41,16 @@ import (
 // until any memory allocated from it is no longer needed.
 //
 // An Arena must never be used concurrently by multiple goroutines.
+//
+// Stability: experimental. The arena API is gated by goexperiment.arenas
+// and may change while the experiment is in flight.
 type Arena struct {
 	a unsafe.Pointer
 }
 
 // NewArena allocates a new arena.
+//
+// Stability: experimental. Gated by goexperiment.arenas.
 func NewArena() *Arena {
 	return &Arena{a: runtime_arena_newArena()}
 }
@@ -54,6 +59,8 @@ func NewArena() *Arena {
 // memory backing the arena can be reused fairly quickly without garbage
 // collection overhead. Applications must not call any method on this
 // arena after it has been freed.
+//
+// Stability: experimental. Gated by goexperiment.arenas.
 func (a *Arena) Free() {
 	runtime_arena_arena_Free(a.a)
 	a.a = nil
@@ -62,6 +69,8 @@ func (a *Arena) Free() {
 // New creates a new *T in the provided arena. The *T must not be used after
 // the arena is freed. Accessing the value after free may result in a fault,
 // but this fault is also not guaranteed.
+//
+// Stability: experimental. Gated by goexperiment.arenas.
 func New[T any](a *Arena) *T {
 	return runtime_arena_arena_New(a.a, reflectlite.TypeOf((*T)(nil))).(*T)
 }
@@ -69,6 +78,8 @@ func New[T any](a *Arena) *T {
 // MakeSlice creates a new []T with the provided capacity and length. The []T must
 // not be used after the arena is freed. Accessing the underlying storage of the
 // slice after free may result in a fault, but this fault is also not guaranteed.
+//
+// Stability: experimental. Gated by goexperiment.arenas.
 func MakeSlice[T any](a *Arena, len, cap int) []T {
 	var sl []T
 	runtime_arena_arena_Slice(a.a, &sl, cap)
@@ -80,6 +91,8 @@ func MakeSlice[T any](a *Arena, len, cap int) []T {
 // allocated from an arena, it is returned untouched. This function is useful
 // to more easily let an arena-allocated value out-live its arena.
 // T must be a pointer, a slice, or a string, otherwise this function will panic.
+//
+// Stability: experimental. Gated by goexperiment.arenas.
 func Clone[T any](s T) T {
 	return runtime_arena_heapify(s).(T)
 }

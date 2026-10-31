@@ -49,6 +49,16 @@ func zgcAtomicCasp1(ptr *unsafe.Pointer, old, new unsafe.Pointer) bool {
 	return atomic.Casp1(ptr, old, new)
 }
 
+// logosZgcFindObjectPtr is the off-experiment stub of the upstream
+// findObject hook: canonical addresses are identities, so the pointer
+// passes through unchanged.
+//
+//go:nosplit
+//go:nowritebarrierrec
+func logosZgcFindObjectPtr(p uintptr) uintptr {
+	return p
+}
+
 // logosZgcForeignArg is the off-experiment stub; arguments pass through unchanged.
 //
 //go:nosplit

@@ -7,6 +7,7 @@
 package runtime_test
 
 import (
+	"runtime/debug"
 	"testing"
 	"unsafe"
 
@@ -26,13 +27,78 @@ func logosZgcForeignGranAddr(addr uintptr) uintptr {
 	return addr &^ (LogosZgcPageSize - 1)
 }
 
+// logosZgcForeignOwnedPage registers the zgc page holding addr, unless pages
+// already holds it, and returns it. It mirrors logosZgcPageOf, but the
+// foreign suite owns its registrations: every page it creates is recorded
+// in owned and dropped by the test's cleanup while automatic collections
+// stay off (logosZgcForeignPagesQuiesce), so no registered page outlives
+// the test into a later GC start.
+//
+// A leaked registration is a fatal, not a leak: the gcStart hook releases
+// every registered unreleased page, and zgcReleasePage throws on a page
+// whose source spans were never prepared over a heap arena
+// (logos_zgc_page.go). Production selection never builds one: it fills the
+// region's real overlapping spans with an honest live count and vets them
+// eligible, so the suite must not leave a synthetic page behind for a real
+// cycle to find. Dropping is not a bypass: the fatal stays for any real
+// unprepared release, and the fixture simply never offers one.
+func logosZgcForeignOwnedPage(t *testing.T, pages map[uintptr]*LogosZgcPage, owned *[]*LogosZgcPage, addr uintptr) *LogosZgcPage {
+	t.Helper()
+	// A page over a heap granule needs the zgc low heap window; check
+	// the mode before touching the directory so a wrong-mode run skips
+	// instead of tripping the registration throw.
+	logosZgcRequireHeapWindow(t)
+	start := addr &^ (LogosZgcPageSize - 1)
+	if pg, ok := pages[start]; ok {
+		return pg
+	}
+	if pg := LogosZgcPageFor(addr); pg != nil {
+		// An earlier test or a live cycle still owns this granule, so
+		// reuse its page rather than registering a second one. Resolve
+		// by the source address, not by the granule start: a page's
+		// registered ranges can hold the start while the forwarded
+		// source sits in a gap, and a start-resolved page would then be
+		// handed a source outside its ranges.
+		pages[start] = pg
+		return pg
+	}
+	// Verify, don't infer: the address must name a heap span the release
+	// gate would have to account for. An address outside any span is a
+	// broken fixture, not a heap granule.
+	if _, ok := LogosZgcSpanStart(addr); !ok {
+		t.Fatalf("foreign fixture address %#x names no heap span", addr)
+	}
+	pg := LogosZgcNewPage(start, 0, 16)
+	pages[start] = pg
+	*owned = append(*owned, pg)
+	return pg
+}
+
+// logosZgcForeignPagesQuiesce stops automatic collections while fixture
+// pages are registered and arranges their drop before collections resume:
+// under GC the gcStart hook's release loop would otherwise reach a page
+// whose sources no selection prepared. The cleanup drops every page this
+// test created, in registration order, and restores the collector last.
+func logosZgcForeignPagesQuiesce(t *testing.T, owned *[]*LogosZgcPage) {
+	t.Helper()
+	prev := debug.SetGCPercent(-1)
+	t.Cleanup(func() {
+		for _, pg := range *owned {
+			LogosZgcDropPage(pg)
+		}
+		*owned = nil
+		debug.SetGCPercent(prev)
+	})
+}
+
 // TestLogosZgcForeignRetainLive proves that the foreign-root closure follows
 // a heap edge from a stack-seeded object, while an unmarked dead stack word
 // retains nothing. The !foreign status branch is uncovered by construction:
 // this fixture deliberately supplies only _Gsyscall.
 func TestLogosZgcForeignRetainLive(t *testing.T) {
 	LogosZgcForeignInit()
-
+	var owned []*LogosZgcPage
+	logosZgcForeignPagesQuiesce(t, &owned)
 	a := new(logosZgcForeignHolder)
 	fillers := make([][]byte, 0, 64)
 	var b *logosZgcForeignHolder
@@ -77,9 +143,9 @@ func TestLogosZgcForeignRetainLive(t *testing.T) {
 	a.next = b
 	b.next = nil
 	pages := make(map[uintptr]*LogosZgcPage)
-	pgA := logosZgcPageOf(t, pages, uintptr(unsafe.Pointer(a)))
-	pgB := logosZgcPageOf(t, pages, uintptr(unsafe.Pointer(b)))
-	pgD := logosZgcPageOf(t, pages, dAddr)
+	pgA := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(a)))
+	pgB := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(b)))
+	pgD := logosZgcForeignOwnedPage(t, pages, &owned, dAddr)
 
 	h := LogosZgcForeignNewG(8)
 	mark := []uintptr{uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(b))}
@@ -148,6 +214,155 @@ func TestLogosZgcForeignRetainLive(t *testing.T) {
 	KeepAlive(dFillers)
 }
 
+// TestLogosZgcForeignRetainColoredG proves the foreign closure consumes a
+// colored allgs entry. The -lb self-heal CAS is the one writer that leaves
+// a colored word in a backing-array slot of the goroutine list, and these
+// loops plain-load the entries (NoLB file) before the gcStart rewrite
+// heals the heap, so the closure must resolve each entry word to its
+// canonical g before the status dereference — the observed bg326 fault
+// dereferenced a heap address with the remapped bit set (0x20c003324600).
+// The fixture parks a real synthetic g in _Gsyscall, colors the swapped-in
+// cell with the remapped color, and runs the P-transitive shape through
+// the export's immediate save/restore STW swap with collections quiesced:
+// no actual cycle ever sees the colored list, and the uncolored rerun
+// asserts parity, so the colored call neither skipped the g nor disturbed
+// page state.
+func TestLogosZgcForeignRetainColoredG(t *testing.T) {
+	logosZgcRequireHeapWindow(t)
+	if LogosZgcColorMaskBits() == 0 {
+		t.Skip("colors are inert: cannot construct a colored entry word")
+	}
+	LogosZgcForeignInit()
+	var owned []*LogosZgcPage
+	logosZgcForeignPagesQuiesce(t, &owned)
+
+	a := new(logosZgcForeignHolder)
+	fillers := make([][]byte, 0, 64)
+	var b *logosZgcForeignHolder
+	for range cap(fillers) {
+		b = new(logosZgcForeignHolder)
+		if logosZgcForeignGran(a) != logosZgcForeignGran(b) {
+			break
+		}
+		fillers = append(fillers, make([]byte, 1<<20))
+	}
+	if b == nil || logosZgcForeignGran(a) == logosZgcForeignGran(b) {
+		t.Fatal("could not place A and B in distinct granules")
+	}
+	a.next = b
+	b.next = nil
+	if uint64(uintptr(unsafe.Pointer(a))) > LogosZgcAddrMask || uint64(uintptr(unsafe.Pointer(b))) > LogosZgcAddrMask {
+		t.Skip("heap object lies outside the ZGC address field")
+	}
+	pages := make(map[uintptr]*LogosZgcPage)
+	pgA := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(a)))
+	pgB := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(b)))
+
+	h := LogosZgcForeignNewG(8)
+	if uint64(LogosZgcForeignGAddr(h)) > LogosZgcAddrMask {
+		// The colored cell would not resolve to heap, so zgcCanonical
+		// would pass the colored word through and the fixture would be
+		// invalid, not red.
+		t.Skip("synthetic g lies outside the ZGC address field")
+	}
+	LogosZgcForeignGSet(h, 0, uintptr(unsafe.Pointer(a)))
+	mark := []uintptr{uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(b))}
+
+	// Colored cell: the closure must strip the entry word to the g and
+	// retain the transitive closure {A, B}.
+	live := []*LogosZgcPage{pgA, pgB}
+	if got := LogosZgcForeignRetainColored(live, h, mark, nil); got != 2 {
+		t.Fatalf("colored entry retained prefix = %d, want 2 (A and B)", got)
+	}
+	if live[0] != pgA || live[1] != pgB {
+		t.Fatalf("colored entry: live pages were not [A B] after prefix closure")
+	}
+
+	// Parity: the same fixture through an uncolored entry.
+	LogosZgcForeignGSet(h, 0, uintptr(unsafe.Pointer(a)))
+	live = []*LogosZgcPage{pgA, pgB}
+	if got := LogosZgcForeignRetain(live, h, mark, nil); got != 2 {
+		t.Fatalf("uncolored entry retained prefix = %d, want 2 (parity)", got)
+	}
+	if live[0] != pgA || live[1] != pgB {
+		t.Fatalf("uncolored entry: live pages were not [A B] after prefix closure")
+	}
+
+	KeepAlive(a)
+	KeepAlive(b)
+	KeepAlive(h)
+	KeepAlive(fillers)
+}
+
+// TestLogosZgcForeignRetainColoredHeader proves the foreign closure consumes a
+// goroutine list whose slice header array pointer is colored with the remapped
+// color (Level 1). This verifies that the NoLB foreign-root loop canonicalizes
+// the slice backing array base before range indexing (PC 0x48652a fault
+// reproduction).
+func TestLogosZgcForeignRetainColoredHeader(t *testing.T) {
+	logosZgcRequireHeapWindow(t)
+	if LogosZgcColorMaskBits() == 0 {
+		t.Skip("colors are inert: cannot construct a colored entry word")
+	}
+	LogosZgcForeignInit()
+	var owned []*LogosZgcPage
+	logosZgcForeignPagesQuiesce(t, &owned)
+
+	a := new(logosZgcForeignHolder)
+	fillers := make([][]byte, 0, 64)
+	var b *logosZgcForeignHolder
+	for range cap(fillers) {
+		b = new(logosZgcForeignHolder)
+		if logosZgcForeignGran(a) != logosZgcForeignGran(b) {
+			break
+		}
+		fillers = append(fillers, make([]byte, 1<<20))
+	}
+	if b == nil || logosZgcForeignGran(a) == logosZgcForeignGran(b) {
+		t.Fatal("could not place A and B in distinct granules")
+	}
+	a.next = b
+	b.next = nil
+	if uint64(uintptr(unsafe.Pointer(a))) > LogosZgcAddrMask || uint64(uintptr(unsafe.Pointer(b))) > LogosZgcAddrMask {
+		t.Skip("heap object lies outside the ZGC address field")
+	}
+	pages := make(map[uintptr]*LogosZgcPage)
+	pgA := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(a)))
+	pgB := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(b)))
+
+	h := LogosZgcForeignNewG(8)
+	if uint64(LogosZgcForeignGAddr(h)) > LogosZgcAddrMask {
+		t.Skip("synthetic g lies outside the ZGC address field")
+	}
+	LogosZgcForeignGSet(h, 0, uintptr(unsafe.Pointer(a)))
+	mark := []uintptr{uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(b))}
+
+	// 1. Level 1 colored slice header (canonical *g entry):
+	// The closure must canonicalize allgs.array before indexing and retain {A, B}.
+	live := []*LogosZgcPage{pgA, pgB}
+	if got := LogosZgcForeignRetainColoredHeader(live, h, mark, nil); got != 2 {
+		t.Fatalf("colored header retained prefix = %d, want 2 (A and B)", got)
+	}
+	if live[0] != pgA || live[1] != pgB {
+		t.Fatalf("colored header: live pages were not [A B] after prefix closure")
+	}
+
+	// 2. Parity control: uncolored header and entry through the same fixture.
+	LogosZgcForeignGSet(h, 0, uintptr(unsafe.Pointer(a)))
+	live = []*LogosZgcPage{pgA, pgB}
+	if got := LogosZgcForeignRetain(live, h, mark, nil); got != 2 {
+		t.Fatalf("uncolored entry retained prefix = %d, want 2 (parity)", got)
+	}
+	if live[0] != pgA || live[1] != pgB {
+		t.Fatalf("uncolored entry: live pages were not [A B] after prefix closure")
+	}
+
+	KeepAlive(a)
+	KeepAlive(b)
+	KeepAlive(h)
+	KeepAlive(fillers)
+}
+
 // TestLogosZgcForeignHoldTransition verifies the bounded hold protocol:
 // 1. A goroutine in _Grunning without a hold is not retained (proves the gap in pause-only scan).
 // 2. Publishing an entry hold via LogosZgcForeignHoldEnter protects its roots and transitive closure.
@@ -156,6 +371,8 @@ func TestLogosZgcForeignHoldTransition(t *testing.T) {
 	LogosZgcForeignInit()
 	LogosZgcForeignResetHolds()
 	defer LogosZgcForeignResetHolds()
+	var owned []*LogosZgcPage
+	logosZgcForeignPagesQuiesce(t, &owned)
 
 	a := new(logosZgcForeignHolder)
 	fillers := make([][]byte, 0, 64)
@@ -199,9 +416,9 @@ func TestLogosZgcForeignHoldTransition(t *testing.T) {
 	a.next = b
 	b.next = nil
 	pages := make(map[uintptr]*LogosZgcPage)
-	pgA := logosZgcPageOf(t, pages, uintptr(unsafe.Pointer(a)))
-	pgB := logosZgcPageOf(t, pages, uintptr(unsafe.Pointer(b)))
-	pgD := logosZgcPageOf(t, pages, dAddr)
+	pgA := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(a)))
+	pgB := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(b)))
+	pgD := logosZgcForeignOwnedPage(t, pages, &owned, dAddr)
 
 	h := LogosZgcForeignNewG(8)
 	gpPtr := *(*unsafe.Pointer)(unsafe.Pointer(h))
@@ -280,6 +497,8 @@ func TestLogosZgcForeignNestedReachability(t *testing.T) {
 	LogosZgcForeignInit()
 	LogosZgcForeignResetHolds()
 	defer LogosZgcForeignResetHolds()
+	var owned []*LogosZgcPage
+	logosZgcForeignPagesQuiesce(t, &owned)
 
 	a := new(logosZgcForeignHolder)
 	fillers := make([][]byte, 0, 64)
@@ -342,10 +561,10 @@ func TestLogosZgcForeignNestedReachability(t *testing.T) {
 	c.next = nil
 
 	pages := make(map[uintptr]*LogosZgcPage)
-	pgA := logosZgcPageOf(t, pages, uintptr(unsafe.Pointer(a)))
-	pgB := logosZgcPageOf(t, pages, uintptr(unsafe.Pointer(b)))
-	pgC := logosZgcPageOf(t, pages, uintptr(unsafe.Pointer(c)))
-	pgD := logosZgcPageOf(t, pages, dAddr)
+	pgA := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(a)))
+	pgB := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(b)))
+	pgC := logosZgcForeignOwnedPage(t, pages, &owned, uintptr(unsafe.Pointer(c)))
+	pgD := logosZgcForeignOwnedPage(t, pages, &owned, dAddr)
 
 	h := LogosZgcForeignNewG(8)
 	gpPtr := *(*unsafe.Pointer)(unsafe.Pointer(h))

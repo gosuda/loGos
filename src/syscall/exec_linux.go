@@ -138,7 +138,26 @@ func runtime_AfterForkInChild()
 func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr *ProcAttr, sys *SysProcAttr, pipe int) (pid int, err Errno) {
 	// Set up and fork. This returns immediately in the parent or
 	// if there's an error.
-	upid, pidfd, err, mapPipe, locked, forkTok := forkAndExecInChild1(argv0, argv, envv, chroot, dir, attr, sys, pipe)
+	//
+	// The admission token lives here, in this outer frame, and is
+	// handed to forkAndExecInChild1 by pointer instead of coming back
+	// in its results. Under CLONE_VM|CLONE_VFORK the child executes
+	// the callee's frame: every word the parent still needs after the
+	// clone must live outside it. forkTok is such a word and it is the
+	// only one the parent does not itself rewrite, so it must not be a
+	// callee result. forkAndExecInChild1 never reads it; the child
+	// never dereferences it.
+	var forkTok logosForeignToken
+	upid, pidfd, err, mapPipe, locked := forkAndExecInChild1(logosForkSetup{
+		Argv0:  argv0,
+		Argv:   argv,
+		Envv:   envv,
+		Chroot: chroot,
+		Dir:    dir,
+		Attr:   attr,
+		Sys:    sys,
+		Pipe:   pipe,
+	}, &forkTok)
 	if locked {
 		runtime_AfterFork()
 	}
@@ -209,6 +228,25 @@ type cloneArgs struct {
 	cgroup     uint64 // File descriptor for target cgroup of child (since Linux 5.7)
 }
 
+// logosForkSetup carries the fork inputs into forkAndExecInChild1. It
+// groups the words the positional parameter list carried, in the same
+// order, so the call's argument footprint is unchanged. The callee
+// binds them to its own locals at entry, before runtime_BeforeFork,
+// and every later read names those locals; the admission descriptors
+// are taken from those same locals, so they always name the address
+// the child actually reads. Nothing here is required to survive the
+// clone: the fork token does not travel this way.
+type logosForkSetup struct {
+	Argv0  *byte
+	Argv   []*byte
+	Envv   []*byte
+	Chroot *byte
+	Dir    *byte
+	Attr   *ProcAttr
+	Sys    *SysProcAttr
+	Pipe   int
+}
+
 // forkAndExecInChild1 implements the body of forkAndExecInChild up to
 // the parent's post-fork path. This is a separate function so we can
 // separate the child's and parent's stack frames if we're using
@@ -217,10 +255,39 @@ type cloneArgs struct {
 // This is go:noinline because the point is to keep the stack frames
 // of this and forkAndExecInChild separate.
 //
+// Because this frame is the child's frame, a word the parent reads
+// after the clone is safe only if the kernel writes it into the parent
+// after the child was replaced (pid, err1, pidfd), or if the parent
+// reads it before the child can reuse its slot. A word stored before
+// the clone that the parent reads only after the clone has no such
+// guarantee: the child may reuse the slot for a local of its own, and
+// the parent then reloads whatever the child left there. "Dead on the
+// child's path" is not immunity, it is the precondition for reuse.
+//
+// The admission token is exactly such a word, so it is stored through
+// forkTok into the caller's frame, which the child never writes.
+//
+// Two other words here, locked and mapPipe, are also written before
+// the clone and read by the parent after it. They are the same class
+// and this bracket does NOT prove them safe. Both stay on upstream's
+// transport because neither is validated by exact match, so a clobber
+// would not be caught here: locked is set just before the clone and
+// read by the caller after this function returns (a clobber would
+// silently skip runtime_AfterFork), and mapPipe is read only on the
+// UidMappings/GidMappings path. Being read on both sides does not pin
+// either slot: a word the child also reads says nothing about whether
+// its later spills may reuse that slot.
+//
 //go:noinline
 //go:norace
 //go:nocheckptr
-func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr *ProcAttr, sys *SysProcAttr, pipe int) (pid uintptr, pidfd int32, err1 Errno, mapPipe [2]int, locked bool, forkTok logosForeignToken) {
+func forkAndExecInChild1(setup logosForkSetup, forkTok *logosForeignToken) (pid uintptr, pidfd int32, err1 Errno, mapPipe [2]int, locked bool) {
+	// The admission descriptors below name the addresses of these
+	// locals, which live in this frame; the child reads them here.
+	argv0, argv, envv := setup.Argv0, setup.Argv, setup.Envv
+	chroot, dir, attr := setup.Chroot, setup.Dir, setup.Attr
+	sys, pipe := setup.Sys, setup.Pipe
+
 	// Defined in linux/prctl.h starting with Linux 4.3.
 	const (
 		PR_CAP_AMBIENT       = 0x2f
@@ -350,7 +417,7 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 			Elem: logosTypeOf(*clone3),
 		}
 	}
-	forkTok = logosForkBegin(&logosForkCells{
+	*forkTok = logosForkBegin(&logosForkCells{
 		Argv0:      &argv0,
 		Chroot:     &chroot,
 		Dir:        &dir,
@@ -399,6 +466,12 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 		// will not modify, and the results of
 		// rawVforkSyscall, which must have been written after
 		// the child was replaced.
+		//
+		// The admission token is deliberately not a result of this
+		// frame: it was written through *forkTok, in the caller's
+		// frame, before runtime_BeforeFork. A token stored in this
+		// frame would be covered by no such rule — the child's own
+		// spills are free to reuse these slots.
 		return
 	}
 

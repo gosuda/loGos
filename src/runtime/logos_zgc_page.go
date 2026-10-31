@@ -16,10 +16,15 @@ const (
 	zgcPageShift = 21
 	zgcPageSize  = 1 << zgcPageShift
 
-	// zgcMaxPages bounds every page list: one entry per 2 MB directory
-	// granule, the most registrations the directory CAS can admit.
-	// Lists capped here never grow, so their appends under pause locks
-	// never allocate.
+	// zgcMaxPages bounds every page list, and it is the total header
+	// budget: one entry per 2 MB directory granule, the most
+	// registrations the directory CAS can admit. Every distinct live
+	// header holds exactly one granule slot in exactly one of two forms —
+	// its own pointer while registered, the retiring tombstone while it
+	// waits in the retire queue unpublished — and the CAS refuses any
+	// claim while either stands, so distinct registered and retiring
+	// headers together can never exceed this bound. Lists capped here
+	// never grow, so their appends under pause locks never allocate.
 	zgcMaxPages = 1 << (zgcAddrBits - zgcPageShift)
 
 	// zgcMaxPageBytes bounds the page a forwarding entry can index: the
@@ -73,6 +78,27 @@ type zgcPage struct {
 	mapBytes          uintptr
 	released          atomic.Uint32
 
+	// abandoned marks a page intentionally discarded before release:
+	// its to-space reservation failed or the selection vet refused it.
+	// zgcAbandonPage sets it once, before the page is unpublished or
+	// queued; reclamation reads it at a stop-the-world gate and never
+	// frees an unreleased page that lacks it.
+	abandoned bool
+	// retiring records that this header installed the directory tombstone.
+	// It is written and read under zgcPagesMu. Reclaim clears only that
+	// marker, so freeing an unregistered detached test header cannot clear
+	// another descriptor's marker at the same address.
+	retiring bool
+
+	// refs counts live leases on this page header. A relocation worker
+	// gains one under zgcPagesMu before the header escapes
+	// zgcNextUnfinishedPage; a preemptible pinner, attach or self-heal
+	// caller gains one through zgcPageAcquire before any suspension and
+	// drops it on every exit. Reclamation samples refs==0 (after the
+	// acquisition domain drained) before any destructive step: span
+	// metadata free, state pool return, header sysFree.
+	refs atomic.Uintptr
+
 	// published counts the live bytes whose forwarding entries this
 	// page's relocators won. The source page may return to the OS only
 	// once it equals live: every live object then has a copy reachable
@@ -109,6 +135,16 @@ type zgcPage struct {
 // still holds an address on a page released before the pass began.
 var zgcRemapEpoch atomic.Uint32
 
+// zgcPageAcqDomain counts open transient read domains. A reader enters
+// before its first raw pointer-deriving load (directory slot, header or
+// forwarding probe) and leaves after the last; reclamation samples the
+// counter zero after unpublishing and frees nothing while a domain is
+// open, so every pointer derived inside a domain stays valid until the
+// matching leave. Default sequentially consistent Add/Load only
+// (internal/runtime/atomic doc 13). Signal-stack and no-P readers hold
+// domains only: no locks, no allocation, no per-page refs there.
+var zgcPageAcqDomain atomic.Uintptr
+
 // zgcRemapDone records that a remap pass started after every page
 // released so far has finished.
 func zgcRemapDone() {
@@ -116,6 +152,14 @@ func zgcRemapDone() {
 }
 
 type zgcDirectory [1 << (zgcAddrBits - zgcPageShift)]atomic.Uintptr
+
+// zgcSlotRetiring marks a directory granule whose descriptor left the
+// registered list but is not reclaimed yet: fresh lookups miss it, and
+// no claim may take the granule until reclamation frees the descriptor's
+// header and clears the marker. The value must never collide with a
+// header pointer: headers come from sysAlloc, so every one is
+// page-aligned.
+const zgcSlotRetiring = 1
 
 var (
 	zgcDirLock mutex
@@ -178,45 +222,101 @@ func zgcAllocPage(start, size, live, nObjects uintptr) *zgcPage {
 	return pg
 }
 
-// zgcPagesAppend registers pg in the page directory list. The append
-// never allocates: the list is capped at zgcMaxPages, which registration
-// cannot exceed, so an allocation-triggered collection cannot start while
-// this goroutine holds zgcPagesMu and wait on the pause hook that needs
-// it. Discipline: the holder cannot be async-preempted mid-section
-// (holding a runtime mutex sets m.locks, which the preemption predicate
-// requires to be zero), and the section parks nothing: no channel ops, no
-// nested locks, no syscalls, no allocation.
-func zgcPagesAppend(pg *zgcPage) {
+// zgcClaimPage checks the directory slot for start and, if it is free,
+// registers a fresh header for the one-granule page at start, with a
+// forwarding table sized for nObjects relocated objects. It reports
+// whether it claimed the slot.
+//
+// The occupancy check, the CAS and the registry append are one step under
+// zgcPagesMu, so a free slot cannot change hands before the claim lands;
+// every transition of the slot (the claim, the retiring tombstone and
+// the clear in zgcFreePage) holds the same lock. Selection's slot probes
+// remain lock-free fast paths, but the claim is authoritative: a false
+// return defers the region to a later cycle, exactly like those skips.
+// The caller must skip on false, never retry: a registered page or a
+// retiring descriptor owns its granule until reclamation frees it. The
+// metadata allocated for a lost claim is returned before reporting false,
+// so a skip leaks nothing.
+//
+// Discipline: the locked section never allocates (the list is capped at
+// zgcMaxPages, which registration cannot exceed), parks nothing and takes
+// no nested lock: no channel ops, no syscalls. The holder cannot be
+// async-preempted mid-section (holding a runtime mutex sets m.locks,
+// which the preemption predicate requires to be zero). The directory is
+// ensured before the section, so zgcDirLock never nests inside
+// zgcPagesMu; sysAlloc and sysFree run outside the section, as before.
+func zgcClaimPage(start, size, live, nObjects uintptr) (*zgcPage, bool) {
+	if start&(zgcPageSize-1) != 0 || size != zgcPageSize || start > zgcAddrMask-(size-1) {
+		throw("zgc: page must be one aligned granule inside the 4 TB range")
+	}
+	pg := zgcAllocPage(start, size, live, nObjects)
+	dir := zgcDirectoryEnsure()
 	lock(&zgcPagesMu)
+	if !dir[start>>zgcPageShift].CompareAndSwap(0, uintptr(unsafe.Pointer(pg))) {
+		unlock(&zgcPagesMu)
+		sysFree(unsafe.Pointer(pg), pg.mapBytes, &memstats.other_sys)
+		return nil, false
+	}
 	if len(zgcAllPages) == cap(zgcAllPages) {
 		throw("zgc: page registry overflow")
 	}
 	zgcAllPages = append(zgcAllPages, pg)
 	unlock(&zgcPagesMu)
+	return pg, true
 }
 
 // zgcNewPage returns a registered header for the one-granule page at start,
-// with a forwarding table sized for nObjects relocated objects.
+// with a forwarding table sized for nObjects relocated objects. It is
+// zgcClaimPage that must succeed: a stale word into the old page must
+// keep resolving through its table until zgcRetirePage, so a new page
+// registered over one that is not retired would answer for it instead.
 func zgcNewPage(start, size, live, nObjects uintptr) *zgcPage {
-	if start&(zgcPageSize-1) != 0 || size != zgcPageSize || start > zgcAddrMask-(size-1) {
-		throw("zgc: page must be one aligned granule inside the 4 TB range")
-	}
-	pg := zgcAllocPage(start, size, live, nObjects)
-	if !zgcDirectoryEnsure()[start>>zgcPageShift].CompareAndSwap(0, uintptr(unsafe.Pointer(pg))) {
-		// A stale word into the old page must keep resolving through
-		// its table until zgcRetirePage; a new page here would answer
-		// for it instead.
+	pg, ok := zgcClaimPage(start, size, live, nObjects)
+	if !ok {
 		throw("zgc: page registered over a page that is not retired")
 	}
-	zgcPagesAppend(pg)
 	return pg
 }
 
-// zgcFreePage unregisters pg and returns its metadata mapping.
-// A page with a published relocation may go only through zgcRetirePage:
-// until a remap pass after its release, stale words still resolve
-// through its table, and before release the source and the copy would
-// both be live.
+// zgcPageUnpublish replaces pg's directory entry with the retiring
+// tombstone and removes pg from the registered list. Idempotent: a retire
+// attempt whose drain sample failed leaves the tombstoned descriptor
+// queued, and its re-entry finds the tombstone and no list entry. The
+// tombstone stops new transient readers from resolving pg while retaining
+// ownership of the granule until reclamation clears it; readers already
+// inside a domain and lease holders are drained by the caller's samples
+// afterwards, and nothing else is reclaimed here.
+func zgcPageUnpublish(pg *zgcPage) {
+	// Discipline: one non-preemptible, allocation-free section for the
+	// tombstone and the removal (slot CAS plus swap-remove only). The
+	// tombstone holds the same lock as the claim in zgcClaimPage, so a
+	// slot observed retiring cannot be claimed from under it, and a slot
+	// cleared by reclamation cannot be claimed before its list entry leaves
+	// with it.
+	lock(&zgcPagesMu)
+	if p := atomic.Loaduintptr(&zgcDirAddr); p != 0 {
+		if (*zgcDirectory)(add(nil, p))[pg.start>>zgcPageShift].CompareAndSwap(uintptr(unsafe.Pointer(pg)), zgcSlotRetiring) {
+			pg.retiring = true
+		}
+	}
+	for i, q := range zgcAllPages {
+		if q == pg {
+			zgcAllPages[i] = zgcAllPages[len(zgcAllPages)-1]
+			zgcAllPages = zgcAllPages[:len(zgcAllPages)-1]
+			break
+		}
+	}
+	unlock(&zgcPagesMu)
+}
+
+// zgcFreePage unregisters pg and returns its metadata mapping. It runs
+// only after reclamation fully drained: the page is unpublished and a
+// zgcPageAcqDomain and refs sample both returned zero, so no transient
+// reader can still hold a derived pointer and no lease can still name
+// the header. A page with a published relocation may go only through
+// zgcRetirePage: until a remap pass after its release, stale words
+// still resolve through the table, and before release the source and
+// the copy would both be live.
 func zgcFreePage(pg *zgcPage) {
 	if pg.published.Load() != 0 && (pg.released.Load() == 0 || zgcRemapEpoch.Load() == pg.releaseEpoch) {
 		throw("zgc: freeing a relocated page before a remap pass retired it")
@@ -224,18 +324,20 @@ func zgcFreePage(pg *zgcPage) {
 	if pg.published.Load() != 0 && zgcForeignPagePinnedLocked(pg.start) {
 		throw("zgc: freeing a pinned page with published relocation")
 	}
-	if p := atomic.Loaduintptr(&zgcDirAddr); p != 0 {
-		(*zgcDirectory)(add(nil, p))[pg.start>>zgcPageShift].CompareAndSwap(uintptr(unsafe.Pointer(pg)), 0)
+	if pg.stateIdx != 0 {
+		throw("zgc: freeing a page that still owns a span state")
 	}
-	// Discipline: same non-preemptible, allocation-free section as the
-	// append path above (swap-remove only); sysFree runs unlocked below.
+	zgcPageUnpublish(pg)
 	lock(&zgcPagesMu)
-	for i, q := range zgcAllPages {
-		if q == pg {
-			zgcAllPages[i] = zgcAllPages[len(zgcAllPages)-1]
-			zgcAllPages = zgcAllPages[:len(zgcAllPages)-1]
-			break
+	if pg.retiring {
+		p := atomic.Loaduintptr(&zgcDirAddr)
+		if p == 0 {
+			throw("zgc: retiring page directory disappeared")
 		}
+		if !(*zgcDirectory)(add(nil, p))[pg.start>>zgcPageShift].CompareAndSwap(zgcSlotRetiring, 0) {
+			throw("zgc: retiring page tombstone was not owned")
+		}
+		pg.retiring = false
 	}
 	unlock(&zgcPagesMu)
 	sysFree(unsafe.Pointer(pg), pg.mapBytes, &memstats.other_sys)
@@ -259,6 +361,21 @@ func zgcDirectoryEnsure() *zgcDirectory {
 	return (*zgcDirectory)(add(nil, p))
 }
 
+// zgcPageSlotOccupied reports whether the directory already holds a
+// registered page or a retiring descriptor for the 2 MB region at base.
+// Selection consults the raw slot, not zgcPageFor: a base in a gap between
+// the registered page's exact source ranges resolves to nil yet still
+// collides on registration, since the directory admits one page or
+// retiring descriptor per granule. Lock-free atomic load only, safe in
+// the selection pause.
+func zgcPageSlotOccupied(base uintptr) bool {
+	p := atomic.Loaduintptr(&zgcDirAddr)
+	if p == 0 {
+		return false
+	}
+	return (*zgcDirectory)(add(nil, p))[base>>zgcPageShift].Load() != 0
+}
+
 // zgcPageFor returns the registered page whose relocation sources contain
 // addr, or nil. The directory is keyed by 2 MB region, but a region may
 // hold more than the page's quarantined source spans (free pages, stacks
@@ -267,16 +384,19 @@ func zgcDirectoryEnsure() *zgcDirectory {
 // forwarding entry will ever name them, nothing there may be copied,
 // healed through the table, or released, and every caller that asks "is
 // this word on a page that is relocating" must see nil for them. Every
-// resolution path (barrier, remap, pin, attach, identity, foreign
-// admission) goes through this filter, so none needs a membership test of
-// its own.
+// Protected-internal lookup for callers that already exclude
+// reclamation: stop-the-world pauses, the foreign-gate commit section
+// (no STW under the gate), and lock-held registry sections. A
+// world-running reader without such exclusion must go through
+// zgcPageAcquire (retained handle) or zgcPageTransientEnter plus
+// zgcPageLookupTransient (bounded read), never this.
 func zgcPageFor(addr uintptr) *zgcPage {
 	p := atomic.Loaduintptr(&zgcDirAddr)
 	if p == 0 || addr > zgcAddrMask {
 		return nil
 	}
 	v := (*zgcDirectory)(add(nil, p))[addr>>zgcPageShift].Load()
-	if v == 0 {
+	if v == 0 || v == zgcSlotRetiring {
 		return nil
 	}
 	pg := (*zgcPage)(add(nil, v))
@@ -286,11 +406,92 @@ func zgcPageFor(addr uintptr) *zgcPage {
 	return pg
 }
 
+// zgcPageTransientEnter opens a transient read domain. Every raw
+// pointer a reader derives inside the domain (directory slot, header,
+// source ranges, forwarding entries) stays valid until the matching
+// zgcPageTransientLeave: reclamation samples the counter zero after
+// unpublishing and frees nothing while a domain is open. Balanced and
+// nestable; nosplit-safe so signal-stack and no-P readers can hold a
+// domain across their whole bounded read. Nothing derived inside the
+// domain may escape it; a reader that must keep the page beyond the
+// bounded read takes a lease with zgcPageAcquire instead.
+//
+//go:nosplit
+func zgcPageTransientEnter() {
+	zgcPageAcqDomain.Add(1)
+}
+
+// zgcPageTransientLeave closes one open transient read domain.
+//
+//go:nosplit
+func zgcPageTransientLeave() {
+	zgcPageAcqDomain.Add(^uintptr(0))
+}
+
+// zgcPageLookupTransient resolves addr to the registered page whose
+// relocation sources contain it, or nil: the exact membership filter of
+// zgcPageFor, inside a transient read domain. Legal only between
+// zgcPageTransientEnter and zgcPageTransientLeave, and its result must
+// not escape the domain: it carries no lease.
+//
+//go:nosplit
+func zgcPageLookupTransient(addr uintptr) *zgcPage {
+	p := atomic.Loaduintptr(&zgcDirAddr)
+	if p == 0 || addr > zgcAddrMask {
+		return nil
+	}
+	v := (*zgcDirectory)(add(nil, p))[addr>>zgcPageShift].Load()
+	if v == 0 || v == zgcSlotRetiring {
+		return nil
+	}
+	pg := (*zgcPage)(add(nil, v))
+	if !pg.holdsSource(addr) {
+		return nil
+	}
+	return pg
+}
+
+// zgcPageAcquire resolves addr like zgcPageLookupTransient and returns
+// a leased handle: the per-page ref is gained while the acquisition is
+// still announced, before the domain closes, so reclamation — which
+// samples the domain first and the refs afterwards — cannot free the
+// header between the load and the ref. nil means addr is not a
+// relocation source of any registered page. On every non-nil result the
+// caller owes exactly one zgcPageRelease, on every path including
+// refusals, retries and lost races.
+//
+// Nosplit: the whole body is atomic counter and directory loads plus
+// the nosplit membership filter, so a caller may gain a lease while
+// holding the M or the foreign gate — the changed-slot revalidation
+// that must reacquire before its protected window ends. It allocates
+// nothing, takes no lock, and grows no stack.
+//
+//go:nosplit
+func zgcPageAcquire(addr uintptr) *zgcPage {
+	zgcPageTransientEnter()
+	pg := zgcPageLookupTransient(addr)
+	if pg != nil {
+		pg.refs.Add(1)
+	}
+	zgcPageTransientLeave()
+	return pg
+}
+
+// zgcPageRelease drops one lease gained by zgcPageAcquire, or by
+// zgcNextUnfinishedPage under the registry lock. Strict by contract, so
+// a released nil is a caller defect, not a tolerated no-op: release
+// exactly the handle acquire returned.
+//
+//go:nosplit
+func zgcPageRelease(pg *zgcPage) {
+	pg.refs.Add(^uintptr(0))
+}
+
 // sourceRangeAt returns the i-th source range. i < srcN.
 //
 //go:nosplit
 func (pg *zgcPage) sourceRangeAt(i uintptr) *zgcSourceRange {
-	return (*zgcSourceRange)(add(pg.src, i*unsafe.Sizeof(zgcSourceRange{})))
+	return (*zgcSourceRange)(unsafe.Pointer(uintptr(pg.src) + i*unsafe.Sizeof(zgcSourceRange{})))
 }
 
 // sourceEnd returns the end of the source range containing addr and
@@ -300,9 +501,12 @@ func (pg *zgcPage) sourceRangeAt(i uintptr) *zgcSourceRange {
 //go:nosplit
 func (pg *zgcPage) sourceEnd(addr uintptr) (uintptr, bool) {
 	lo, hi := uintptr(0), pg.srcN
+	stride := unsafe.Sizeof(zgcSourceRange{})
+	base := uintptr(pg.src)
 	for lo < hi {
 		m := (lo + hi) >> 1
-		if pg.sourceRangeAt(m).hi <= addr {
+		r := (*zgcSourceRange)(unsafe.Pointer(base + m*stride))
+		if r.hi <= addr {
 			lo = m + 1
 		} else {
 			hi = m
@@ -311,7 +515,7 @@ func (pg *zgcPage) sourceEnd(addr uintptr) (uintptr, bool) {
 	if lo == pg.srcN {
 		return 0, false
 	}
-	r := pg.sourceRangeAt(lo)
+	r := (*zgcSourceRange)(unsafe.Pointer(base + lo*stride))
 	if r.lo > addr {
 		return 0, false
 	}
@@ -319,11 +523,30 @@ func (pg *zgcPage) sourceEnd(addr uintptr) (uintptr, bool) {
 }
 
 // holdsSource reports whether addr lies in a source range of pg.
+// It searches the immutable source ranges directly as a leaf function
+// without nested calls: nosplit callers on deep call stacks (e.g. untag
+// during write barriers under -N -l) have bounded stack budgets that
+// would overflow if holdsSource called through sourceEnd and sourceRangeAt.
 //
 //go:nosplit
 func (pg *zgcPage) holdsSource(addr uintptr) bool {
-	_, ok := pg.sourceEnd(addr)
-	return ok
+	lo, hi := uintptr(0), pg.srcN
+	stride := unsafe.Sizeof(zgcSourceRange{})
+	base := uintptr(pg.src)
+	for lo < hi {
+		m := (lo + hi) >> 1
+		r := (*zgcSourceRange)(unsafe.Pointer(base + m*stride))
+		if r.hi <= addr {
+			lo = m + 1
+		} else {
+			hi = m
+		}
+	}
+	if lo == pg.srcN {
+		return false
+	}
+	r := (*zgcSourceRange)(unsafe.Pointer(base + lo*stride))
+	return r.lo <= addr
 }
 
 // holdsSourceObject reports whether the size bytes from addr lie inside
@@ -596,6 +819,9 @@ func zgcRelocateObject(pg *zgcPage, from, size, to uintptr) uintptr {
 	if mine {
 		t.moveLockedNoGrow(from, to)
 		pg.published.Add(size)
+		// Direct commits bypass the claim path, so ensure the dest mark
+		// here; free slots are never allocated by this call.
+		zgcEnsureDestRegistered(to)
 	}
 	zgcForeignGateUnlock()
 	unlock(&t.lock)
@@ -628,6 +854,17 @@ func zgcReleasePage(pg *zgcPage) bool {
 	if pg.published.Load() != pg.live {
 		return false
 	}
+	if logosZgcCommitLedgerDebug {
+		lock(&mheap_.lock)
+		for i := range pg.srcN {
+			r := pg.sourceRangeAt(i)
+			lo, hi := alignUp(r.lo, physPageSize), alignDown(r.hi, physPageSize)
+			if lo < hi {
+				logosZgcCommitLedgerAssertGrant(lo, hi-lo, "release")
+			}
+		}
+		unlock(&mheap_.lock)
+	}
 	if !pg.srcExact && regionHoldsHeapArena(pg.start, pg.size) {
 		throw("zgc: releasing a heap page whose source spans were never prepared")
 	}
@@ -640,5 +877,16 @@ func zgcReleasePage(pg *zgcPage) bool {
 	pg.releaseSources()
 	pg.released.Store(1)
 	zgcForeignGateUnlock()
+	if logosZgcCommitLedgerDebug {
+		lock(&mheap_.lock)
+		for i := range pg.srcN {
+			r := pg.sourceRangeAt(i)
+			lo, hi := alignUp(r.lo, physPageSize), alignDown(r.hi, physPageSize)
+			if lo < hi {
+				logosZgcCommitLedgerRemove(lo, hi-lo, "release")
+			}
+		}
+		unlock(&mheap_.lock)
+	}
 	return true
 }

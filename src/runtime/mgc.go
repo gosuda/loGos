@@ -216,6 +216,8 @@ func gcenable() {
 	<-c
 	<-c
 	memstats.enablegc = true // now that runtime is initialized, GC is okay
+	// Start card recording for amd64 GreenTea builds run without -gc or
+	// under -gc=greentea; other modes stay non-generational.
 	logosGenEnable()
 }
 
@@ -239,7 +241,7 @@ var gcphase uint32
 //go:linkname writeBarrier
 var writeBarrier struct {
 	enabled bool    // compiler emits a check of this before calling write barrier
-	cards   bool    // pointer stores record their slots for the card table (logosgen)
+	cards   bool    // pointer stores record their slots for the card table on amd64 GreenTea
 	pad     [2]byte // compiler uses 32-bit load for "enabled" field
 	alignme uint64  // guarantee alignment so that compiler can use a 32 or 64-bit load
 }
@@ -2111,6 +2113,7 @@ func gcSweep(mode gcMode) bool {
 	mheap_.reclaimIndex.Store(0)
 	mheap_.reclaimCredit.Store(0)
 	unlock(&mheap_.lock)
+	zgcRefreshDeferredSpans()
 
 	sweep.centralIndex.clear()
 

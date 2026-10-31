@@ -24,9 +24,11 @@ import (
 // the traversal below is otherwise identical.
 
 // pinPtr keeps the granule holding the heap object containing p in place
-// for this cycle. Words that are not heap pointers are ignored.
+// for this cycle. Words that are not heap pointers are ignored. A word on
+// a registered zgc page pins even without a heap span: synthetic test pages
+// map memory directly, and debug-call holders name such pages.
 func (ev *logosEvac) pinPtr(p uintptr) {
-	if v := zgcCanonical(p); spanOfHeap(v) != nil {
+	if v := zgcCanonical(p); spanOfHeap(v) != nil || zgcPageRegisteredNoSplit(v) {
 		ev.pinned.add(v &^ (ev.granule - 1))
 	}
 }
@@ -36,6 +38,22 @@ func (ev *logosEvac) pinRange(lo, hi uintptr) {
 	for p := lo &^ (goarch.PtrSize - 1); p+goarch.PtrSize <= hi; p += goarch.PtrSize {
 		ev.pinPtr(*(*uintptr)(unsafe.Pointer(p)))
 	}
+}
+
+// pinStrings pins every page the slice holds: each granule of the backing
+// array itself (covered even if it spans pages) plus, through the header
+// words the range walk reads, the data of every element. Empty slices walk
+// nothing; empty strings and non-heap words (argslice elements name C argv
+// memory via gostringnocopy) resolve to no span and are ignored by pinPtr.
+// STW only; allocates nothing.
+func (ev *logosEvac) pinStrings(s []string) {
+	h := (*slice)(unsafe.Pointer(&s))
+	lo := uintptr(h.array)
+	hi := lo + uintptr(len(s))*2*goarch.PtrSize
+	for p := lo &^ (ev.granule - 1); p < hi; p += ev.granule {
+		ev.pinPtr(p)
+	}
+	ev.pinRange(lo, hi)
 }
 
 // logosSpanPinned reports whether any object of s feeds an address hash:
@@ -101,6 +119,17 @@ func (ev *logosEvac) collectPins() bool {
 	for _, pp := range allp {
 		ev.pinP(pp)
 	}
+	// Runtime-owned globals: the environment and argument slices built at
+	// startup (goenvs/goargs via gostring) are ordinary movable heap, so
+	// without this they are selected, evacuated, and released like any
+	// other fragmented page. Their readers (gogetenv/GOROOT during init)
+	// run without a load barrier in binaries built without -lb, and the
+	// pause rewrite skips the running goroutine's stack, so a stale word
+	// kept across the pause reads released memory once the sources go.
+	// Pinning their pages every cycle excludes that memory from evacuation
+	// instead, which keeps every reader safe with or without barriers.
+	ev.pinStrings(envs)
+	ev.pinStrings(argslice)
 	ev.pinItabs()
 	for i := range semtable {
 		ev.pinTreap(semtable[i].root.treap)
@@ -161,8 +190,10 @@ func (ev *logosEvac) pinGoroutine(gp *g) bool {
 		// (entry PC plus captured environment), read with the same
 		// representation idiom as heapdump. Pin the funcval so the
 		// closure environment cannot move; the entry PC itself is not
-		// a heap pointer. d.fn is nil for open-coded defers.
-		ev.pinPtr(uintptr(unsafe.Pointer(d)))
+		// a heap pointer. d.fn is nil for open-coded defers. The
+		// record itself stays precisely tracked (the collector rewrites
+		// its slots); only its referents take page pins, so an ordinary
+		// heap record never contributes its own granule to the set.
 		if d.fn != nil {
 			ev.pinPtr(uintptr(unsafe.Pointer(*(**funcval)(unsafe.Pointer(&d.fn)))))
 		}

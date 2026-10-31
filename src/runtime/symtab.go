@@ -7,6 +7,7 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -502,7 +503,7 @@ var firstmoduledata moduledata // linker symbol
 //go:linkname lastmoduledatap
 var lastmoduledatap *moduledata // linker symbol
 
-var modulesSlice *[]*moduledata // see activeModules
+var modulesSlice *[]*moduledata // see activeModules; unused under GOEXPERIMENT=logosgcmoving, which publishes logosModuleTable
 
 // activeModules returns a slice of active modules.
 //
@@ -515,6 +516,9 @@ var modulesSlice *[]*moduledata // see activeModules
 //go:nosplit
 //go:nowritebarrier
 func activeModules() []*moduledata {
+	if goexperiment.LogosGCMoving {
+		return logosActiveModules()
+	}
 	p := (*[]*moduledata)(atomic.Loadp(unsafe.Pointer(&modulesSlice)))
 	if p == nil {
 		return nil
@@ -573,6 +577,10 @@ func modulesinit() {
 		}
 	}
 
+	if goexperiment.LogosGCMoving {
+		logosPublishModules(*modules)
+		return
+	}
 	atomicstorep(unsafe.Pointer(&modulesSlice), unsafe.Pointer(modules))
 }
 

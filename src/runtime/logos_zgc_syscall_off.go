@@ -21,6 +21,11 @@ func zgcSyscallAdmitIndirect(code unsafe.Pointer, rows unsafe.Pointer, n uintptr
 	return nil, 0
 }
 
+//go:nosplit
+func zgcSyscallAdmitIndirectNoSplit(code unsafe.Pointer, rows unsafe.Pointer, n uintptr) (frame unsafe.Pointer, gen uint64) {
+	return nil, 0
+}
+
 func zgcSyscallEnd(frame unsafe.Pointer, gen uint64) {
 }
 

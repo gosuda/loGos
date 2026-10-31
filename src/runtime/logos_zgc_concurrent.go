@@ -51,6 +51,16 @@ func zgcBarrierMark(target uintptr) {
 	}
 	gcw := &mp.p.ptr().gcw
 	if obj, span, objIndex := findObject(target, 0, 0); obj != 0 {
+		// A barrier-loaded word may be stale: it can name a slot the
+		// previous sweep freed and nothing has reused yet. Marking it
+		// would leave a mark with no allocation behind, which the
+		// quarantine vet rejects. Skip free slots exactly as the
+		// conservative scanner does; slots allocated since mark start
+		// are already black, so skipping loses nothing. Large spans hold
+		// one object and cannot name a free slot this way.
+		if span.spanclass.sizeclass() != 0 && span.isFreeOrNewlyAllocated(objIndex) {
+			return
+		}
 		greyobject(obj, 0, 0, span, gcw, objIndex)
 	}
 }
@@ -147,16 +157,45 @@ func zgcReservePageToSpace(pg *zgcPage) bool {
 // zgcAbandonPage unregisters a page whose to-space reservation failed and
 // frees its metadata. Nothing copied, nothing published, no source span
 // quarantined: the page stays ordinary heap.
+//
+// The same drain discipline as the retire path: the abandoned page
+// replaces its directory entry with a retiring tombstone this same pause,
+// keeping the granule reserved while a signal-stack or no-P reader that
+// resolved it drains. The domain and refs sample decides when its
+// reservation, state and header go. A drained page frees everything here;
+// a page with a live transient reader or lease is queued for the next
+// pause's retire pass, which re-samples the idempotent gates and drains it
+// there. The never-released page has no remap epoch to await and no
+// quarantined spans to free.
 func zgcAbandonPage(pg *zgcPage) {
-	st := zgcPageState(pg)
-	st.spans = nil
-	for _, ns := range st.toSpace {
-		lock(&mheap_.lock)
-		atomic.Store(&ns.sweepgen, mheap_.sweepgen)
-		mheap_.freeSpanLocked(ns, spanAllocHeap)
-		unlock(&mheap_.lock)
+	pg.abandoned = true
+	zgcPageUnpublish(pg)
+	if zgcPageAcqDomain.Load() == 0 && pg.refs.Load() == 0 {
+		zgcAbandonDrain(pg)
+		return
 	}
-	st.toSpace = nil
+	zgcRetirePendingAppend(pg)
+}
+
+// zgcAbandonDrain frees what an abandoned page still owns once the
+// drain sample passed: its reserved to-space spans, then its state and
+// header through Forget and FreePage. The source spans list is not
+// freed — the page never quarantined anything, and those spans stay
+// ordinary heap the allocator keeps owning; Forget clears the list.
+// The reservation free runs under systemstack so the drain is
+// answerable from the pause (already on g0, no switch for the nesting)
+// and from the retire seam on an ordinary goroutine stack, like the
+// retire tail it mirrors.
+func zgcAbandonDrain(pg *zgcPage) {
+	st := zgcPageState(pg)
+	systemstack(func() {
+		lock(&mheap_.lock)
+		for _, ns := range st.toSpace {
+			atomic.Store(&ns.sweepgen, mheap_.sweepgen)
+			mheap_.freeSpanLocked(ns, spanAllocHeap)
+		}
+		unlock(&mheap_.lock)
+	})
 	zgcPageForget(pg)
 	zgcFreePage(pg)
 }

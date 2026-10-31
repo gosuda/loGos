@@ -192,3 +192,69 @@ func logosForeignValidateRoots(roots *logosForeignRoot, n uintptr) {
 		}
 	}
 }
+
+// Syscall iovec-payload Whole wire (owner H-runtime, producer ssagen).
+//
+// A blocking vectored syscall (readv/writev style) names its kernel
+// buffers indirectly: the call's uintptr arguments name the iovec array
+// while each payload is reachable only through the array's Base words.
+// The boundary chase in logos_zgc_boundary.go defers a release but cannot
+// exclude a payload page from relocation selection, so a kernel writing
+// through the source address while the collector heals Go edges to the
+// copy is a real hazard. Each payload extent is therefore admitted as a
+// Whole descriptor (Slot = extent base, Size = authoritative bytes,
+// Type = element *_type), pinned in the registry by AdmitWholeCell and
+// never rewritten, for the whole blocking window: End pairs with the
+// blocking completion (the post-call point), never with the scheduler
+// return. Async sites (go/defer/tail) admit nothing, so no frame is ever
+// released at a scheduler return while the child still runs.
+//
+// Wire (bound with the compiler lane; versioned in place, no new callee):
+//
+//   - The existing rows buffer carries both sections. When the top bit of
+//     n is clear, the buffer holds exactly 2*n Unknown pairs and nothing
+//     else: every existing producer and test behaves byte-identically.
+//     When the top bit is set, n0 = n with the bit cleared counts the
+//     Unknown pairs, one word at rows[2*n0] names the integer section,
+//     and 2*m words follow holding one [ArraySlot, ElemType] pair per
+//     iovec array. The integer section is a [*]uintptr array holding m
+//     followed by one [BaseOff, LenOff, IovSize, Count] quad per array.
+//     The top bit is
+//     free because lawful pair counts stay far below it
+//     (zgcSyscallMaxPairs); the nosplit leaf rejects the bit outright.
+//     Pointers live only in unsafe.Pointer-typed memory (scanned) and
+//     integers only in uintptr-typed memory (unscanned), so the
+//     collector never chases a metadata integer as a pointer.
+//   - ArraySlot is the address of the unsafe.Pointer temp whose uintptr
+//     conversion the call reads (the same cell the Unknown pair names:
+//     the array row is always emitted alongside). ElemType is the payload
+//     element *_type (byte for Iovec-style payloads, so Len counts bytes
+//     and Size is exact). BaseOff/LenOff are the byte offsets of the Base
+//     and Len fields within one iovec struct, IovSize its stride, Count
+//     the proven element count. The runtime loads each (Base, Len) pair
+//     from the frozen array at admission time and builds, per element,
+//     one Unknown root over the Base field (retaining the payload object)
+//     plus one Whole root with Size = Len, so Size stays authoritative
+//     for dynamically sized extents and is never inferred from Type.
+//   - A nil array value or a zero Len element admits nothing for that
+//     element (the kernel reports the error itself); unreadable addresses
+//     are skipped element-wise so unmapped user pointers can neither
+//     fault the stopped world nor reach the registry; malformed
+//     descriptors throw fail-loud like every other lane.
+//
+// Only provable extents are emitted: a single iovec struct, a fixed-size
+// array of them, or a slice recovered from the conversion operand's own
+// address expression. An opaque pointer whose count lives only in a
+// sibling scalar argument cannot be correlated inside the syscall lane;
+// correlating it needs producer metadata from outside these files (see
+// the producer note in logos_syscall_order.go) and is deliberately not
+// emitted: those sites keep today's Unknown-only behavior, unchanged.
+const logosSyscallWholeVersion = uintptr(1) << (8*unsafe.Sizeof(uintptr(0)) - 1)
+
+// logosSyscallWholeSextuples reports whether n carries an iovec section.
+// Pure arithmetic, safe in any context including nosplit.
+//
+//go:nosplit
+func logosSyscallWholeSextuples(n uintptr) bool {
+	return n&logosSyscallWholeVersion != 0
+}

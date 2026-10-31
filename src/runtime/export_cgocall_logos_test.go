@@ -128,6 +128,17 @@ func LogosCgoCanonBad(v uintptr) uintptr {
 	return v + uintptr(zgcColorBits(zgcColor(zgcColorMark0)))
 }
 
+// LogosCgoCanonStoreWord seeds a color or stale address into the typed
+// pointer slot at slot from runtime code, which checkptr does not
+// instrument; a test-side unsafe.Pointer(uintptr) round-trip is the
+// bare conversion -race rejects. It returns nothing, so no invalid
+// pointer value escapes to test code.
+//
+//go:nosplit
+func LogosCgoCanonStoreWord(slot unsafe.Pointer, w uintptr) {
+	*(*uintptr)(slot) = w
+}
+
 func LogosCgoCanonicalizeSlot(ptr any, slot unsafe.Pointer) {
 	cgoCanonicalizeSlot(ptr, slot)
 }

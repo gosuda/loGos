@@ -167,10 +167,12 @@ func zgcIdentityHash(p unsafe.Pointer) uint32 {
 // (zgcRelocateObject), so a stale source address can never mint a second
 // identity for an object whose identity already moved to its copy.
 func (t *zgcIdentityTable) idLocked(addr uintptr) uint32 {
-	if pg := zgcPageFor(addr); pg != nil {
+	pg := zgcPageAcquire(addr)
+	if pg != nil {
 		if to, ok := pg.forward(addr); ok {
 			addr = to
 		}
+		zgcPageRelease(pg)
 	}
 	e := t.find(addr)
 	if e == nil {
@@ -237,7 +239,9 @@ func (t *zgcIdentityTable) reserveMoveLocked(from, to uintptr) {
 }
 
 // moveLockedNoGrow is the gate-held half of moveLocked: identical
-// semantics, but never resizes. Capacity must be pre-reserved by
+// semantics, but never resizes. It carries one identity from source to
+// copy without touching mark or alloc bits, so the quarantine
+// marks-subset-allocs invariant is unaffected. Capacity must be pre-reserved by
 // reserveMoveLocked under the same identity lock hold before the gate.
 // Violation fails closed; no fallback identity loss.
 func (t *zgcIdentityTable) moveLockedNoGrow(from, to uintptr) {
@@ -325,16 +329,30 @@ func zgcCanonical(v uintptr) uintptr {
 		// Nothing relocates before zgc is configured.
 		return v
 	}
-	addr := v
-	if spanOfHeap(v) == nil {
-		// Not an uncolored heap word: a colored one, or foreign.
-		a := v &^ colors
-		if a > zgcAddrMask || zgcPageFor(a) == nil && spanOfHeap(a) == nil {
+	// Validate before truncating: the word is strippable only when every
+	// bit above the address field lies in the non-address region (flag
+	// bits or the colour nibble), so a foreign high word returns
+	// bit-identical instead of folding into the heap range. Only a word
+	// accepted here is canonicalized below, and the canonical result
+	// strips the whole non-address field.
+	if v&^(zgcAddrMask|zgcFlagMask|zgcColorMask) != 0 {
+		return v
+	}
+	addr := v & zgcAddrMask
+	if addr != v {
+		// Colored or flagged candidate: accept only when the stripped
+		// word names heap. Before the arena map is live no word can name
+		// heap, and the lookup would fault on the nil map, so keep the
+		// word unchanged.
+		if !zgcPageRegisteredNoSplit(addr) && (!zgcHeapArenaLive() || spanOfHeap(addr) == nil) {
 			return v
 		}
-		addr = a
+	} else if !zgcHeapArenaLive() || spanOfHeap(v) == nil {
+		return v
 	}
-	if zgcPageFor(addr) != nil {
+	// Validated heap word: keep the address field alone, so every color,
+	// flag, and tag bit above it is gone in both encodings.
+	if zgcPageRegisteredNoSplit(addr) {
 		return zgcRemap(addr)
 	}
 	return addr

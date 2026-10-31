@@ -583,7 +583,7 @@ func writeHeapBitsSmallStub(span *mspan, x, dataSize uintptr, typ *_type) uintpt
 
 	// Since we're never writing more than one uintptr's worth of bits, we're either going
 	// to do one or two writes.
-	dstBase, _ := spanHeapBitsRange(span.base(), pageSize, elemsize)
+	dstBase, _ := spanHeapBitsRange(span.base(), span.npages*pageSize, elemsize)
 	dst := unsafe.Pointer(dstBase)
 	o := (x - span.base()) / goarch.PtrSize
 	i := o / ptrBits

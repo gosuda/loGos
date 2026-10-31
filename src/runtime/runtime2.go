@@ -713,7 +713,7 @@ type m struct {
 	ditEnabled      bool        // set if DIT is currently enabled on this M
 
 	// logosWbScratch is the write barrier buffer of a store made without a P
-	// (GOEXPERIMENT=logosgen).
+	// (amd64 GreenTea builds; zero length otherwise).
 	logosWbScratch logosGenScratch
 
 	mLockProfile mLockProfile // fields relating to runtime.lock contention

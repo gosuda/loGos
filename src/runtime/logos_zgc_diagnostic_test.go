@@ -16,8 +16,8 @@ import (
 // W6 debug/crash boundary tests.
 //
 // The compiler half of the W6 contract lives in
-// cmd/compile/internal/ssa/logos_loadbarrier.go: debugcall.go and the
-// crash-stack entries keep plain loads (LogosNoLBFiles / LogosNoLBFunc).
+// cmd/compile/internal/base/logos.go: LogosNoLB keeps debugcall.go and
+// the crash-stack entries on plain loads.
 // The compiled witnesses (no zgcLoadBarrierSlow in debugCallWrap or
 // switchToCrashStack) belong to the parent's -lb build and objdump gates.
 //
@@ -53,6 +53,11 @@ import (
 // and frees once.
 func w6RegisterPage(t *testing.T, pages map[uintptr]*LogosZgcPage, addr uintptr) {
 	t.Helper()
+	// Every holder below (the g record, the args block, the closure
+	// environment) is a real heap object; its page needs the zgc low
+	// heap window. Check the mode before touching the directory so a
+	// wrong-mode run skips instead of tripping the registration throw.
+	logosZgcRequireHeapWindow(t)
 	start := addr &^ (LogosZgcPageSize - 1)
 	if _, ok := pages[start]; !ok {
 		pages[start] = LogosZgcNewPage(start, 0, 16)
@@ -289,11 +294,10 @@ func TestLogosZgcW6CrashStackStateRefusal(t *testing.T) {
 // block behind gp.param: debugCallWrap stashes debugCallWrapArgs there
 // (debugcall.go) and debugCallWrap1 plain-loads it back, while the
 // reader is excluded from the load barrier. The real pinGoroutine must
-// pin the args page from the param word alone. EXPECTED FAILURE until
-// the param pin lands: pinGoroutine visits gp, defer chain, waiters,
-// and conservative stack, but never gp.param, so the args page stays
-// unpinned. The args page is isolated from the g page so the g self
-// pin cannot mask the missing discovery.
+// pin the args page from the param word alone: pinGoroutine visits gp,
+// gp.param, defer chain, waiters, and conservative stack, so the args
+// page is pinned. The args page is isolated from the g page so the g
+// self pin cannot mask a missing discovery.
 func TestLogosZgcW6PinDiscoversParam(t *testing.T) {
 	defer LogosZgcReset()
 	LogosZgcSelectSoftware(LogosZgcMark0)

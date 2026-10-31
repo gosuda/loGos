@@ -240,11 +240,17 @@ func (c Cleanup) Stop() {
 		return
 	}
 
-	// Canonicalize without copying, mirroring removespecial: the handle
-	// already names the copy's span, so this is the identity for it, and
-	// it keeps the lookup on the copy's span for a stale or colored word.
-	// The following block removes the Special record of type cleanup for the object c.ptr.
-	ptr := uintptr(logosZgcAttachSpecial(unsafe.Pointer(c.ptr)))
+	// Home ownership, never forwarding: the handle names the home span the
+	// special was spliced onto (the to-space copy when attach relocated,
+	// the object itself otherwise). Cancellation resolves only that home
+	// and never follows forwarding, so a copy published while Stop is in
+	// flight cannot divert the lookup to the copy's span (double-run),
+	// the unlinked record's argument and closure become collectable at
+	// once (no leak), and Stop never touches forwarding records or source
+	// ranges that release/retire may free concurrently
+	// (no use-after-release). A stale or colored word cannot appear here:
+	// c.ptr is the stored home, never a heap word the barrier may color.
+	ptr := c.ptr
 	span := spanOfHeap(ptr)
 	if span == nil {
 		return

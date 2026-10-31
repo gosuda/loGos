@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"sync"
 	"testing"
+	"unsafe"
 
 	. "runtime"
 )
@@ -560,6 +561,446 @@ func TestLogosZgcReleaseBeforeSelfHealDrains(t *testing.T) {
 	fresh := src
 	if got := LogosZgcLoad(&fresh); got != src || LogosZgcWord(got) != 0x5a5a5a5a5a5a5a5a {
 		t.Fatalf("fresh word into the reused range resolved to %#x, want %#x", got, src)
+	}
+}
+
+// Ordering pin: a live foreign hold keeps the source page unreleased,
+// and the storage chain (release → heal → drain → remap → retire)
+// respects ownership at every step. The hold is published through the
+// real bounded hold protocol the foreign boundary emits —
+// logosZgcForeignHoldEnter canonicalizes the root and claims a slot
+// (logos_zgc_boundary.go:315), no direct slot manipulation — and the
+// witnessed gate is zgcPageHasActiveHold (logos_zgc_boundary.go:427),
+// the exact predicate the pause release loop consults before it may
+// call zgcReleasePage (logos_zgc_cycle.go:95). Exit clears the hold,
+// so every later gate proceeds on its own merits.
+//
+// A regression that drops the hold from the gate query fails the
+// active-hold assertions while the hold is live; a regression that
+// releases or zeroes before the drain completes fails the intact-bytes
+// assertions; a regression that frees storage before the drain fails
+// the retire gates; a regression that skips the remap pass fails the
+// early retire.
+func TestLogosZgcReleaseWaitsForForeignHold(t *testing.T) {
+	logosZgcRequireHeapWindow(t)
+	if GOOS != "linux" {
+		t.Skip("blocked: zero fill after release is a property of madvise(MADV_DONTNEED) on Linux")
+	}
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	GC()
+	GC()
+	LogosZgcForeignInit()
+
+	run := LogosZgcAllocRun([]int{LogosZgcRunManual, LogosZgcRunHeap, LogosZgcRunHeap, LogosZgcRunHeap})
+	if run == nil {
+		t.Fatal("no tight span run in one 2 MB region after 256 trials")
+	}
+	for i := 3; i >= 0; i-- {
+		t.Cleanup(func() { run.Free(i) })
+	}
+	const head, s0, s1, ts = 0, 1, 2, 3
+	elem := run.Elem(s0)
+	if elem == 0 || run.Elem(s1) != elem {
+		t.Fatal("source spans have no common object size")
+	}
+	if run.Nelems(s0) < 1 || run.Nelems(s1) < 1 {
+		t.Fatal("source span holds no object")
+	}
+	// The two hand-built source objects are real objects of their spans:
+	// hand their slots out through the allocator's own occupancy
+	// accounting, so the claim path's published-copy decrement
+	// (zgcCopyOneResult) moves a real count to zero instead of wrapping
+	// an uncounted span below zero, and retire's live-allocation vet
+	// sees the truth.
+	run.Occupy(s0, 0)
+	run.Occupy(s1, 0)
+
+	region := run.Base(0) &^ (LogosZgcPageSize - 1)
+	pg := LogosZgcNewPage(region, 2*elem, 2)
+	retired := false
+	t.Cleanup(func() {
+		if !retired {
+			LogosZgcForgetPage(pg)
+			LogosZgcDropPage(pg)
+		}
+	})
+
+	// Selection order is not address order; record reversed so the
+	// prepare sort is exercised.
+	LogosZgcRecordSources(pg, run, []int{s1, s0})
+	var eligible, reserved bool
+	LogosZgcWithWorldStopped(func() {
+		eligible = LogosZgcEligible(pg)
+		reserved = LogosZgcReserveToSpace(pg)
+	})
+	if !eligible {
+		t.Fatal("page with adjacent sources is ineligible")
+	}
+	if !reserved {
+		t.Fatal("page reserved no to-space span for the copies")
+	}
+	ranges, exact := LogosZgcPageSources(pg)
+	if !exact || len(ranges) != 1 || ranges[0] != [2]uintptr{run.Base(s0), run.Base(s1) + run.Bytes(s1)} {
+		t.Fatalf("source ranges = %v, want one coalesced range", ranges)
+	}
+
+	LogosZgcFill(run.Base(s0), run.Bytes(s0), 0xA1)
+	LogosZgcFill(run.Base(s1), run.Bytes(s1), 0xA2)
+	LogosZgcFill(run.Base(head), run.Bytes(head), 0xE0)
+	LogosZgcFill(run.Base(ts), run.Bytes(ts), 0x5C)
+
+	// Publish every live byte first, so the release below is decided by
+	// the ownership gates alone, never by an unpublished byte. The
+	// copies commit through the production claim-and-commit path, so
+	// each published copy leaves its source count and the winners are
+	// the addresses the heal and retire lifecycle actually names.
+	src := []uintptr{run.Base(s0), run.Base(s1)}
+	dst := make([]uintptr, 2)
+	for i, si := range []int{s0, s1} {
+		won, st := LogosZgcCopyOneResult(pg, run, si, src[i], elem)
+		if st != LogosZgcRelocateDone || won == 0 {
+			t.Fatalf("copy of %#x status %d winner %#x, want a committed copy", src[i], st, won)
+		}
+		dst[i] = won
+	}
+	LogosZgcSelectSoftware(LogosZgcRemapped)
+	defer LogosZgcReset()
+
+	// Live foreign hold: the boundary thread publishes its hold at
+	// entry, naming the source object as the direct root, and the page
+	// the root names must answer the pause gate until the hold ends.
+	h := LogosZgcForeignNewG(8)
+	gpPtr := *(*unsafe.Pointer)(unsafe.Pointer(h))
+	LogosZgcForeignGSetStatus(gpPtr, LogosZgcGRunning)
+	holds := LogosZgcForeignHoldCount()
+	if slot := LogosZgcForeignHoldEnter(gpPtr, src[0]); slot < 0 {
+		t.Fatal("foreign hold enter found no free slot in an empty table")
+	}
+	defer LogosZgcForeignHoldExit(gpPtr)
+	if d := LogosZgcForeignHoldDepth(gpPtr); d != 1 {
+		t.Fatalf("hold depth = %d, want 1", d)
+	}
+	if c := LogosZgcForeignHoldCount(); c != holds+1 {
+		t.Fatalf("hold count = %d, want %d", c, holds+1)
+	}
+	if !LogosZgcPageHasActiveHold(unsafe.Pointer(pg)) {
+		t.Fatal("page of the held root reports no active hold")
+	}
+	for i, fill := range []byte{0xA1, 0xA2} {
+		if off := LogosZgcFirstMismatch(run.Base(s0+i), run.Bytes(s0+i), fill); off >= 0 {
+			t.Fatalf("source span %d byte %#x changed under the foreign hold", s0+i, run.Base(s0+i)+uintptr(off))
+		}
+	}
+	if LogosZgcPageFor(src[0]) != pg {
+		t.Fatal("page lost its registration under a live foreign hold")
+	}
+	LogosZgcForeignHoldExit(gpPtr)
+	if d := LogosZgcForeignHoldDepth(gpPtr); d != 0 {
+		t.Fatalf("post-exit hold depth = %d, want 0", d)
+	}
+	if c := LogosZgcForeignHoldCount(); c != holds {
+		t.Fatalf("post-exit hold count = %d, want %d", c, holds)
+	}
+	if LogosZgcPageHasActiveHold(unsafe.Pointer(pg)) {
+		t.Fatal("hold outlived its Exit")
+	}
+
+	// Hold ended: the source returns to the OS with DONTNEED, exactly
+	// the prepared ranges zero, and every copy keeps its bytes.
+	if !LogosZgcRelease(pg) || !LogosZgcPageReleased(pg) {
+		t.Fatal("release refused after the foreign hold ended")
+	}
+	for i, fill := range []byte{0xA1, 0xA2} {
+		if !LogosZgcAllZero(run.Base(s0+i), run.Bytes(s0+i)) {
+			t.Fatalf("source span %d not zeroed after release", s0+i)
+		}
+		if off := LogosZgcFirstMismatch(dst[i], elem, fill); off >= 0 {
+			t.Fatalf("copy %d lost its contents at +%d after release", i, off)
+		}
+	}
+	if LogosZgcByteAt(run.Base(head)) != 0xE0 || LogosZgcByteAt(run.Base(head)+run.Bytes(head)-1) != 0xE0 {
+		t.Fatal("head bytes touched by the release")
+	}
+	if off := LogosZgcFirstMismatch(run.Base(ts), run.Bytes(ts), 0x5C); off >= 0 {
+		t.Fatalf("to-space span clobbered at +%d", run.Base(ts)+uintptr(off))
+	}
+
+	// Self-heal drains through the off-heap forwarding table after the
+	// source is zeroed, one heal per stale word.
+	before := LogosZgcHeals()
+	heal := LogosZgcColored(src[1], LogosZgcMark0)
+	if got := LogosZgcLoad(&heal); got != dst[1] {
+		t.Fatalf("stale slot healed to %#x after release, want %#x", got, dst[1])
+	}
+	if n := LogosZgcHeals() - before; n != 1 {
+		t.Fatalf("drain took %d heals, want 1", n)
+	}
+
+	// The filled to-space spans join the swept sets the way the
+	// mark-termination pause publishes them, draining the page's
+	// destination list; retirement still needs a remap pass first.
+	LogosZgcWithWorldStopped(func() { LogosZgcPublishToSpaceSpans(pg) })
+	if n := LogosZgcPageStateToSpaceLen(pg); n != 0 {
+		t.Fatalf("publish left %d to-space spans", n)
+	}
+
+	// A remap pass is the first ownership retirement needs.
+	var early bool
+	LogosZgcWithWorldStopped(func() { early = LogosZgcRetire(pg) })
+	if early || LogosZgcPageFor(src[0]) != pg {
+		t.Fatal("page retired before a remap pass completed after release")
+	}
+	LogosZgcRemapDone()
+
+	var late bool
+	LogosZgcWithWorldStopped(func() { late = LogosZgcRetire(pg) })
+	if !late || LogosZgcPageFor(src[0]) != nil {
+		t.Fatal("page not retired after the hold ended and a remap pass")
+	}
+	retired = true
+	run.MarkFreed(s0)
+	run.MarkFreed(s1)
+}
+
+// Copy hold: the meaningful foreign hold on a canonical copy survives
+// the source page's retire. The admission names the copy itself — the
+// exact address production handed the foreign caller — never a stale
+// source word: the copy commit refuses to re-copy a non-source object
+// (zgcRelocateObject returns 0 for anything outside the prepared
+// source ranges, logos_zgc_page.go:745-748), so zgcForeignAdmitBaseSTW
+// owns the copy in place, refcounts zgcForeignObjects[canon] and pins
+// zgcForeignRegionKey(canon) (logos_zgc_foreign_registry.go:1166-1177).
+// End releases exactly those canon-keyed records
+// (zgcForeignRetireLocked, logos_zgc_foreign_registry.go:1758-1765);
+// the forwarding table of the old source base is never consulted.
+//
+// With release and a remap pass done, the source page may retire under
+// the live hold: the caller's word was rewritten to the copy before
+// admission published (zgcForeignAdmitPendingApply), and once the
+// table is gone no functional consumer resolves the old base — the
+// load barrier's unregistered-page arm strips color with no heal
+// (logos_zgc.go:264-281). What must hold instead is the copy: the
+// token stays valid and the copy stays exposed across the retire, the
+// payload is intact after End, and End leaves nothing exposed. The
+// retire return is captured exactly once: when the to-space copy
+// shares the page's region the region pin refuses the drain while the
+// frame is live and only End clears it; when the copy landed elsewhere
+// the source retires under the hold. Both outcomes carry the same
+// contract, so the fixture asserts both without depending on
+// allocator placement.
+func TestLogosZgcCopyHoldSurvivesSourceRetire(t *testing.T) {
+	logosZgcRequireHeapWindow(t)
+	if GOOS != "linux" {
+		t.Skip("blocked: zero fill after release is a property of madvise(MADV_DONTNEED) on Linux")
+	}
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	GC()
+	GC()
+	LogosZgcForeignInit()
+
+	run := LogosZgcAllocRun([]int{LogosZgcRunManual, LogosZgcRunHeap, LogosZgcRunHeap, LogosZgcRunHeap})
+	if run == nil {
+		t.Fatal("no tight span run in one 2 MB region after 256 trials")
+	}
+	for i := 3; i >= 0; i-- {
+		t.Cleanup(func() { run.Free(i) })
+	}
+	const head, s0, s1, ts = 0, 1, 2, 3
+	elem := run.Elem(s0)
+	if elem == 0 || run.Elem(s1) != elem {
+		t.Fatal("source spans have no common object size")
+	}
+	if run.Nelems(s0) < 1 || run.Nelems(s1) < 1 {
+		t.Fatal("source span holds no object")
+	}
+	// Real objects of their spans, so the published-copy decrement
+	// moves a real count to zero and retire's live-allocation vet sees
+	// the truth.
+	run.Occupy(s0, 0)
+	run.Occupy(s1, 0)
+
+	region := run.Base(0) &^ (LogosZgcPageSize - 1)
+	pg := LogosZgcNewPage(region, 2*elem, 2)
+	retired := false
+	t.Cleanup(func() {
+		if !retired {
+			LogosZgcForgetPage(pg)
+			LogosZgcDropPage(pg)
+		}
+	})
+
+	LogosZgcRecordSources(pg, run, []int{s1, s0})
+	var eligible, reserved bool
+	LogosZgcWithWorldStopped(func() {
+		eligible = LogosZgcEligible(pg)
+		reserved = LogosZgcReserveToSpace(pg)
+	})
+	if !eligible {
+		t.Fatal("page with adjacent sources is ineligible")
+	}
+	if !reserved {
+		t.Fatal("page reserved no to-space span for the copies")
+	}
+	ranges, exact := LogosZgcPageSources(pg)
+	if !exact || len(ranges) != 1 || ranges[0] != [2]uintptr{run.Base(s0), run.Base(s1) + run.Bytes(s1)} {
+		t.Fatalf("source ranges = %v, want one coalesced range", ranges)
+	}
+
+	LogosZgcFill(run.Base(s0), run.Bytes(s0), 0xA1)
+	LogosZgcFill(run.Base(s1), run.Bytes(s1), 0xA2)
+	LogosZgcFill(run.Base(head), run.Bytes(head), 0xE0)
+	LogosZgcFill(run.Base(ts), run.Bytes(ts), 0x5C)
+
+	// Publish every live byte first, so the release below is decided by
+	// the ownership gates alone, never by an unpublished byte.
+	src := []uintptr{run.Base(s0), run.Base(s1)}
+	dst := make([]uintptr, 2)
+	for i, si := range []int{s0, s1} {
+		won, st := LogosZgcCopyOneResult(pg, run, si, src[i], elem)
+		if st != LogosZgcRelocateDone || won == 0 {
+			t.Fatalf("copy of %#x status %d winner %#x, want a committed copy", src[i], st, won)
+		}
+		dst[i] = won
+	}
+	LogosZgcSelectSoftware(LogosZgcRemapped)
+	defer LogosZgcReset()
+
+	// frame1 owns the canonical copy before the source release. When
+	// the copy shares the page's region the pin refuses the release
+	// while the frame is live — the real source-release criterion —
+	// and only End clears it; when the copy landed elsewhere the
+	// release proceeds under the hold, the same copy-hold survival the
+	// retire half asserts below. Both branches converge on the released
+	// page with the copy intact.
+	// The slot is a plain word temp admitted with Type nil (one opaque
+	// word): the runtime reads and rewrites the cell exactly as before,
+	// but no uintptr->unsafe.Pointer conversion exists for checkptr to
+	// reject, and &temp1 is a real typed address.
+	var temp1 uintptr = dst[0]
+	rows1 := []unsafe.Pointer{unsafe.Pointer(&temp1), nil}
+	frame1, gen1 := LogosZgcSyscallAdmit(unsafe.Pointer(&rows1[0]), 1)
+	if !LogosZgcSyscallTokenValid(frame1, gen1) {
+		t.Fatal("first admit returned invalid token with cycle enabled")
+	}
+	if temp1 != dst[0] {
+		t.Fatalf("first admitted root = %#x, want the canonical copy owned in place", temp1)
+	}
+	if !LogosZgcSyscallExposed(dst[0]) {
+		t.Fatal("canonical copy not exposed while the first frame is live")
+	}
+	if LogosZgcRelease(pg) {
+		// Out-of-region geometry: the source releases under the hold.
+		LogosZgcSyscallEnd(frame1, gen1)
+		if LogosZgcSyscallExposed(dst[0]) {
+			t.Fatal("canonical copy still exposed after End")
+		}
+	} else {
+		// In-region geometry: the region pin refused the release.
+		if LogosZgcPageReleased(pg) {
+			t.Fatal("page released while the canonical copy's pin named its region")
+		}
+		if off := LogosZgcFirstMismatch(run.Base(s0), run.Bytes(s0), 0xA1); off >= 0 {
+			t.Fatalf("source span byte %#x changed under the foreign hold", run.Base(s0)+uintptr(off))
+		}
+		LogosZgcSyscallEnd(frame1, gen1)
+		if LogosZgcSyscallExposed(dst[0]) {
+			t.Fatal("canonical copy still exposed after End")
+		}
+		if !LogosZgcRelease(pg) || !LogosZgcPageReleased(pg) {
+			t.Fatal("release refused after the pin ended")
+		}
+	}
+	// The release returned exactly the prepared ranges to the OS,
+	// zeroed them, and left every copy and every byte outside the
+	// ranges untouched.
+	for i, fill := range []byte{0xA1, 0xA2} {
+		if !LogosZgcAllZero(run.Base(s0+i), run.Bytes(s0+i)) {
+			t.Fatalf("source span %d not zeroed after release", s0+i)
+		}
+		if off := LogosZgcFirstMismatch(dst[i], elem, fill); off >= 0 {
+			t.Fatalf("copy %d lost its contents at +%d after release", i, off)
+		}
+	}
+	if LogosZgcByteAt(run.Base(head)) != 0xE0 || LogosZgcByteAt(run.Base(head)+run.Bytes(head)-1) != 0xE0 {
+		t.Fatal("head bytes touched by the release")
+	}
+	if off := LogosZgcFirstMismatch(run.Base(ts), run.Bytes(ts), 0x5C); off >= 0 {
+		t.Fatalf("to-space span clobbered at +%d", run.Base(ts)+uintptr(off))
+	}
+
+	// The filled to-space spans join the swept sets the way the
+	// mark-termination pause publishes them, draining the page's
+	// destination list; a remap pass is the last ownership gate before
+	// retirement.
+	LogosZgcWithWorldStopped(func() { LogosZgcPublishToSpaceSpans(pg) })
+	if n := LogosZgcPageStateToSpaceLen(pg); n != 0 {
+		t.Fatalf("publish left %d to-space spans", n)
+	}
+	LogosZgcRemapDone()
+
+	// frame2 owns the real canonical copy in place: valid token, the
+	// slot keeps the copy address, the copy is exposed.
+	// Same plain-word slot contract as frame1: Type nil, real typed
+	// address, no fabricated conversion.
+	var temp2 uintptr = dst[0]
+	rows2 := []unsafe.Pointer{unsafe.Pointer(&temp2), nil}
+	frame2, gen2 := LogosZgcSyscallAdmit(unsafe.Pointer(&rows2[0]), 1)
+	if !LogosZgcSyscallTokenValid(frame2, gen2) {
+		t.Fatal("admit returned invalid token with cycle enabled")
+	}
+	if temp2 != dst[0] {
+		t.Fatalf("admitted root = %#x, want the canonical copy owned in place", temp2)
+	}
+	if !LogosZgcSyscallExposed(dst[0]) {
+		t.Fatal("canonical copy not exposed while the frame is live")
+	}
+
+	// Capture the retire exactly once. In-region geometry: the pin
+	// refuses the drain while frame2 is live. Elsewhere: the source
+	// retires under the hold. Either way the freed page must never be
+	// retired or dropped again, so the retired flag moves before any
+	// later assertion can reach the cleanup.
+	var retiredNow bool
+	LogosZgcWithWorldStopped(func() { retiredNow = LogosZgcRetire(pg) })
+	if retiredNow {
+		retired = true
+		run.MarkFreed(s0)
+		run.MarkFreed(s1)
+	}
+
+	// The copy hold survives its source: the token is live and the
+	// canonical copy is still exposed, whatever the source page's fate.
+	if !LogosZgcSyscallTokenValid(frame2, gen2) {
+		t.Fatal("frame lost its token across the source retire")
+	}
+	if !LogosZgcSyscallExposed(dst[0]) {
+		t.Fatal("canonical copy not exposed across the source retire")
+	}
+
+	// End releases the canon-keyed records only, and the held payload
+	// is intact afterwards.
+	LogosZgcSyscallEnd(frame2, gen2)
+	if LogosZgcSyscallExposed(dst[0]) {
+		t.Fatal("canonical copy still exposed after End")
+	}
+	if !retiredNow && LogosZgcPageHasActiveHold(unsafe.Pointer(pg)) {
+		t.Fatal("hold outlived its End")
+	}
+	if off := LogosZgcFirstMismatch(dst[0], elem, 0xA1); off >= 0 {
+		t.Fatalf("held copy lost its payload at +%d", off)
+	}
+
+	if !retiredNow {
+		// The pin named this page's region and refused the drain while
+		// the frame was live; with the frame ended it proceeds.
+		var late bool
+		LogosZgcWithWorldStopped(func() { late = LogosZgcRetire(pg) })
+		if !late || LogosZgcPageFor(src[0]) != nil {
+			t.Fatal("page not retired after the pin ended and a remap pass")
+		}
+		retired = true
+		run.MarkFreed(s0)
+		run.MarkFreed(s1)
 	}
 }
 

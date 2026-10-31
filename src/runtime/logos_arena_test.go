@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+	"weak"
 )
 
 const arenaScanUnit = runtime.LogosArenaUnit
@@ -200,6 +201,246 @@ func TestLogosArenaMarkSurvivesPark(t *testing.T) {
 	}
 	wake <- struct{}{}
 	<-done
+}
+
+// arenaParkBig is the object size that fills a chunk alone. A noscan object of
+// this size leaves too little room for a second noscan or scan object, and a
+// scan object of this size takes all the room past the header, so each chunk
+// built by arenaParkCase holds one object and the next allocation links a
+// fresh chunk.
+const arenaParkBig = runtime.LogosArenaCapacity - runtime.LogosArenaUnit
+
+// arenaEmptyMarks returns the watermarks of the chunk at addr while it is
+// empty: the noscan base and the scan base.
+func arenaEmptyMarks(addr uintptr) (noscan, scan uintptr) {
+	return addr + runtime.LogosArenaChunkBytes - runtime.LogosArenaCapacity,
+		addr + runtime.LogosArenaChunkBytes
+}
+
+// checkWords reports whether the pointer words of the size bytes at p all
+// hold v.
+func checkWords(p unsafe.Pointer, size uintptr, v *int) bool {
+	words := unsafe.Slice((**int)(p), size/unsafe.Sizeof(v))
+	for _, w := range words {
+		if w != v {
+			return false
+		}
+	}
+	return true
+}
+
+// arenaIndexes names each chunk address by its position in built.
+func arenaIndexes(addrs, built []uintptr) []int {
+	idx := make([]int, len(addrs))
+	for i, a := range addrs {
+		idx[i] = -1
+		for j, b := range built {
+			if a == b {
+				idx[i] = j
+			}
+		}
+	}
+	return idx
+}
+
+// sameAddrs reports whether a and b hold the same addresses in the same order.
+func sameAddrs(a, b []uintptr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// arenaShapeOK reports whether chain, newest first, holds the chunks of addrs,
+// oldest first, with each chunk in use exactly when live says so.
+func arenaShapeOK(chain []runtime.LogosArenaChunk, addrs []uintptr, live []bool) bool {
+	if len(chain) != len(addrs) {
+		return false
+	}
+	for k, c := range chain {
+		j := len(addrs) - 1 - k
+		if c.Addr != addrs[j] || (c.NoscanUsed+c.ScanUsed > 0) != live[j] {
+			return false
+		}
+	}
+	return true
+}
+
+// arenaParkMax bounds the chunks one arenaParkCase builds. The parking
+// goroutine keeps its bookkeeping in arrays of this size, so the chain it
+// builds is never grown by append.
+const arenaParkMax = 4
+
+// arenaParkBuilt is what a parking goroutine hands the test: its id and its n
+// chunks, oldest first. objs[i] is the object chunk i keeps, nil when emptied.
+type arenaParkBuilt struct {
+	goid  uint64
+	n     int
+	addrs [arenaParkMax]uintptr
+	objs  [arenaParkMax]unsafe.Pointer
+}
+
+// arenaParkCase parks a goroutine whose chain holds one chunk per entry of
+// live, oldest first. Each chunk gets one object: noscan for even entries and
+// scan for odd ones. Entries that are false are emptied in place by empty once
+// every chunk is built. After the goroutine parks, the chunks it still holds
+// must be exactly the live chunks, newest first, and the live objects must
+// keep their contents.
+func arenaParkCase(t *testing.T, live []bool, empty func(addr uintptr) bool) {
+	t.Helper()
+	if len(live) == 0 || len(live) > arenaParkMax {
+		t.Fatalf("arenaParkCase: %d chunks, want 1 to %d", len(live), arenaParkMax)
+	}
+	_, leasedBase, _ := runtime.LogosArenaCounts()
+	x := new(int)
+	built := make(chan arenaParkBuilt)
+	wake := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m := runtime.LogosArenaSave()
+		b := arenaParkBuilt{goid: runtime.LogosArenaGoid(), n: len(live)}
+		for i := range live {
+			var p unsafe.Pointer
+			if i%2 == 0 {
+				p = runtime.LogosArenaAlloc(byte(0), arenaParkBig)
+				fillBytes(p, arenaParkBig, byte(0x40+i))
+			} else {
+				p = runtime.LogosArenaAllocScan((*int)(nil), arenaParkBig)
+				fillWords(p, arenaParkBig, x)
+			}
+			head, _, _ := runtime.LogosArenaMarkSave()
+			b.addrs[i] = head
+			b.objs[i] = p
+		}
+		for i, keep := range live {
+			if !keep {
+				b.objs[i] = nil
+				if !empty(b.addrs[i]) {
+					t.Errorf("chunk %d: emptying it in place failed", i)
+				}
+			}
+		}
+		var buf [arenaParkMax]runtime.LogosArenaChunk
+		n, _ := runtime.LogosArenaChainOf(b.goid, buf[:])
+		if n != len(live) || !arenaShapeOK(buf[:n], b.addrs[:b.n], live) {
+			t.Errorf("built chain has %d chunks, want %d with live %v", n, len(live), live)
+		}
+		built <- b
+		<-wake
+		runtime.LogosArenaRestore(m)
+	}()
+
+	b := <-built
+	addrs := b.addrs[:b.n]
+	var want []uintptr
+	for j := len(live) - 1; j >= 0; j-- {
+		if live[j] {
+			want = append(want, addrs[j])
+		}
+	}
+	var buf [arenaParkMax]runtime.LogosArenaChunk
+	deadline := time.Now().Add(20 * time.Second)
+	n, waiting := runtime.LogosArenaChainOf(b.goid, buf[:])
+	for !waiting {
+		if time.Now().After(deadline) {
+			close(wake)
+			<-done
+			t.Fatalf("goroutine %d did not park", b.goid)
+		}
+		runtime.Gosched()
+		n, waiting = runtime.LogosArenaChainOf(b.goid, buf[:])
+	}
+	if n > len(buf) {
+		close(wake)
+		<-done
+		t.Fatalf("goroutine %d holds %d chunks, more than the %d the test can record", b.goid, n, len(buf))
+	}
+	var got []uintptr
+	for _, c := range buf[:n] {
+		got = append(got, c.Addr)
+	}
+	if !sameAddrs(got, want) {
+		t.Errorf("after parking, the goroutine holds chunks %v, want %v (build order, oldest first): every empty chunk must return to the P cache", arenaIndexes(got, addrs), arenaIndexes(want, addrs))
+	}
+	total, leased, pooled := runtime.LogosArenaCounts()
+	if leased != leasedBase+len(want) {
+		t.Errorf("leased = %d after the goroutine parked, want %d", leased, leasedBase+len(want))
+	}
+	if total != leased+pooled {
+		t.Errorf("total = %d chunks, want leased %d + pooled %d", total, leased, pooled)
+	}
+	for j, keep := range live {
+		if !keep {
+			continue
+		}
+		if j%2 == 0 && !checkBytes(b.objs[j], arenaParkBig, byte(0x40+j)) {
+			t.Errorf("chunk %d: noscan object lost its contents across the park", j)
+		}
+		if j%2 == 1 && !checkWords(b.objs[j], arenaParkBig, x) {
+			t.Errorf("chunk %d: scan object lost its contents across the park", j)
+		}
+	}
+	close(wake)
+	<-done
+	arenaWaitLeased(t, leasedBase)
+}
+
+// arenaWaitLeased yields until the leased count returns to want, the cleanup
+// that follows a parking case. It yields rather than sleeps, and gives up
+// after a bounded deadline.
+func arenaWaitLeased(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		_, leased, _ := runtime.LogosArenaCounts()
+		if leased == want || time.Now().After(deadline) {
+			if leased != want {
+				t.Errorf("leased = %d after cleanup, want %d", leased, want)
+			}
+			return
+		}
+		runtime.Gosched()
+	}
+}
+
+// M18-S1 (AR4): a goroutine that parks with an empty head over a live chunk
+// returns the head. The empty head is reached through the existing mark seam:
+// a restore to the watermark the head holds while empty.
+func TestLogosArenaParkReleasesEmptyHeadOverLiveTail(t *testing.T) {
+	arenaParkCase(t, []bool{true, false}, func(addr uintptr) bool {
+		noscan, scan := arenaEmptyMarks(addr)
+		runtime.LogosArenaMarkRestore(addr, noscan, scan)
+		return true
+	})
+}
+
+// M18-S1 (AR4): when a goroutine parks, every empty chunk returns to the P
+// cache, including empty chunks behind a live chunk, and the live chunks keep
+// their addresses and contents. Some of these states no Save, Restore, or
+// allocation reaches, so they are built with LogosArenaEmptyChunk.
+func TestLogosArenaParkReleasesEmptyChunksBehindLiveHead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		live []bool
+	}{
+		{"all live", []bool{true, true}},
+		{"one empty", []bool{false}},
+		{"all empty", []bool{false, false}},
+		{"live head over empty tail", []bool{false, true}},
+		{"empty head over live tail", []bool{true, false}},
+		{"empty middle", []bool{true, false, true}},
+		{"alternating", []bool{false, true, false, true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			arenaParkCase(t, tc.live, runtime.LogosArenaEmptyChunk)
+		})
+	}
 }
 
 // M18-S1 (AR4, AR2): a goroutine that exits without restoring its watermark,
@@ -835,6 +1076,278 @@ func TestLogosArenaDynamicMakeWatermark(t *testing.T) {
 	})
 }
 
+// TestLogosArenaGCScansScanRegion tests AR3 / #46 / #81:
+// Pointer-containing arena objects keep their heap referents alive across runtime.GC().
+// After a watermark restore, popped scan memory is zeroed and no longer retains referents.
+func TestLogosArenaGCScansScanRegion(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+
+	type ptrHolder struct {
+		p *[64]byte
+	}
+
+	inFreshGoroutine(t, func() {
+		m := runtime.LogosArenaSave()
+
+		heapObj := new([64]byte)
+		heapObj[0] = 42
+		w := weak.Make(heapObj)
+
+		holder := (*ptrHolder)(runtime.LogosArenaAllocScan(ptrHolder{}, unsafe.Sizeof(ptrHolder{})))
+		holder.p = heapObj
+		heapObj = nil
+
+		// GC must not collect heapObj while holder in arena scan region references it.
+		runtime.GC()
+		runtime.GC()
+
+		if w.Value() == nil {
+			t.Fatal("heap referent collected while referenced by arena scan region (AR3 violation)")
+		}
+		if holder.p[0] != 42 {
+			t.Fatalf("heap referent corrupted: got %d, want 42", holder.p[0])
+		}
+
+		// Pop scan region and restore watermark.
+		runtime.LogosArenaRestore(m)
+
+		// After restore, the popped scan region is zeroed (AR2), so referent must be reclaimable.
+		for range 5 {
+			runtime.GC()
+			if w.Value() == nil {
+				break
+			}
+		}
+		if w.Value() != nil {
+			t.Errorf("heap referent not reclaimed after arena restore (popped scan memory not cleared)")
+		}
+	})
+}
+
+func TestLogosArenaPointerSliceScanRetention(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	inFreshGoroutine(t, func() {
+		m := runtime.LogosArenaSave()
+		defer runtime.LogosArenaRestore(m)
+
+		obj := new([64]byte)
+		obj[0] = 77
+		w := weak.Make(obj)
+
+		// Directly allocate slice backing in arena scan region via LogosArenaAllocScan.
+		sliceData := (*[16]*[64]byte)(runtime.LogosArenaAllocScan((*[64]byte)(nil), 16*unsafe.Sizeof((*[64]byte)(nil))))
+		sliceData[0] = obj
+		obj = nil
+
+		runtime.GC()
+		runtime.GC()
+
+		if w.Value() == nil {
+			t.Fatal("heap referent collected while held in arena scan pointer slice")
+		}
+		if sliceData[0][0] != 77 {
+			t.Fatalf("slice data corrupted: got %d, want 77", sliceData[0][0])
+		}
+
+		runtime.LogosArenaRestore(m)
+		for range 5 {
+			runtime.GC()
+			if w.Value() == nil {
+				break
+			}
+		}
+		if w.Value() != nil {
+			t.Errorf("heap referent not reclaimed after arena restore")
+		}
+	})
+}
+
+//go:noinline
+func arenaMakeAndPanic(n int) {
+	b := make([]byte, n)
+	if len(b) > 0 {
+		b[0] = 7
+	}
+	panic("arena panic unwind test")
+}
+
+// TestLogosArenaPanicUnwindRecovery directly attacks G3 (#63):
+// When an arena-allocating function panics and an ancestor recovers,
+// the arena watermark must be restored by the unwind, not leaked.
+func TestLogosArenaPanicUnwindRecovery(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	inFreshGoroutine(t, func() {
+		before := runtime.LogosArenaStat().NoscanUsed
+
+		func() {
+			defer func() {
+				_ = recover()
+			}()
+			arenaMakeAndPanic(1024)
+		}()
+
+		after := runtime.LogosArenaStat().NoscanUsed
+		if after != before {
+			t.Errorf("watermark leaked across recovered panic: before=%d, after=%d (G3 panic-unwind restore missing)", before, after)
+		}
+	})
+}
+
+//go:noinline
+func arenaMakeLoop(iters, allocSize int) uintptr {
+	var lastWatermark uintptr
+	for i := range iters {
+		b := make([]byte, allocSize)
+		if len(b) > 0 {
+			b[0] = byte(i)
+		}
+		lastWatermark = runtime.LogosArenaStat().NoscanUsed
+	}
+	return lastWatermark
+}
+
+// TestLogosArenaLoopWatermarkBounded directly attacks G4 (#181):
+// An iteration-local allocation inside a loop must restore the watermark
+// on the loop back-edge, keeping arena use bounded rather than growing
+// with iteration count.
+func TestLogosArenaLoopWatermarkBounded(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	inFreshGoroutine(t, func() {
+		before := runtime.LogosArenaStat().NoscanUsed
+
+		wm1 := arenaMakeLoop(1, 1024)
+		used1 := wm1 - before
+
+		wm10 := arenaMakeLoop(10, 1024)
+		used10 := wm10 - before
+
+		// With loop back-edge restore (G4 / #181), arena use remains bounded
+		// to the per-iteration size rather than growing linearly (10x).
+		if used10 > used1*2 {
+			t.Errorf("loop arena watermark grew unboundedly: 1-iter used %d B, 10-iter used %d B (G4 loop back-edge restore missing)", used1, used10)
+		}
+	})
+}
+
+//go:noinline
+func arenaMakeSwitchBreakLoop(outerIters, allocSize int) uintptr {
+	var lastWatermark uintptr
+	for o := range outerIters {
+	SwitchOuter:
+		switch o >= 0 {
+		case true:
+			for i := range 5 {
+				b := make([]byte, allocSize)
+				if len(b) > 0 {
+					b[0] = byte(i + o)
+				}
+				lastWatermark = runtime.LogosArenaStat().NoscanUsed
+				if i == 2 {
+					break SwitchOuter
+				}
+			}
+		case false:
+		}
+	}
+	return lastWatermark
+}
+
+// TestLogosArenaSwitchBreakWatermarkBounded attacks the labeled-switch
+// enclosing-branch exit: an inner eligible loop allocates 256 B per
+// iteration, a labeled break exits the loop by breaking the enclosing
+// switch, and execution continues in the same function for repeated outer
+// iterations. The inner loop back-edge restore alone does not cover the
+// switch-exit edge, so a missing restore accumulates one inner lifetime
+// per outer iteration.
+func TestLogosArenaSwitchBreakWatermarkBounded(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	if runtime.GOARCH != "amd64" {
+		t.Skip("skipping test: arena make lowering is amd64-only")
+	}
+	inFreshGoroutine(t, func() {
+		before := runtime.LogosArenaStat().NoscanUsed
+
+		wm1 := arenaMakeSwitchBreakLoop(1, 256)
+		used1 := wm1 - before
+		if used1 == 0 {
+			t.Fatalf("switch-break probe allocated nothing in the arena: 1-iter used 0 B, the attack is not live")
+		}
+
+		wm10 := arenaMakeSwitchBreakLoop(10, 256)
+		used10 := wm10 - before
+
+		if used10 > used1*2 {
+			t.Errorf("switch-break arena watermark grew unboundedly: 1-iter used %d B, 10-iter used %d B (enclosing-switch exit restore missing)", used1, used10)
+		}
+	})
+}
+
+//go:noinline
+func arenaMakeSelectBreakLoop(outerIters, allocSize int, ch chan int) uintptr {
+	var lastWatermark uintptr
+	for o := range outerIters {
+	SelectOuter:
+		select {
+		case <-ch:
+			for i := range 5 {
+				b := make([]byte, allocSize)
+				if len(b) > 0 {
+					b[0] = byte(i + o)
+				}
+				lastWatermark = runtime.LogosArenaStat().NoscanUsed
+				if i == 2 {
+					break SelectOuter
+				}
+			}
+		default:
+		}
+	}
+	return lastWatermark
+}
+
+// TestLogosArenaSelectBreakWatermarkBounded is the labeled-select analogue
+// of the switch-break attack: the inner eligible loop allocates 256 B per
+// iteration inside a ready receive case, a labeled break exits the loop by
+// breaking the enclosing select, and execution continues in the same
+// function for repeated outer iterations. The channel is pre-closed, so the
+// receive case is always ready and the attack is deterministic without timing.
+func TestLogosArenaSelectBreakWatermarkBounded(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	if runtime.GOARCH != "amd64" {
+		t.Skip("skipping test: arena make lowering is amd64-only")
+	}
+	inFreshGoroutine(t, func() {
+		ch := make(chan int)
+		close(ch)
+		before := runtime.LogosArenaStat().NoscanUsed
+
+		wm1 := arenaMakeSelectBreakLoop(1, 256, ch)
+		used1 := wm1 - before
+		if used1 == 0 {
+			t.Fatalf("select-break probe allocated nothing in the arena: 1-iter used 0 B, the attack is not live")
+		}
+
+		wm10 := arenaMakeSelectBreakLoop(10, 256, ch)
+		used10 := wm10 - before
+
+		if used10 > used1*2 {
+			t.Errorf("select-break arena watermark grew unboundedly: 1-iter used %d B, 10-iter used %d B (enclosing-select exit restore missing)", used1, used10)
+		}
+	})
+}
+
 // The make seam attacks below drive the public make([]T, len, cap) syntax
 // through sites the compiler places in the arena (non-escaping, dynamic
 // capacity), and compare every panic with the heap path's. They never touch
@@ -1118,4 +1631,51 @@ func TestLogosArenaMakeSliceEntry(t *testing.T) {
 			arenaMakeMustPanic(t, "entry", arenaMakeCapPanic, func() { runtime.LogosArenaMakeSlice(int64(0), 0, wide) })
 		})
 	}
+}
+
+// TestLogosArenaEvacFixesScanSlots is the evacuation behavior proof for the
+// fixup walk: a heap object held only from an arena scan region plus a
+// strong local copy must stay reachable through the arena slot across a
+// collection that moved objects. It fails when the rewrite misses arena
+// memory (stale slot) and skips when the collector moves nothing (the
+// evacuation is opportunistic, so no move means nothing to prove).
+func TestLogosArenaEvacFixesScanSlots(t *testing.T) {
+	if !goexperiment.LogosArena {
+		t.Skip("skipping test: GOEXPERIMENT=logosarena not enabled")
+	}
+	if !runtime.LogosHeapObjectsCanMove() {
+		t.Skip("skipping test: heap objects do not move without a moving collector")
+	}
+	inFreshGoroutine(t, func() {
+		m := runtime.LogosArenaSave()
+		defer runtime.LogosArenaRestore(m)
+
+		type holder struct {
+			p *[64]byte
+		}
+		heapObj := new([64]byte)
+		heapObj[0] = 42
+		h := (*holder)(runtime.LogosArenaAllocScan(holder{}, unsafe.Sizeof(holder{})))
+		h.p = heapObj
+
+		_, movedBefore := runtime.LogosEvacTotals()
+		moved := false
+		for range 8 {
+			runtime.GC()
+			if _, movedAfter := runtime.LogosEvacTotals(); movedAfter != movedBefore {
+				moved = true
+				break
+			}
+		}
+		if !moved {
+			t.Skip("skipping test: the collector moved nothing, so the fixup has nothing to prove")
+		}
+		if h.p != heapObj {
+			t.Fatalf("arena scan slot names %p, want the moved referent %p: the evacuation did not fix arena memory", h.p, heapObj)
+		}
+		if h.p[0] != 42 {
+			t.Fatalf("arena-held referent corrupted: got %d, want 42", h.p[0])
+		}
+		runtime.KeepAlive(heapObj)
+	})
 }

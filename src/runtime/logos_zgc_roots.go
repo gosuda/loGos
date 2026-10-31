@@ -43,7 +43,9 @@ import (
 // queue records) resolve to no span and take the plain store.
 func zgcFixSlot(slot *uintptr) {
 	v := *slot
+	zgcPageTransientEnter()
 	c := zgcCanonical(v)
+	zgcPageTransientLeave()
 	if c == v {
 		return
 	}
@@ -128,7 +130,11 @@ func zgcSlotInExposedObject(slot *uintptr) bool {
 // It checks every slot zgcFixSlot visits, exposed objects included: the
 // fixup heals those too, so a stale word left in one is a real defect.
 func zgcVerifySlot(slot *uintptr) {
-	if v := *slot; zgcRemap(zgcAddr(v)) != zgcAddr(v) {
+	v := *slot
+	zgcPageTransientEnter()
+	remapped := zgcRemap(zgcAddr(v))
+	zgcPageTransientLeave()
+	if remapped != zgcAddr(v) {
 		print("runtime: slot ", slot, " still holds relocated pointer ", hex(v), "\n")
 		throw("logos zgc: stale pointer to relocated object")
 	}
@@ -156,7 +162,10 @@ func logosZgcAttachSpecial(p unsafe.Pointer) unsafe.Pointer {
 	if !zgcCycleEnabled() {
 		return p
 	}
-	return unsafe.Pointer(zgcCanonical(uintptr(p)))
+	zgcPageTransientEnter()
+	canonical := zgcCanonical(uintptr(p))
+	zgcPageTransientLeave()
+	return unsafe.Pointer(canonical)
 }
 
 // Foreign retention for pages addressed from blocking syscalls and cgo
@@ -327,7 +336,11 @@ func zgcForeignRetainLive(live []*zgcPage) int {
 	if zgcForeignHoldCount.Load() > 0 {
 		foreign = true
 	} else {
-		for _, gp := range allgs {
+		for _, gp := range logosGCCanonicalGs(allgs) {
+			// Plain load in a NoLB file: a colored word an -lb heal left
+			// in a backing-array entry must resolve to the canonical g
+			// before the status dereference.
+			gp = (*g)(unsafe.Pointer(zgcCanonical(uintptr(unsafe.Pointer(gp)))))
 			if readgstatus(gp)&^_Gscan == _Gsyscall {
 				foreign = true
 				break
@@ -344,7 +357,8 @@ func zgcForeignRetainLive(live []*zgcPage) int {
 	// same way so an A -> X -> B chain through ordinary heap still retains B; only
 	// registered pages join the retained prefix.
 	seeded := false
-	for _, gp := range allgs {
+	for _, gp := range logosGCCanonicalGs(allgs) {
+		gp = (*g)(unsafe.Pointer(zgcCanonical(uintptr(unsafe.Pointer(gp))))) // same NoLB strip as above
 		if readgstatus(gp)&^_Gscan != _Gsyscall {
 			continue
 		}
@@ -446,7 +460,9 @@ func zgcAttachResolve(p unsafe.Pointer) (base uintptr, s *mspan) {
 		base, s, _ = findObject(v, 0, 0)
 		return base, s
 	}
+	zgcPageTransientEnter()
 	addr := zgcCanonical(v)
+	zgcPageTransientLeave()
 	s = spanOfHeap(addr)
 	if s == nil {
 		return 0, nil
@@ -496,8 +512,10 @@ func zgcAttachEnsureCopy(p unsafe.Pointer) unsafe.Pointer {
 	if !zgcCycleEnabled() {
 		return p
 	}
+	zgcPageTransientEnter()
 	addr := zgcCanonical(uintptr(p))
-	pg := zgcPageFor(addr)
+	zgcPageTransientLeave()
+	pg := zgcPageAcquire(addr)
 	if pg == nil {
 		// NotHeap fast path: unregistered ordinary identity under the
 		// caller's lifetime (a live Go reference plus the M-held
@@ -509,11 +527,13 @@ func zgcAttachEnsureCopy(p unsafe.Pointer) unsafe.Pointer {
 		base = s.base() + s.objIndex(addr)*s.elemsize
 	}
 	if to, ok := pg.forward(base); ok {
+		zgcPageRelease(pg)
 		// Published (Done): resolving to the copy needs no allocation
 		// and is safe in any context.
 		return unsafe.Pointer(to + (addr - base))
 	}
 	if !zgcCanRelocateDeep() {
+		zgcPageRelease(pg)
 		// Unpublished and no preemptible context to copy in (locked,
 		// g0, signal, or P-less): the refill would allocate where it
 		// must not. Fail fast; the attach loops copy at their own
@@ -523,6 +543,7 @@ func zgcAttachEnsureCopy(p unsafe.Pointer) unsafe.Pointer {
 		throw("logos zgc: cannot attach finalizer/cleanup in non-relocatable context")
 	}
 	to, st := zgcRelocateOneResult(pg, addr)
+	zgcPageRelease(pg)
 	switch st {
 	case zgcRelocateDone:
 		return unsafe.Pointer(to)
@@ -596,7 +617,10 @@ func zgcAttachStable(s *mspan, p uintptr) bool {
 	if !zgcCycleEnabled() {
 		return true
 	}
-	if zgcCanonical(p) != p {
+	zgcPageTransientEnter()
+	canonical := zgcCanonical(p)
+	zgcPageTransientLeave()
+	if canonical != p {
 		return false
 	}
 	if s.spanclass.sizeclass() == 0 {
@@ -628,7 +652,7 @@ func zgcAttachStable(s *mspan, p uintptr) bool {
 		// exists.
 		return s.logosPinned.Load() || isPinned(unsafe.Pointer(p))
 	}
-	if zgcPageFor(p) == nil {
+	if !zgcPageRegisteredNoSplit(p) {
 		return true
 	}
 	// Registered, unquarantined, unpublished source. A frozen source

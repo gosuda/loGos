@@ -35,10 +35,26 @@ func logosForward(p uintptr) (uintptr, bool) {
 		return 0, false
 	}
 	s := spanOf(p)
-	if s == nil || s.logosFwd == 0 || p < s.base() || p >= s.limit {
+	if s == nil || s.logosFwd == 0 {
+		return 0, false
+	}
+	// Invariant: span metadata must outlive every record that names it. A
+	// forwarding record exists only while the world is stopped inside the
+	// evacuation that owns it, so its span is live and manual spans never
+	// carry one. A retired span naming a record is impossible: freeSpanLocked
+	// clears the record at span death and finish clears every record before
+	// freeing the table. Fail fast instead of reading retired span-class
+	// metadata (base, limit, elemsize, nelems) or the freed table.
+	if s.state.get() != mSpanInUse {
+		throw("logos evacuation: forwarding record on retired span")
+	}
+	if p < s.base() || p >= s.limit {
 		return 0, false
 	}
 	i := s.objIndex(p)
+	if i >= uintptr(s.nelems) {
+		throw("logos evacuation: forwarding index out of range")
+	}
 	f := *s.logosFwdSlot(i)
 	if f == 0 {
 		return 0, false
@@ -177,7 +193,11 @@ func logosWalkSpanWith(s *mspan, v logosSlotVisitor, pol logosWalkPolicy) {
 	for i := uintptr(0); i < uintptr(s.nelems); i++ {
 		live := s.markBitsForIndex(i).isMarked()
 		if pol.useAllocBits {
-			live = s.allocBitsForIndex(i).isMarked()
+			// The sweep's allocated view: a fast-path hand-out bumps
+			// freeindex without writing allocBits, so a slot below
+			// freeindex is allocated even with a clear bit (sweep
+			// resets freeindex to 0, so holes cannot sit below it).
+			live = i < uintptr(s.freeindex) || s.allocBitsForIndex(i).isMarked()
 		}
 		if live {
 			logosWalkObject(s, s.base()+i*s.elemsize, v)
@@ -246,21 +266,79 @@ func logosWalkQueues(v logosSlotVisitor) {
 	}
 }
 
+// logosWalkStacks visits the arena scan regions of every live non-running
+// goroutine plus the stack roots of every goroutine whose stack the pin
+// pass did not scan conservatively. Arena slots of each walked goroutine
+// are always rewritten: unlike stack referents, nothing pins what an arena
+// names. It does not walk a running goroutine, whose frames change under
+// the walk.
+//
+// The zgc callers reach the skip: they run at gcStart, where the goroutine that
+// stopped the world is still _Grunning, zgcGCStartHook pins what that stack
+// names (zgcPinSelfStack), and a load barrier heals the rest.
+//
+// The immix walk never reaches it, and nothing heals a slot it would skip.
+// logosEvacuate runs from gcMarkTermination after that function parked its
+// caller in _Gwaiting (casGToWaitingForSuspendG), and stopTheWorldWithSema
+// throws unless every P is _Pgcstop, so no other goroutine is _Grunning.
+// collectPins, the gate of run and so of logosWalkAll, also returns false for
+// _Grunning, _Gidle and _Gcopystack. A change that lets a goroutine run during
+// the evacuation must pin its stack conservatively before it moves anything.
 func logosWalkStacks(v logosSlotVisitor) {
 	for _, gp := range allgs {
 		switch readgstatus(gp) &^ _Gscan {
-		case _Gdead, _Gdeadextra:
-			continue
-		case _Grunning:
-			// A running thread's stack moves beneath the walk;
-			// its slots heal lazily through the barrier. Reached
-			// only with the world stopped and the runner skipped
-			// by the caller.
+		case _Gdead, _Gdeadextra, _Grunning:
 			continue
 		}
+		logosWalkArena(gp, v)
 		if !logosStackConservative(gp) {
 			logosWalkStack(gp, v)
 		}
+	}
+}
+
+// logosWalkArena visits the pointer slots of the scan objects in every
+// chunk leased to gp. The scan region holds heap pointers the marking
+// pass shades through logosArenaScanStack, so the evacuation must rewrite
+// them too, or arena-held references stay stale after objects move. The
+// walk is unconditional: a goroutine whose stack the pin pass scanned
+// conservatively keeps its stack referents pinned, but nothing pins what
+// its arena names, so its arena slots still need the rewrite. Chunks
+// themselves are manual spans and never move; only the heap objects their
+// scan regions point to do.
+func logosWalkArena(gp *g, v logosSlotVisitor) {
+	for c := gp.logosArena; c != nil; c = c.next {
+		for hdrAddr := c.scanCur; hdrAddr < c.scanBase; {
+			hdr := (*logosArenaScanHeader)(unsafe.Pointer(hdrAddr))
+			obj := hdrAddr + logosArenaScanHeaderBytes
+			hdrAddr = obj + alignUp(hdr.size, logosArenaUnit)
+			if hdr.typ == nil || hdr.size == 0 {
+				continue
+			}
+			logosWalkArenaObject(hdr.typ, obj, hdr.size, v)
+		}
+	}
+}
+
+// logosWalkArenaObject visits the pointer slots of one arena scan object:
+// size/typ.Size_ consecutive elements of typ at obj. It mirrors
+// logosArenaScanObject, except the caller rewrites slots instead of
+// shading referents, so stack-range and span lookups are unnecessary:
+// slots holding non-heap words simply have no forwarding entry.
+func logosWalkArenaObject(typ *_type, obj, size uintptr, v logosSlotVisitor) {
+	limit := obj + size
+	// nextFast trusts the mask, and next clips to limit only when it
+	// advances, so the first mask must be clipped here, exactly as the
+	// marking scan does.
+	tp := typePointers{elem: obj, addr: obj, mask: readUintptr(getGCMask(typ)), typ: typ}.fastForward(0, limit)
+	for {
+		var addr uintptr
+		if tp, addr = tp.nextFast(); addr == 0 {
+			if tp, addr = tp.next(limit); addr == 0 {
+				return
+			}
+		}
+		v((*uintptr)(unsafe.Pointer(addr)))
 	}
 }
 
@@ -268,13 +346,33 @@ func logosWalkStacks(v logosSlotVisitor) {
 // stack objects, and its defer records. A goroutine whose stack the pin pass
 // scanned conservatively is not walked: its referents did not move.
 func logosWalkStack(gp *g, v logosSlotVisitor) {
+	if gp.sched.ctxt != nil {
+		v((*uintptr)(unsafe.Pointer(&gp.sched.ctxt)))
+	}
 	var u unwinder
 	for u.init(gp, 0); u.valid(); u.next() {
 		logosWalkFrame(&u.frame, v)
 	}
+	if gp._defer != nil {
+		v((*uintptr)(unsafe.Pointer(&gp._defer)))
+	}
 	for d := gp._defer; d != nil; d = d.link {
 		v((*uintptr)(unsafe.Pointer(&d.fn)))
 		v((*uintptr)(unsafe.Pointer(&d.link)))
+		if d.head != nil {
+			v((*uintptr)(unsafe.Pointer(&d.head)))
+		}
+	}
+	for p := gp._panic; p != nil; p = p.link {
+		// p.arg is an empty interface. Whenever it holds a value its data
+		// word is a pointer: the value itself for a direct type (a type
+		// stored in the word, abi.TFlagDirectIface, is pointer-shaped), the
+		// address of a box for any other type. The box holds the value even
+		// when the type has no pointers, and it can move, so Pointers() is
+		// not the test. The type word is not a heap pointer slot.
+		if e := efaceOf(&p.arg); e._type != nil {
+			v((*uintptr)(unsafe.Pointer(&e.data)))
+		}
 	}
 }
 

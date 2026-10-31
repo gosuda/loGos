@@ -511,13 +511,13 @@ func cleanupMoved() error {
 		if whole(argAt[i]) {
 			argsInside++
 			if expect == "1" && !argMoved {
-				return fmt.Errorf("argument %d in region block %#x did not move", i, argAt[i]&^(blockBytes-1))
+				return fmt.Errorf("argument %d in region block %#x did not move: at %#x still %#x", i, argAt[i]&^(blockBytes-1), argAt[i], uintptr(unsafe.Pointer(args[i])))
 			}
 		}
 		if whole(clAt[i]) {
 			closuresInside++
 			if expect == "1" && !clMoved {
-				return fmt.Errorf("closure %d in region block %#x did not move", i, clAt[i]&^(blockBytes-1))
+				return fmt.Errorf("closure %d in region block %#x did not move: at %#x still %#x", i, clAt[i]&^(blockBytes-1), clAt[i], *(*uintptr)(unsafe.Pointer(&kept[i])))
 			}
 		}
 	}

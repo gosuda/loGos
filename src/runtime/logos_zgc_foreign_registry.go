@@ -603,14 +603,16 @@ func zgcForeignHeapBaseNoSplit(w uintptr) (base uintptr, ok bool) {
 // contract. The old boolean shape stays: true means admit the returned
 // base (copy or in-place source), false means fail the admission.
 func zgcForeignEnsureCopy(base uintptr) (uintptr, bool) {
-	pg := zgcPageFor(base)
+	pg := zgcPageAcquire(base)
 	if pg == nil {
 		return base, true
 	}
 	if to, ok := pg.forward(base); ok {
+		zgcPageRelease(pg)
 		return to, true
 	}
 	to, st := zgcRelocateOneResult(pg, base)
+	zgcPageRelease(pg)
 	switch st {
 	case zgcRelocateDone:
 		return to, true
@@ -1782,7 +1784,22 @@ func logosZgcForeignEnd(t logosForeignToken) {
 	if gp.logosForeignTop != uintptr(unsafe.Pointer(f)) {
 		throw("logos zgc: foreign End without matching Begin (LIFO violation)")
 	}
+	// Two independent checks share this throw. An owner mismatch
+	// means the frame belongs to another g (or was recycled); it says
+	// nothing about generations.
+	//
+	// The generation check is separate: f.gen is write-once, set by
+	// the Begin path that created this frame (zgcForeignBeginLocked,
+	// and logosZgcForeignBeginNoSplit for unpublished markers), and
+	// the token carries that same word, so for a live frame in LIFO
+	// position the two must agree. End and Extend never write it.
+	// So when f.gen != t.Gen, the token's Gen word changed after
+	// Begin returned while the frame's did not: the producer stored
+	// the token where something else could rewrite it. Under vfork
+	// that is any slot of the child-shared frame; keep the token in
+	// the caller's frame (see syscall.forkAndExecInChild1).
 	if f.owner != uintptr(unsafe.Pointer(gp)) || f.gen != t.Gen {
+		println("logos zgc: foreign End mismatch: gp=", unsafe.Pointer(gp), " top=", gp.logosForeignTop, " depth=", gp.logosForeignDepth, " spare=", gp.logosForeignSpare, " f=", unsafe.Pointer(f), " owner=", f.owner, " fgen=", f.gen, " tgen=", t.Gen)
 		throw("logos zgc: foreign End owner/generation mismatch")
 	}
 	if f.published == 0 {
@@ -1843,6 +1860,7 @@ func logosZgcForeignEndNoSplit(t logosForeignToken) {
 		throw("logos zgc: foreign End without matching Begin (LIFO violation)")
 	}
 	if f.owner != uintptr(unsafe.Pointer(gp)) || f.gen != t.Gen {
+		println("logos zgc: foreign EndNoSplit mismatch: gp=", unsafe.Pointer(gp), " top=", gp.logosForeignTop, " depth=", gp.logosForeignDepth, " spare=", gp.logosForeignSpare, " f=", unsafe.Pointer(f), " owner=", f.owner, " fgen=", f.gen, " tgen=", t.Gen)
 		throw("logos zgc: foreign End owner/generation mismatch")
 	}
 	if f.published != 0 || f.nObjs != 0 || f.chunks != 0 {

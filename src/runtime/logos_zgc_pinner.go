@@ -16,23 +16,27 @@ func logosZgcPinnerCanonicalize(ptr unsafe.Pointer) unsafe.Pointer {
 	if ptr == nil {
 		return nil
 	}
+	zgcPageTransientEnter()
 	addr := uintptr(ptr)
 	colors := atomic.Loaduintptr(&zgcColorMaskBits)
 	if colors != 0 {
 		if spanOfHeap(addr) == nil {
 			a := addr &^ colors
 			if a == 0 || a > zgcAddrMask {
+				zgcPageTransientLeave()
 				return ptr
 			}
-			pg := logosZgcPinnerPageFor(a)
+			pg := zgcPageLookupTransient(a)
 			if pg == nil && spanOfHeap(a) == nil {
+				zgcPageTransientLeave()
 				return ptr
 			}
 			addr = a
 		}
 	}
-	pg := logosZgcPinnerPageFor(addr)
+	pg := zgcPageLookupTransient(addr)
 	if pg == nil {
+		zgcPageTransientLeave()
 		return unsafe.Pointer(addr)
 	}
 	var base uintptr
@@ -43,39 +47,17 @@ func logosZgcPinnerCanonicalize(ptr unsafe.Pointer) unsafe.Pointer {
 		off = addr - base
 	} else {
 		base = addr
-		off = 0
 	}
 	if base < pg.start || base-pg.start >= pg.size {
+		zgcPageTransientLeave()
 		return unsafe.Pointer(addr)
 	}
 	if to, ok := logosZgcPinnerForward(pg, base); ok {
+		zgcPageTransientLeave()
 		return unsafe.Pointer(to + off)
 	}
+	zgcPageTransientLeave()
 	return unsafe.Pointer(addr)
-}
-
-// logosZgcPinnerPageFor is the nosplit form of zgcPageFor: the registered
-// page whose source ranges contain addr, or nil.
-//
-//go:nosplit
-func logosZgcPinnerPageFor(addr uintptr) *zgcPage {
-	if addr > zgcAddrMask {
-		return nil
-	}
-	p := atomic.Loaduintptr(&zgcDirAddr)
-	if p == 0 {
-		return nil
-	}
-	slot := (*uintptr)(add(unsafe.Pointer(p), (addr>>zgcPageShift)*unsafe.Sizeof(uintptr(0))))
-	v := atomic.Loaduintptr(slot)
-	if v == 0 {
-		return nil
-	}
-	pg := (*zgcPage)(unsafe.Pointer(v))
-	if !pg.holdsSource(addr) {
-		return nil
-	}
-	return pg
 }
 
 //go:nosplit
@@ -163,34 +145,42 @@ func logosZgcPinPrepare(p unsafe.Pointer) (home unsafe.Pointer, s *mspan, mp *m)
 		var refused bool
 		var refusedBase uintptr
 		if zgcCycleEnabled() {
-			if pg := zgcPageFor(base); pg != nil {
+			if pg := zgcPageAcquire(base); pg != nil {
 				if to, ok := pg.forward(base); ok {
 					base = to
+					zgcPageRelease(pg)
 				} else if large {
+					zgcPageRelease(pg)
 					// Large never copies; base stays for the M-held stable path.
 				} else if !zgcCanRelocateDeep() {
+					zgcPageRelease(pg)
 					throw("logos zgc: cannot pin object in non-relocatable context")
-				} else if to, st := zgcRelocateOneResult(pg, base); st == zgcRelocateDone {
-					base = to
-				} else if st == zgcRelocateNoMemory {
-					throw("logos zgc: out of memory pinning object")
-				} else if st == zgcRelocateNotHeap {
-					// Nil page/span only (defensive; Prepare calls Result
-					// with non-nil pg on a heap base). Unregistered,
-					// out-of-range, and holds races map to Refused via
-					// commit 0 and take the pin-in-place path below, not
-					// this branch. Use the source via AttachStable.
 				} else {
-					// Refused: frozen (exposed) source. Never retry until
-					// unexposure (a public Pinner.Pin inside a callback on
-					// the current G's active C-exposed object would
-					// self-deadlock because the scope cannot end until the
-					// callback returns) and never misthrow as OOM. Pin the
-					// source in place below with the M held; the caller
-					// commits pinner bits or the sticky flag preserving
-					// M -> speciallock -> gate order with no copy under M.
-					refused = true
-					refusedBase = base
+					to, st := zgcRelocateOneResult(pg, base)
+					zgcPageRelease(pg)
+					if st == zgcRelocateDone {
+						base = to
+					} else if st == zgcRelocateNoMemory {
+						throw("logos zgc: out of memory pinning object")
+					} else if st == zgcRelocateNotHeap {
+						// Nil page/span only (defensive; Prepare calls Result
+						// with non-nil pg on a heap base). Unregistered,
+						// out-of-range, and holds races map to Refused via
+						// commit 0 and take the pin-in-place path below, not
+						// this branch. Use the source via AttachStable.
+					} else {
+						// Refused: frozen (exposed) source. Never retry until
+						// unexposure (a public Pinner.Pin inside a callback on
+						// the current G's active C-exposed object would
+						// self-deadlock because the scope cannot end until
+						// the callback returns) and never misthrow as OOM.
+						// Pin the source in place below with the M held; the
+						// caller commits pinner bits or the sticky flag
+						// preserving M -> speciallock -> gate order with no
+						// copy under M.
+						refused = true
+						refusedBase = base
+					}
 				}
 			}
 		}
@@ -212,11 +202,15 @@ func logosZgcPinPrepare(p unsafe.Pointer) (home unsafe.Pointer, s *mspan, mp *m)
 			// held no pause can unregister the page, so a fresh lookup is
 			// stable for registration; world-running workers may still
 			// publish, so recheck forwarding and adopt a winning copy.
-			if q2 := zgcPageFor(refusedBase); q2 != nil {
-				if _, ok := q2.forward(refusedBase); ok {
-					releasem(mp)
-					continue
-				}
+			zgcPageTransientEnter()
+			forwarded := false
+			if q2 := zgcPageLookupTransient(refusedBase); q2 != nil {
+				_, forwarded = q2.forward(refusedBase)
+			}
+			zgcPageTransientLeave()
+			if forwarded {
+				releasem(mp)
+				continue
 			}
 			// No forward: return the source with the M held; the caller's
 			// gate-held commit rechecks forwarding and pins atomically.
@@ -274,17 +268,22 @@ func logosPinSignalObject(p unsafe.Pointer) unsafe.Pointer {
 			off = finalAddr - base
 		}
 		zgcForeignGateLock()
-		if pg := zgcPageFor(base); pg != nil {
-			if won, ok := pg.forward(base); ok {
-				zgcForeignGateUnlock()
-				releasem(mp)
-				p = unsafe.Pointer(won + off)
-				home, s, mp = logosZgcPinPrepare(p)
-				if mp == nil {
-					return home
-				}
-				continue
+		zgcPageTransientEnter()
+		var won uintptr
+		forwarded := false
+		if pg := zgcPageLookupTransient(base); pg != nil {
+			won, forwarded = pg.forward(base)
+		}
+		zgcPageTransientLeave()
+		if forwarded {
+			zgcForeignGateUnlock()
+			releasem(mp)
+			p = unsafe.Pointer(won + off)
+			home, s, mp = logosZgcPinPrepare(p)
+			if mp == nil {
+				return home
 			}
+			continue
 		}
 		s.logosPinned.Store(true)
 		zgcForeignGateUnlock()
@@ -321,18 +320,24 @@ func logosZgcPinnerPin(ptr unsafe.Pointer) (unsafe.Pointer, bool) {
 			base = sFinal.startAddr
 			off = finalAddr - base
 		} else {
-			base = sFinal.startAddr + finalIdx*sFinal.elemsize
+			idx := sFinal.objIndex(finalAddr)
+			base = sFinal.startAddr + idx*sFinal.elemsize
 			off = finalAddr - base
 		}
 		zgcForeignGateLock()
-		if pg := zgcPageFor(base); pg != nil {
-			if won, ok := pg.forward(base); ok {
-				zgcForeignGateUnlock()
-				unlock(&sFinal.speciallock)
-				releasem(mp)
-				ptr = unsafe.Pointer(won + off)
-				continue
-			}
+		zgcPageTransientEnter()
+		var won uintptr
+		forwarded := false
+		if pg := zgcPageLookupTransient(base); pg != nil {
+			won, forwarded = pg.forward(base)
+		}
+		zgcPageTransientLeave()
+		if forwarded {
+			zgcForeignGateUnlock()
+			unlock(&sFinal.speciallock)
+			releasem(mp)
+			ptr = unsafe.Pointer(won + off)
+			continue
 		}
 		recheck := pb.ofObject(finalIdx)
 		isMulti := recheck.isPinned()

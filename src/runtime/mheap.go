@@ -696,6 +696,27 @@ func inHeapOrStack(b uintptr) bool {
 //
 // Must be nosplit because it has callers that are nosplit.
 
+// zgcHeapArenasLive is 1 once the first heap arena map (L2) is published,
+// and never cleared: arena maps are never freed. spanOf assumes the map is
+// live — its bounds checks are complete only then, and it dereferences the
+// L2 without a nil check when arenaL1Bits == 0 ("should never happen if
+// there's no L1"). Colors may be armed (gcinit → zgcInit) before the first
+// arena reservation publishes the map, and in that window any
+// validation-passing word reaches spanOfHeap through the canonicalisation
+// paths. Those paths consult zgcHeapArenaLive first and pass the word
+// through unchanged until the map is live; a GC cannot run before
+// initialisation completes, so nothing is lost.
+var zgcHeapArenasLive uintptr
+
+// zgcHeapArenaLive reports whether spanOf-style arena lookups are safe:
+// true once the arena map is published, false before. Set once, never
+// cleared.
+//
+//go:nosplit
+func zgcHeapArenaLive() bool {
+	return atomic.Loaduintptr(&zgcHeapArenasLive) != 0
+}
+
 //go:nosplit
 func spanOf(p uintptr) *mspan {
 	// This function looks big, but we use a lot of constant
@@ -1305,7 +1326,21 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 
 	if needImmixAlign && base == 0 {
 		extraPages := uintptr(logosImmixBlockBytes / pageSize)
-		base, _ = h.pages.find(npages + extraPages)
+
+		// Honor pageAlloc.alloc's exhausted-heap guard before searching
+		// directly: find walks the summary radix tree, and before the
+		// first growth sysGrow has mapped none of it, so a search with
+		// searchAddr at or past p.end reads summary memory that was
+		// reserved but never committed. In that state alloc reports
+		// failure and the caller grows; do the same instead of
+		// searching, then let the existing growth path retry find.
+		//
+		// Note that we skip updates to searchAddr here. It's OK if
+		// it's stale and higher than normal; it'll operate correctly,
+		// just come with a performance cost.
+		if chunkIndex(h.pages.searchAddr.addr()) < h.pages.end {
+			base, _ = h.pages.find(npages + extraPages)
+		}
 		if base == 0 {
 			var ok bool
 			growth, ok = h.grow(npages + extraPages)
@@ -1315,7 +1350,22 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 			}
 			base, _ = h.pages.find(npages + extraPages)
 			if base == 0 {
-				throw("grew heap, but no adequate free space found")
+				// The first grow marks a random prefix of the fresh palloc
+				// chunk as allocated (markRandomPaddingPages), which may leave
+				// fewer than npages+extraPages contiguous free pages. Retry
+				// grow+find once: later grows have no random padding, so this
+				// retry is deterministic.
+				var moreGrowth uintptr
+				moreGrowth, ok = h.grow(npages + extraPages)
+				growth += moreGrowth
+				if !ok {
+					unlock(&h.lock)
+					return nil
+				}
+				base, _ = h.pages.find(npages + extraPages)
+				if base == 0 {
+					throw("grew heap, but no adequate free space found")
+				}
 			}
 		}
 		base = alignUp(base, logosImmixBlockBytes)
@@ -1624,6 +1674,9 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 				// Transition this space from Reserved to Prepared and mark it
 				// as released since we'll be able to start using it after updating
 				// the page allocator and releasing the lock at any time.
+				if logosZgcCommitLedgerDebug {
+					logosZgcCommitLedgerAssertGrant(h.curArena.base, size, "grow:remainder")
+				}
 				sysMap(unsafe.Pointer(h.curArena.base), size, &gcController.heapReleased, "heap")
 				// Update stats.
 				stats := memstats.heapStats.acquire()
@@ -1632,6 +1685,9 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 				// Update the page allocator's structures to make this
 				// space ready for allocation.
 				h.pages.grow(h.curArena.base, size)
+				if logosZgcCommitLedgerDebug {
+					logosZgcCommitLedgerAdd(h.curArena.base, size)
+				}
 				totalGrowth += size
 			}
 			// Switch to the new space.
@@ -1645,7 +1701,9 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 				// h.curArena.base is aligned to pallocChunkBytes.
 				bits := logHeapArenaBytes - logPallocChunkBytes
 				offset := nextHeapRandBits(bits)
-				h.curArena.base = alignDown(h.curArena.base|(offset<<logPallocChunkBytes), pallocChunkBytes)
+				if !logosZgcHeapEnabled() {
+					h.curArena.base = alignDown(h.curArena.base|(offset<<logPallocChunkBytes), pallocChunkBytes)
+				}
 			}
 		}
 
@@ -1665,6 +1723,9 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 	// The allocation is always aligned to the heap arena
 	// size which is always > physPageSize, so its safe to
 	// just add directly to heapReleased.
+	if logosZgcCommitLedgerDebug {
+		logosZgcCommitLedgerAssertGrant(v, nBase-v, "grow")
+	}
 	sysMap(unsafe.Pointer(v), nBase-v, &gcController.heapReleased, "heap")
 
 	// The memory just allocated counts as both released
@@ -1676,6 +1737,9 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 	// Update the page allocator's structures to make this
 	// space ready for allocation.
 	h.pages.grow(v, nBase-v)
+	if logosZgcCommitLedgerDebug {
+		logosZgcCommitLedgerAdd(v, nBase-v)
+	}
 	totalGrowth += nBase - v
 
 	if firstGrow && randomizeHeapBase {
@@ -1812,10 +1876,24 @@ func (h *mheap) freeSpanLocked(s *mspan, typ spanAllocType) {
 	memstats.heapStats.release()
 	if goexperiment.LogosGCMoving {
 		logosImmixFreeSpan(s)
+		// Invariant: span metadata must outlive every record that names it.
+		// The forwarding table is freed at evacuation end, so the span-side
+		// record must die no later than span death; the next span.init also
+		// clears it, but a retired span must never name freed table memory
+		// in between. logosForward fails fast on any record that survives
+		// this point.
+		s.logosFwd = 0
 	}
 
 	// Mark the space as free.
 	h.pages.free(s.base(), s.npages)
+	if logosZgcCommitLedgerDebug {
+		// Ownership restore: freeing returns the span's pages to the heap,
+		// so record them again. Idempotent for ordinary spans; restores
+		// exactly what a zgc source release removed once the page retires,
+		// so post-retire reuse never names a false absent grant.
+		logosZgcCommitLedgerAdd(s.base(), s.npages*pageSize)
+	}
 
 	// Free the span structure. We no longer have a use for it.
 	s.state.set(mSpanDead)

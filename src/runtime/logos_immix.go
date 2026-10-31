@@ -59,7 +59,17 @@ type logosLineMark [logosImmixLines]uint8
 //     span init resets to sentinel under exclusive ownership.
 //   - dirtyNext: intrusive per-parity stack links for the bounded
 //     dirtied-block lists; drained only at STW (no concurrent push).
-//   - blockPinned: sticky pin bit; a pinned block never evacuates.
+//   - blockPinned: sticky pin bit; a pinned block never evacuates. Cleared
+//     when the block is evaluated unpinned and when its span dies, so a
+//     recycled address never inherits a pin.
+//   - blockLive: ownership generation state, 0 dead, 1 initializing, 2
+//     live. Claimed per generation with a 0-to-1 CAS in BlockFor (creation
+//     or retake); the winner resets the epoch, then publishes 2, and a
+//     loser waits read-only for 2, so publication always converges.
+//     Cleared to 0 when the span dies.
+//     Lookup reports only state 2, so a barrier can never observe a
+//     half-retaken slot, and recycled heap addresses read as
+//     never-created; identity queries (PlanesAt) keep using base alone.
 type logosImmixBlock struct {
 	_           sys.NotInHeap
 	base        uintptr
@@ -69,6 +79,8 @@ type logosImmixBlock struct {
 	epoch       uint32
 	dirtyNext   [2]unsafe.Pointer
 	blockPinned uint8
+	_           [3]byte
+	blockLive   uint32
 }
 
 // logosImmixDirtyEpoch is the global parity selector for the dirty pair.
@@ -174,6 +186,14 @@ func logosImmixBlockAt(a *logosImmixArena, addr uintptr) *logosImmixBlock {
 // creating it with all lines free and the pin bit clear on first use. It
 // returns nil when addr lies outside the heap arenas. It is safe for
 // concurrent callers.
+//
+// A slot whose span died (base kept, state dead) is retaken, not shared:
+// base is published first, then exactly one claimant CAS-claims 0 dead to
+// 1 initializing, resets the epoch to the unenlisted sentinel, and
+// publishes 2 live. Lookup rejects the initializing state, so a barrier
+// can neither observe a half-retaken slot nor enlist on a pre-reset epoch.
+// No plane is touched here; freeSpan already cleared them, which keeps
+// concurrent takeovers free of torn-plane races.
 func logosImmixBlockFor(addr uintptr) *logosImmixBlock {
 	ri := arenaIndex(addr)
 	if !logosImmixInHeapArena(ri) {
@@ -182,6 +202,21 @@ func logosImmixBlockFor(addr uintptr) *logosImmixBlock {
 	b := logosImmixBlockAt(logosImmixArenaFor(ri), addr)
 	if atomic.Loaduintptr(&b.base) == 0 {
 		atomic.Casuintptr(&b.base, 0, addr&^(logosImmixBlockBytes-1))
+	}
+	for {
+		live := atomic.Load(&b.blockLive)
+		if live == 2 {
+			break
+		}
+		if live == 0 {
+			if atomic.Cas(&b.blockLive, 0, 1) {
+				atomic.Store(&b.epoch, ^uint32(0))
+				atomic.Store(&b.blockLive, 2)
+				return b
+			}
+			continue
+		}
+		procyield(30)
 	}
 	return b
 }
@@ -288,10 +323,28 @@ func logosImmixClearIncomingDirty() {
 }
 
 // logosImmixBlockLookup is like logosImmixBlockFor but returns nil instead
-// of creating the metadata.
+// of creating the metadata. It also returns nil for a block whose span
+// died: base preserves identity for evacuated-address queries, but only
+// live blocks answer Lookup and the barrier, so recycled heap addresses
+// never inherit stale metadata.
 //
 //go:nosplit
 func logosImmixBlockLookup(addr uintptr) *logosImmixBlock {
+	b := logosImmixBlockIdentity(addr)
+	if b == nil || atomic.Load(&b.blockLive) != 2 {
+		return nil
+	}
+	return b
+}
+
+// logosImmixBlockIdentity returns the metadata slot of the block containing
+// addr by identity alone, without creating it and without consulting
+// liveness. Only evacuated-address observation (PlanesAt) may use it: the
+// barrier, selection, and freshness checks must go through Lookup so a
+// recycled address never inherits a dead span's tables or pin.
+//
+//go:nosplit
+func logosImmixBlockIdentity(addr uintptr) *logosImmixBlock {
 	a := logosImmixArenaLookup(arenaIndex(addr))
 	if a == nil {
 		return nil

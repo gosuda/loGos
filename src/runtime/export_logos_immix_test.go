@@ -220,7 +220,10 @@ func LogosImmixPlanes(p unsafe.Pointer) (occupy LogosLineMark, dirty [2]LogosLin
 // observes the planes while a mark window is open uses it, so that it holds
 // no pointer to the objects it is about to leave unreachable.
 func LogosImmixPlanesAt(addr uintptr) (occupy LogosLineMark, dirty [2]LogosLineMark, epoch uint32, pinned, ok bool) {
-	b := logosImmixBlockLookup(addr)
+	// Identity, not liveness: an evacuated address must stay observable
+	// after its span dies, while Lookup (barrier, selection, freshness)
+	// reports only live blocks.
+	b := logosImmixBlockIdentity(addr)
 	if b == nil {
 		return occupy, dirty, 0, false, false
 	}

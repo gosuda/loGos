@@ -29,8 +29,9 @@ var zgcRelocating atomic.Int32
 // before user code runs. ARM64 TBI covers the tag byte; x86 LAM at 7
 // bits fails with EINVAL on Linux (LAM_U57 only) and falls back to the
 // software encoding. Stage 2/3 run with real colors from here; the
-// Z2-asm wrappers remain the documented residual for unaudited assembly,
-// and the mode gate stays shut until the parent's runtime probes pass.
+// reflectcall-fn and defer-record residuals named on
+// zgcBoundaryWrappersLanded remain, and the mode gate stays shut until
+// the parent's runtime probes pass.
 func zgcInit() {
 	zgcInitPageRegistry()
 	zgcInitSelect()
@@ -42,10 +43,11 @@ func zgcInit() {
 	zgcConfigure(zgcEncodingSoftware, zgcColorMark0)
 }
 
-// zgcAsmBoundaryComplete reports whether the Z2-asm wrappers landed. The
-// assembly audit artifact owns the wrapper set; the Go-side untag and
-// canonicalization boundaries land with this lane and the audit residual
-// is recorded, not claimed.
+// zgcAsmBoundaryComplete reports whether every pointer-typed assembly
+// path reads and writes only untagged words. It delegates to
+// zgcBoundaryWrappersLanded, whose contract names the closed Go-side
+// rows (raw atomics, Loadp hook, syscall/cgo args) and the named
+// residuals (reflectcall fn, defer records) that keep it false.
 func zgcAsmBoundaryComplete() bool {
 	return zgcBoundaryWrappersLanded()
 }
@@ -76,7 +78,7 @@ func zgcGCStartHook() {
 	// so even a disabled cycle strands goroutine 1 in Gosched. g0
 	// never grows here. Every callee is already pause-safe;
 	// MarkStartRoots' inner systemstack nests as a direct call on
-	// g0 by design, channel sends are non-blocking, and the
+	// g0 by design, worker wakes are lock-free on runtime notes, and the
 	// load-barrier behavior is unchanged.
 	systemstack(func() {
 		zgcFinishRelocation()
@@ -258,9 +260,29 @@ func zgcMarkTerminationHook() {
 	assertWorldStopped()
 	// Whole pause runs on the system stack: an STW pause must not grow
 	// the worker stack; g0 needs no growth.
-	systemstack(func() {
-		zgcRemapPassComplete()
 	wakeWorkers := false
+	systemstack(func() {
+		// Detach every P's cached spans before selection. A span held
+		// in an mcache carries sweepgen+3, so zgcSpanMovable rejects it
+		// and zgcPageLive rejects every 2 MB page it overlaps; in a
+		// young heap the allocating tip always overlaps the freshly
+		// allocated candidate page and selection would never fire.
+		// Flushing normalizes spans cached this cycle to the current
+		// sweepgen through uncacheSpan (spans cached across the last
+		// sweep take the stale arm and sweep inline), exactly as the
+		// sweep's own prepareForSweep does. The sweep's later
+		// prepareForSweep then observes flushGen and skips, so no
+		// accounting runs twice; spans this pass skips settle next
+		// cycle. Pause-only: the world is stopped and no locks are
+		// held (mcentral locks only, as in the sweep path).
+		sg := mheap_.sweepgen
+		for _, pp := range allp {
+			c := pp.mcache
+			c.releaseAll()
+			stackcache_clear(c)
+			c.flushGen.Store(sg)
+		}
+		zgcRemapPassComplete()
 		zgcRetirePendingPages()
 		zgcPublishReadyToSpace()
 		zgcPagesLock()
@@ -274,14 +296,18 @@ func zgcMarkTerminationHook() {
 		// Vet every selected page before any to-space is reserved: a
 		// reservation allocates spans, and an ineligible page must not be
 		// able to receive one into a gap the vet is about to rule out.
-		// A page that fails the vet owns no to-space yet, so discarding it
-		// is forget plus free; zgcAbandonPage would also nil the state's
-		// presized span lists, which the next pause's selection appends to.
+		// A page that fails the vet owns no to-space yet; it discards
+		// through the same drain discipline as the reservation-failure
+		// abandon, because a signal-stack or no-P reader may have
+		// resolved the freshly registered page: unpublish, sample the
+		// acquisition domain and refs, and only then free the state and
+		// header — otherwise queue the intact descriptor for the next
+		// pause. The drain's forget keeps the presized span lists the
+		// next pause's selection appends to.
 		eligible := pages[:0]
 		for _, pg := range pages {
 			if !zgcPageEligible(pg) {
-				zgcPageForget(pg)
-				zgcFreePage(pg)
+				zgcAbandonPage(pg)
 				continue
 			}
 			eligible = append(eligible, pg)
@@ -306,6 +332,9 @@ func zgcMarkTerminationHook() {
 		zgcRelocating.Store(int32(len(kept)))
 		wakeWorkers = true
 	})
+	if wakeWorkers {
+		systemstack(zgcWakeWorkers)
+	}
 }
 
 // zgcRemapPassComplete records that a remap pass finished: a full mark
@@ -328,12 +357,6 @@ func zgcFinishRelocation() {
 	for {
 		progress := false
 		pages := zgcPagesSnapshot()
-	// The wake's channel send is race-instrumented, so it runs on this
-	// goroutine's stack, which has a race context; the system stack does
-	// not.
-	if wakeWorkers {
-		zgcWakeWorkers()
-	}
 		for _, pg := range pages {
 			if pg.published.Load() == pg.live {
 				continue

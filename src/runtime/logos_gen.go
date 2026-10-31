@@ -402,6 +402,9 @@ func logosGenSettle() {
 // is stopped and the previous sweep is finished. A full cycle forgets all
 // cards, because every span is young after it.
 func logosGenBeginCycle(t gcTrigger) {
+	// The evacuation reserve is granted here, at the same gcStart point this
+	// hook is called from: after sweep finished and before marking begins.
+	logosEvacReserveDestination()
 	if !logosGenBuild || !logosGen.active {
 		return
 	}
