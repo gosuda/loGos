@@ -6,9 +6,9 @@
 
 package runtime
 
-// LogosForeignGBytes is the size logosForeignG adds to g under the
-// moving experiment, exported for the size-floor test.
-const LogosForeignGBytes = 24
+// logosForeignGBytes is the size logosForeignG adds to g under the
+// moving experiment, read by the size-floor test.
+const logosForeignGBytes = 24
 
 // logosForeignG holds this goroutine's foreign-call frame state. It is
 // embedded in g (ahead of a non-zero-sized field), so consumers keep the

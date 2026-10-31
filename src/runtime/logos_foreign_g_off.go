@@ -6,9 +6,9 @@
 
 package runtime
 
-// LogosForeignGBytes is the size logosForeignG adds to g under the
+// logosForeignGBytes is the size logosForeignG adds to g under the
 // moving experiment; zero off-experiment where the struct is empty.
-const LogosForeignGBytes = 0
+const logosForeignGBytes = 0
 
 // logosForeignG is empty off-experiment: no per-g foreign-call frame
 // state exists where no frame can be admitted. It is embedded in g ahead
