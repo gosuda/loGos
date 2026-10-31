@@ -328,9 +328,10 @@ A bare spelling such as `2` MUST fail validation like an unknown level [T-105].
 An invalid level MUST fail with text that lists the six accepted levels [T-105].
 O0 MUST pass debug flags for no inline and no debug-info loss protection [T-105].
 O1 MUST be the upstream baseline [T-105].
-O2 MUST set inline budget 120 and variable-make stack buffer 256 bytes with standard synthetic PGO [T-105].
-O3 MUST set inline budget 400 with 80 inside recursive cycles, clone specialization, variable-make buffer 4096 bytes, and aggressive synthetic PGO [T-105].
+O2 MUST set inline budget 120 and variable-make stack buffer 256 bytes for non-standard packages with standard synthetic PGO [T-105].
+O3 MUST set inline budget 400 with 80 inside recursive cycles, clone specialization, variable-make buffer 4096 bytes for non-standard packages, and aggressive synthetic PGO [T-105].
 A function in a recursive call-graph cycle MUST keep the upstream variable-make buffer of 32 bytes at every level, inlined bodies included [T-105][T-302].
+A standard-library-provenance package (a standard library package or its external test package) MUST keep the default variable-make buffer of 32 bytes at every opt level; non-standard packages MUST use 256 bytes at O2 and 4096 bytes at O3 [T-105][T-302].
 Os and Oz MUST set inline budget 15 with linker identical code folding [T-105].
 Linker identical code folding MUST fold only functions with identical machine code, relocations, call ABI, and function metadata (frame sizes, function identity and flags, stack-height, file, inline-mark, pcdata, and liveness tables); only the name and line table MAY be shared, with the kept function's name and line table serving every folded function, and cgo-exported functions MUST keep their own entries [T-105].
 Synthetic PGO MUST mark `?` error blocks, panics, and `os.Exit` paths unlikely through the intrinsic `logos/rt.cold()` [T-105].
@@ -1112,8 +1113,9 @@ Go runtime states objects do not move, so zgc and immix stay research tracks unt
 ### 3.2 RFC-302: Smart stack engine
 
 The variable-size `make` stack buffer MUST default to 32 bytes. [T-302]
-At O2 it MUST be 256 bytes. [T-302]
-At O3 it MUST be 4096 bytes. [T-302]
+At O2 it MUST be 256 bytes for non-standard packages. [T-302]
+At O3 it MUST be 4096 bytes for non-standard packages. [T-302]
+A standard-library-provenance package MUST keep the default 32-byte variable-make buffer at every opt level [T-105][T-302].
 A slice `make` with variable effective capacity that flows into a cgo call argument or an `unsafe.Pointer` conversion MUST NOT use the stack buffer and MUST allocate its backing storage on the heap. Effective capacity is the explicit capacity when present, otherwise the length; it is fixed only when the compiler proves it constant with `ir.IsSmallIntConst` after literal rewriting. Fixed-effective-capacity makes MUST retain ordinary escape and size behavior, not a guarantee of stack allocation. [T-302]
 Under `GOEXPERIMENT=logosstack`, the runtime MUST choose the initial goroutine stack size from the per-PC exponential moving average of final stack sizes. [T-302]
 Without history for a PC, it MUST fall back to the upstream global average. [T-302]
