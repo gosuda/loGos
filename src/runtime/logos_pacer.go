@@ -95,9 +95,22 @@ func logosElasticRatio(live, goal uint64) float64 {
 }
 
 // logosElasticDedicated is the number of whole dedicated workers in total
-// Ps of background utilization.
+// Ps of background utilization. The grant is bounded by the OS-thread
+// headroom left after the program's own parallelism: a dedicated worker
+// needs an M for the whole cycle, and the program may still need an M per
+// P, so the grant is capped by sched.maxmcount minus existing Ms minus
+// gomaxprocs. A user SetMaxThreads cap therefore shrinks the worker count
+// instead of throwing thread exhaustion inside mark enlistment.
 func logosElasticDedicated(total float64) int64 {
-	return int64(total + logosElasticSlack)
+	dedicated := int64(total + logosElasticSlack)
+	headroom := int64(sched.maxmcount) - int64(mcount()) - int64(gomaxprocs)
+	if headroom <= 0 {
+		return 0
+	}
+	if dedicated > headroom {
+		return headroom
+	}
+	return dedicated
 }
 
 // logosElasticFractional is the fractional goal that makes up the part of
