@@ -949,7 +949,7 @@ func BenchmarkFastcall(b *testing.B) {
 	b.Logf("logosfastcgo = %v", goexperiment.LogosFastCgo)
 	var sink int32
 	for b.Loop() {
-		sink += callFastAdd(sink, 1)
+		sink = callFastAdd(sink&((1<<30)-1), 1)
 	}
 	_ = sink
 }
@@ -959,7 +959,7 @@ func BenchmarkFastcallSlow(b *testing.B) {
 	requireCgo(b)
 	var sink int32
 	for b.Loop() {
-		sink += callSlowNoescape(sink, 1)
+		sink = callSlowNoescape(sink&((1<<30)-1), 1)
 	}
 	_ = sink
 }
