@@ -457,7 +457,7 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 	} else {
 		// N.B. gomaxprocs and dedicatedMarkWorkersNeeded are guaranteed not to
 		// change during a GC cycle.
-		c.setMaxIdleMarkWorkers(int32(procs) - int32(dedicatedMarkWorkersNeeded))
+		c.setMaxIdleMarkWorkers(logosIdleMarkWorkerMax(procs, dedicatedMarkWorkersNeeded))
 	}
 
 	// Compute initial values for controls that are updated
