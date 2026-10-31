@@ -51,7 +51,7 @@ var initLogosArenaBuiltinUniverse = sync.OnceFunc(func() {
 })
 
 // TestLogosArenaBuiltinsDeclared pins shared contract C1, the runtime arena
-// entry-point signature set. It scans runtimeDecls for the six names and
+// entry-point signature set. It scans runtimeDecls for the seven names and
 // checks each signature in runtimeTypes against the declaration text in
 // _builtin/runtime.go. It must not resolve the names with LookupRuntime:
 // ir.Pkgs.Runtime is populated only by a real compile, so the lookup would
@@ -67,6 +67,7 @@ func TestLogosArenaBuiltinsDeclared(t *testing.T) {
 	want := map[string]expectation{
 		"logosArenaAlloc":       {[]types.Kind{types.TPTR, types.TUINTPTR}, []types.Kind{types.TUNSAFEPTR}},
 		"logosArenaAllocScan":   {[]types.Kind{types.TPTR, types.TUINTPTR}, []types.Kind{types.TUNSAFEPTR}},
+		"logosArenaMakeSlice":   {[]types.Kind{types.TPTR, types.TINT64, types.TINT64}, []types.Kind{types.TUNSAFEPTR}},
 		"logosArenaMarkSave":    {nil, []types.Kind{types.TUINTPTR, types.TUINTPTR, types.TUINTPTR}},
 		"logosArenaMarkRestore": {[]types.Kind{types.TUINTPTR, types.TUINTPTR, types.TUINTPTR}, nil},
 		"logosArenaRetTake":     {nil, []types.Kind{types.TBOOL}},
@@ -160,6 +161,7 @@ func TestLogosArenaBuiltinsDeclared(t *testing.T) {
 	text := map[string][2][]string{
 		"logosArenaAlloc":       {{"*byte", "uintptr"}, {"unsafe.Pointer"}},
 		"logosArenaAllocScan":   {{"*byte", "uintptr"}, {"unsafe.Pointer"}},
+		"logosArenaMakeSlice":   {{"*byte", "int64", "int64"}, {"unsafe.Pointer"}},
 		"logosArenaMarkSave":    {nil, {"uintptr", "uintptr", "uintptr"}},
 		"logosArenaMarkRestore": {{"uintptr", "uintptr", "uintptr"}, nil},
 		"logosArenaRetTake":     {nil, {"bool"}},

@@ -474,11 +474,13 @@ func (check *Checker) instantiatedType(x syntax.Expr, xlist []syntax.Expr) (res 
 	}
 
 	// For Named types, orig.tparams may not be set up, so we need to do expansion later.
+	logosAssertEnclosing := check.logosAssertEnclosing() // logos T-201 hook: capture body context before the delay.
 	check.later(func() {
 		// This is an instance from the source, not from recursive substitution,
 		// and so it must be resolved during type-checking so that we can report
 		// errors.
 		check.recordInstance(x, targs, inst)
+		check.logosRecordTypeInst(logosAssertEnclosing, inst, targs, x.Pos()) // logos T-201 hook.
 
 		name := inst.(interface{ Obj() *TypeName }).Obj().name
 		tparams := inst.TypeParams().list()

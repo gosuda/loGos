@@ -110,7 +110,12 @@ func (s *logosPurity) scanType(te syntax.Expr) {
 		}
 	case *syntax.SelectorExpr:
 		if x, ok := syntax.Unparen(te.X).(*syntax.Name); ok && x.Value == "unsafe" && te.Sel.Value == "Pointer" {
+			// Invariant (unsafe): unsafe.Pointer is a pointer type in const funcs.
 			s.fail(te, "pointer type in const func")
+		} else {
+			// Invariant (qualified): pkg.T resolves through the same
+			// impurity check as bare names.
+			s.scanSelected(te)
 		}
 	case *syntax.SliceType:
 		s.scanType(te.Elem)
@@ -142,19 +147,67 @@ func (s *logosPurity) scanNamed(id *syntax.Name) {
 	if !ok {
 		return
 	}
-	switch u := tn.typ.(type) {
+	s.scanNamedType(id, tn.Type())
+}
+
+// scanNamedType flags pointer, channel, uintptr, interface, function,
+// and option shapes behind a resolved type name. Defined types are
+// judged by underlying type after alias removal, so `type P *int`
+// cannot bypass the check; struct and other composite underlyings stay
+// legal, matching the syntactic cases in scanType.
+func (s *logosPurity) scanNamedType(at syntax.Node, typ Type) {
+	t := Unalias(typ)
+	if t == nil {
+		return
+	}
+	// Invariant (option): named option types carry the option obligation.
+	if logosAsOption(t) != nil {
+		s.fail(at, "option type in const func")
+		return
+	}
+	u := t.Underlying()
+	if u == nil {
+		return
+	}
+	switch u := u.(type) {
 	case *Pointer:
-		s.fail(id, "pointer type in const func")
+		s.fail(at, "pointer type in const func")
 	case *Chan:
-		s.fail(id, "channel type in const func")
+		s.fail(at, "channel type in const func")
 	case *Basic:
 		if u.Kind() == Uintptr {
-			s.fail(id, "uintptr type in const func")
+			s.fail(at, "uintptr type in const func")
 		}
 	case *Interface:
-		s.fail(id, "interface type in const func")
+		s.fail(at, "interface type in const func")
 	case *Signature:
-		s.fail(id, "function type in const func")
+		s.fail(at, "function type in const func")
+	}
+}
+
+// scanSelected resolves a qualified type name (pkg.T) and flags impurity
+// behind it, so imported named pointer, channel, interface, and function
+// types cannot bypass the signature scan through qualification.
+// Unresolved names keep the upstream diagnostic.
+func (s *logosPurity) scanSelected(te *syntax.SelectorExpr) {
+	if s.done {
+		return
+	}
+	if obj, ok := s.check.Info.Uses[te.Sel].(*TypeName); ok {
+		s.scanNamedType(te, obj.Type())
+		return
+	}
+	x, ok := syntax.Unparen(te.X).(*syntax.Name)
+	if !ok {
+		return
+	}
+	_, obj := s.check.lookupScope(x.Value)
+	pn, ok := obj.(*PkgName)
+	if !ok || pn.Imported() == nil {
+		return
+	}
+	if tn, ok := pn.Imported().Scope().Lookup(te.Sel.Value).(*TypeName); ok {
+		s.scanNamedType(te, tn.Type())
 	}
 }
 
@@ -292,13 +345,18 @@ func (s *logosPurity) visitStore(lhs syntax.Expr) bool {
 	return found || s.done
 }
 
-// visitRange flags ranging over maps.
+// visitRange flags ranging over dynamic maps, named map types included.
+// A const view is not a *Map, so ranging a const map stays legal.
 func (s *logosPurity) visitRange(rc *syntax.RangeClause) {
 	if s.done {
 		return
 	}
-	if tv, ok := s.check.Info.Types[rc.X]; ok && tv.Type != nil {
-		if _, isMap := Unalias(tv.Type).(*Map); isMap {
+	typ := s.check.Info.TypeOf(rc.X)
+	if typ == nil {
+		return
+	}
+	if u, _ := commonUnder(Unalias(typ), nil); u != nil {
+		if _, isMap := u.(*Map); isMap {
 			s.fail(rc.X, "range over map in const func")
 		}
 	}
